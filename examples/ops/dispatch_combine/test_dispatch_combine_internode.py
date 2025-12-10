@@ -752,7 +752,7 @@ class EpDispatchCombineTestCase:
                 warp_per_block=16,
             )
             
-            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output(
+            packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
                 dispatch_output, 
                 dispatch_indices, 
                 self.config, 
@@ -760,7 +760,7 @@ class EpDispatchCombineTestCase:
             )
             gemm_output = packed_input 
             events[2 * i + 1].record()
-            rec_output = mori.inverse_transform_dispatch_output(
+            rec_output = mori.triton_inverse_transform_dispatch_output(
                 gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
             )
         
