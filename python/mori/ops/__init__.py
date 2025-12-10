@@ -24,3 +24,7 @@ from .dispatch_combine import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+from .triton_kernels import (
+    triton_transform_dispatch_output,
+    triton_inverse_transform_dispatch_output,
+)

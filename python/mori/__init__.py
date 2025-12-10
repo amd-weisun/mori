@@ -23,3 +23,8 @@ from . import cpp
 from . import ops
 from . import shmem
 from . import io
+
+from .ops import (
+    triton_transform_dispatch_output,
+    triton_inverse_transform_dispatch_output,
+)

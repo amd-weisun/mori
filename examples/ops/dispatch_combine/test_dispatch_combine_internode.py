@@ -271,6 +271,89 @@ class EpDispatchCombineTestCase:
             # print("Rank counts to other nodes:", rank_counts_remote_send)
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
+    def transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count):
+        """
+        Transforms dispatch output to a packed layout [Experts, N, hidden_dim]
+        where tokens are packed contiguously for each expert.
+        
+        Args:
+            dispatch_output: [N, H] tensor of received tokens
+            dispatch_indices: [N, K] tensor of expert indices for each token
+            config: EpDispatchCombineConfig object
+            recv_count: Scalar, number of valid tokens received
+        """
+        # 1. Slice valid data
+        valid_tokens = dispatch_output[:recv_count]   # [M, H]
+        valid_indices = dispatch_indices[:recv_count] # [M, K]
+        
+        N_capacity = dispatch_output.size(0)
+        _, H = valid_tokens.shape
+        _, K = valid_indices.shape
+        E = config.num_experts_per_rank
+        
+        # 2. Find which tokens go to which local expert
+        flat_indices = valid_indices.view(-1) # [M*K]
+        is_local = (flat_indices // E) == config.rank
+        active_flat_indices = torch.nonzero(is_local).squeeze(-1)
+        
+        if active_flat_indices.numel() == 0:
+             return (
+                 torch.zeros((E, N_capacity, H), device=dispatch_output.device, dtype=dispatch_output.dtype),
+                 torch.empty((0,), device=dispatch_output.device, dtype=torch.long),
+                 torch.zeros((E,), device=dispatch_output.device, dtype=torch.long)
+             )
+
+        token_indices = active_flat_indices.div(K, rounding_mode='floor')
+        local_expert_ids = flat_indices[active_flat_indices] % E
+        
+        # 3. Sort by expert ID
+        sort_order = torch.argsort(local_expert_ids)
+        sorted_token_indices = token_indices[sort_order]
+        sorted_expert_ids = local_expert_ids[sort_order]
+        
+        # 4. Calculate counts and pack
+        expert_counts = torch.bincount(sorted_expert_ids, minlength=E)
+        
+        # Generate slot indices: [0, 1, ... c0-1, 0, 1, ... c1-1, ...]
+        slot_indices_list = [torch.arange(c, device=dispatch_output.device) for c in expert_counts]
+        slot_indices = torch.cat(slot_indices_list)
+        
+        packed_output = torch.zeros((E, N_capacity, H), dtype=dispatch_output.dtype, device=dispatch_output.device)
+        packed_output[sorted_expert_ids, slot_indices] = valid_tokens[sorted_token_indices]
+        
+        return packed_output, sorted_token_indices, expert_counts
+
+    def inverse_transform_dispatch_output(packed_output, original_indices, expert_counts, original_N):
+        """
+        Reconstructs dispatch_output from packed_output [E, N, H].
+        
+        Args:
+            packed_output: [E, N, H] tensor (result of GEMM)
+            original_indices: [M] tensor mapping rows back to dispatch_output indices
+            expert_counts: [E] tensor of token counts per expert
+            original_N: Original number of tokens (N)
+            
+        Returns:
+            rec_output: [N, H]
+        """
+        E, _, H = packed_output.shape
+        device = packed_output.device
+        
+        # Generate read indices matching the write order
+        slot_indices_list = [torch.arange(c, device=device) for c in expert_counts]
+        slot_indices = torch.cat(slot_indices_list)
+        
+        expert_ids = torch.repeat_interleave(torch.arange(E, device=device), expert_counts)
+        
+        # Extract valid tokens
+        flat_values = packed_output[expert_ids, slot_indices]
+        
+        # Scatter add back
+        rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
+        rec_output.index_add_(0, original_indices, flat_values)
+        
+        return rec_output
+
     def run_test_once(self, op, test_data, error_round, round):
         (
             all_rank_num_token,
@@ -296,6 +379,60 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
 
+        # --- Simulated GEMM Start ---
+        recv_count = dispatch_recv_num_token.item()
+        
+        # 1. Transform Layout
+        packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
+            dispatch_output, 
+            dispatch_indices, 
+            self.config, 
+            recv_count
+        )
+
+        if self.rank == 0 and round == 0:
+            print("\n--- Packed Output Visualization (Rank 0) ---")
+            print(f"Packed Shape: {packed_input.shape}")
+            print(f"Expert Counts (Tokens per Expert): {expert_counts.tolist()}")
+            if recv_count > 0:
+                unique_tokens = torch.unique(sorted_indices)
+                print(f"Unique Tokens Received: {len(unique_tokens)}")
+                print(f"Total Token-Expert Pairs: {len(sorted_indices)}")
+                if len(sorted_indices) > len(unique_tokens):
+                    print(">> Duplication Confirmed: Some tokens are present in multiple expert rows.")
+                else:
+                    print(">> No Duplication: Each token is assigned to at most one local expert.")
+            print("--------------------------------------------\n")
+        
+        # 2. Simulated GEMM (Multiply by 1.0)
+        # Scale the input so that the sum over experts equals the original token
+        # This ensures compatibility with the test expectation (identity per rank)
+        if recv_count > 0:
+            token_counts = torch.bincount(sorted_indices, minlength=recv_count)
+            scales = 1.0 / token_counts[sorted_indices]
+            
+            E = self.config.num_experts_per_rank
+            expert_ids = torch.repeat_interleave(torch.arange(E, device=self.device), expert_counts)
+            slot_indices = torch.cat([torch.arange(c, device=self.device) for c in expert_counts])
+            
+            packed_input[expert_ids, slot_indices] *= scales.unsqueeze(-1)
+
+        gemm_output = packed_input * 1.0
+        
+        # 3. Inverse Transform
+        rec_output = mori.triton_inverse_transform_dispatch_output(
+            gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+        )
+
+        if recv_count > 0:
+            expected_rec = dispatch_output[:recv_count]
+            
+            if not torch.allclose(rec_output[:recv_count], expected_rec, atol=1e-2, rtol=1e-2):
+                print(f"Rank {self.rank}: Reconstruction mismatch!")
+                diff = (rec_output[:recv_count] - expected_rec).abs()
+                print(f"Max diff: {diff.max().item()}")
+                assert False
+        # --- Simulated GEMM End ---
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
@@ -337,7 +474,7 @@ class EpDispatchCombineTestCase:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
         combine_output, combine_output_weight = op.combine(
-            dispatch_output,
+            rec_output,
             dispatch_weights,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
@@ -540,10 +677,47 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            torch.cuda.synchronize()
+            
             total_recv_num_token = dispatch_recv_num_token[0].item()
+            
+            # --- Simulated GEMM Start ---
+            packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
+                dispatch_output, 
+                dispatch_indices, 
+                self.config, 
+                total_recv_num_token
+            )
+            torch.cuda.synchronize()
+            # 2. Simulated GEMM (Multiply by 1.0)
+            if total_recv_num_token > 0:
+                token_counts = torch.bincount(sorted_indices, minlength=total_recv_num_token)
+                scales = 1.0 / token_counts[sorted_indices]
+                
+                E = self.config.num_experts_per_rank
+                expert_ids = torch.repeat_interleave(torch.arange(E, device=self.device), expert_counts)
+                slot_indices = torch.cat([torch.arange(c, device=self.device) for c in expert_counts])
+                
+                packed_input[expert_ids, slot_indices] *= scales.unsqueeze(-1)
+
+            gemm_output = packed_input * 1.0
+
+            rec_output = mori.triton_inverse_transform_dispatch_output(
+                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+            )
+
+            if total_recv_num_token > 0:
+                expected_rec = dispatch_output[:total_recv_num_token]
+                
+                if not torch.allclose(rec_output[:total_recv_num_token], expected_rec, atol=1e-2, rtol=1e-2):
+                    print(f"Rank {self.rank}: Reconstruction mismatch!")
+                    diff = (rec_output[:total_recv_num_token] - expected_rec).abs()
+                    print(f"Max diff: {diff.max().item()}")
+                    assert False
+            # --- Simulated GEMM End ---
+
+
             combine_output, _ = op.combine(
-                dispatch_output,
+                rec_output,
                 dispatch_weights,
                 # None,
                 all_rank_indices[self.rank],
@@ -577,9 +751,21 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
+            
+            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output(
+                dispatch_output, 
+                dispatch_indices, 
+                self.config, 
+                total_recv_num_token
+            )
+            gemm_output = packed_input 
             events[2 * i + 1].record()
+            rec_output = mori.inverse_transform_dispatch_output(
+                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+            )
+        
             combine_output, _ = op.combine(
-                dispatch_output,
+                rec_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
