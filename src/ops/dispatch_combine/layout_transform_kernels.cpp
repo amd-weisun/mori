@@ -189,13 +189,6 @@ void LaunchInverseTransformDispatchOutput(
 }
 
 // Explicit Instantiation
-template void LaunchTransformDispatchOutput<float>(
-    const float* src, float* dst,
-    const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
-    int64_t stride_src_n, int64_t stride_src_h,
-    int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream);
-
 template void LaunchTransformDispatchOutput<__half>(
     const __half* src, __half* dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
@@ -352,7 +345,7 @@ void LaunchPrepareTransformMetadata(
     hipStream_t stream) {
     
     // 1. Zero out expert counts
-    hipMemsetAsync(expert_counts, 0, num_experts_per_rank * sizeof(index_t), stream);
+    (void)hipMemsetAsync(expert_counts, 0, num_experts_per_rank * sizeof(index_t), stream);
     
     // 2. Count Experts
     int block_size = 256;
@@ -372,8 +365,8 @@ void LaunchPrepareTransformMetadata(
     
     index_t* d_offsets;
     index_t* d_base_offsets;
-    hipMallocAsync(&d_offsets, num_experts_per_rank * sizeof(index_t), stream);
-    hipMallocAsync(&d_base_offsets, num_experts_per_rank * sizeof(index_t), stream);
+    (void)hipMallocAsync(&d_offsets, num_experts_per_rank * sizeof(index_t), stream);
+    (void)hipMallocAsync(&d_base_offsets, num_experts_per_rank * sizeof(index_t), stream);
     
     // Launch Scan
     // Shared memory size: num_experts * sizeof(index_t)
@@ -388,7 +381,7 @@ void LaunchPrepareTransformMetadata(
     );
     
     // Copy base offsets to current offsets for atomic incrementing
-    hipMemcpyAsync(d_offsets, d_base_offsets, num_experts_per_rank * sizeof(index_t), hipMemcpyDeviceToDevice, stream);
+    (void)hipMemcpyAsync(d_offsets, d_base_offsets, num_experts_per_rank * sizeof(index_t), hipMemcpyDeviceToDevice, stream);
     
     // 4. Scatter
     ScatterIndicesKernel<<<num_blocks, block_size, 0, stream>>>(
@@ -401,8 +394,8 @@ void LaunchPrepareTransformMetadata(
         num_tokens, K, num_experts_per_rank, rank
     );
     
-    hipFreeAsync(d_offsets, stream);
-    hipFreeAsync(d_base_offsets, stream);
+    (void)hipFreeAsync(d_offsets, stream);
+    (void)hipFreeAsync(d_base_offsets, stream);
 }
 
 }  // namespace moe
