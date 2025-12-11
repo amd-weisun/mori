@@ -20,7 +20,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
-#include "mori/ops/dispatch_combine/layout_transform_kernels.hpp"
 
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
@@ -38,6 +37,7 @@
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
+#include "mori/ops/dispatch_combine/layout_transform_kernels.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
