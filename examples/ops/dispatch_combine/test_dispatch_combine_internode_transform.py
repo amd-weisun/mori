@@ -392,6 +392,7 @@ class EpDispatchCombineTestCase:
 
         if self.rank == 0 and round == 0:
             print("\n--- Packed Output Visualization (Rank 0) ---")
+            print(f"Original dispatch_output Shape: {dispatch_output.shape}")
             print(f"Packed Shape: {packed_input.shape}")
             print(f"Expert Counts (Tokens per Expert): {expert_counts.tolist()}")
             if recv_count > 0:
@@ -423,6 +424,28 @@ class EpDispatchCombineTestCase:
         rec_output = mori.inverse_transform_dispatch_output_gpu(
             gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
         )
+
+        if self.rank == 0 and round == 0:
+            print("\n--- rec_output Visualization (Rank 0) ---")
+            print(f"rec_output Shape: {rec_output.shape}")
+            print(f"Original dispatch_output Shape: {dispatch_output.shape}")
+            print(f"simulated gemm_output Shape: {gemm_output.shape}")
+            if recv_count > 0:
+                expected_rec = dispatch_output[:recv_count]
+                valid_rec = rec_output[:recv_count]
+                
+                diff = (valid_rec - expected_rec).abs()
+                max_diff = diff.max().item()
+                
+                print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
+                print(f"  Max Diff: {max_diff:.6f}")
+                if max_diff < 1e-2:
+                    print(">> SUCCESS: Reconstruction matches original input.")
+                else:
+                    print(">> FAILURE: Reconstruction mismatch.")
+            else:
+                print("No tokens received.")
+            print("--------------------------------------------\n")
 
         if recv_count > 0:
             expected_rec = dispatch_output[:recv_count]
