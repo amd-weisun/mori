@@ -438,23 +438,73 @@ class EpDispatchCombineTestCase:
                 max_diff = diff.max().item()
                 
                 print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
-                print(f"  Max Diff: {max_diff:.6f}")
+                print(f"  Max Diff (Strict Order): {max_diff:.6f}")
                 if max_diff < 1e-2:
                     print(">> SUCCESS: Reconstruction matches original input.")
                 else:
                     print(">> FAILURE: Reconstruction mismatch.")
+                    
+                    # Debug: Check if it's just a permutation issue
+                    # Flatten to compare set of values
+                    rec_sorted, _ = torch.sort(valid_rec.flatten())
+                    exp_sorted, _ = torch.sort(expected_rec.flatten())
+                    sort_diff = (rec_sorted - exp_sorted).abs().max().item()
+                    print(f"  Max Diff (Sorted Values): {sort_diff:.6f}")
+                    
+                    if sort_diff < 1e-2:
+                        print(">> DIAGNOSTIC: Values are correct but order is wrong (Permutation Issue).")
+                    else:
+                        print(">> DIAGNOSTIC: Values are incorrect.")
+            else:
+                print("No tokens received.")
+            print("--------------------------------------------\n")
+
+            print("\n--- Sorted Indices Verification (Rank 0) ---")
+            print(f"sorted_indices Shape: {sorted_indices.shape}")
+            print(f"dispatch_indices Shape: {dispatch_indices.shape}")
+            if recv_count > 0:
+                # Verify that sorted_indices matches what we expect from dispatch_indices
+                valid_indices = dispatch_indices[:recv_count]
+                E = self.config.num_experts_per_rank
+                K = self.config.num_experts_per_token
+                
+                flat_indices = valid_indices.view(-1)
+                is_local = (flat_indices // E) == self.config.rank
+                active_flat_indices = torch.nonzero(is_local).squeeze(-1)
+                
+                expected_token_indices = active_flat_indices.div(K, rounding_mode='floor')
+                local_expert_ids = flat_indices[active_flat_indices] % E
+                
+                # Sort by expert ID (matching gpu_kernels.py logic)
+                sort_order = torch.argsort(local_expert_ids, stable=True)
+                expected_sorted_indices = expected_token_indices[sort_order]
+                
+                matches = torch.equal(sorted_indices, expected_sorted_indices)
+                
+                if matches:
+                    print(">> SUCCESS: sorted_indices matches expected derivation from dispatch_indices.")
+                else:
+                    print(">> FAILURE: sorted_indices mismatch against expected derivation.")
+                    print(f"  sorted_indices shape: {sorted_indices.shape}")
+                    print(f"  expected shape: {expected_sorted_indices.shape}")
+                    if sorted_indices.shape == expected_sorted_indices.shape:
+                        diff = (sorted_indices != expected_sorted_indices).sum().item()
+                        print(f"  Mismatched elements: {diff}")
             else:
                 print("No tokens received.")
             print("--------------------------------------------\n")
 
         if recv_count > 0:
             expected_rec = dispatch_output[:recv_count]
-            
+            print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
             if not torch.allclose(rec_output[:recv_count], expected_rec, atol=1e-2, rtol=1e-2):
                 print(f"Rank {self.rank}: Reconstruction mismatch!")
                 diff = (rec_output[:recv_count] - expected_rec).abs()
                 print(f"Max diff: {diff.max().item()}")
                 assert False
+            else:
+                print(f"Rank {self.rank}: Reconstruction matches original input.")
+
         # --- Simulated GEMM End ---
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
