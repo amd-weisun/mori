@@ -8,38 +8,37 @@ def _transform_kernel(
     indices_ptr, expert_ids_ptr, slot_ids_ptr,
     stride_src_n, stride_src_h,
     stride_dst_e, stride_dst_c, stride_dst_h,
-    num_tokens, H,
+    num_tokens, 
+    H: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr
 ):
-    pid_n = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    pid = tl.program_id(0)
+    
+    # 1. Load Metadata (Once per block of N)
+    offs_n = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask_n = offs_n < num_tokens
-
-    offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-    mask_h = offs_h < H
-
-    # Load metadata
-    # indices_ptr: [num_tokens], indices into src
+    
     src_idx = tl.load(indices_ptr + offs_n, mask=mask_n, other=0)
-    # expert_ids_ptr: [num_tokens], destination expert
     expert_id = tl.load(expert_ids_ptr + offs_n, mask=mask_n, other=0)
-    # slot_ids_ptr: [num_tokens], destination slot
     slot_id = tl.load(slot_ids_ptr + offs_n, mask=mask_n, other=0)
-
-    # Compute pointers
-    src_ptrs = src_ptr + (src_idx[:, None] * stride_src_n + offs_h[None, :] * stride_src_h)
-    dst_ptrs = dst_ptr + (
-        expert_id[:, None] * stride_dst_e +
-        slot_id[:, None] * stride_dst_c +
-        offs_h[None, :] * stride_dst_h
-    )
-
-    # Load and Store
-    vals = tl.load(src_ptrs, mask=mask_n[:, None] & mask_h[None, :], other=0.0)
-    tl.store(dst_ptrs, vals, mask=mask_n[:, None] & mask_h[None, :])
+    
+    # Pre-calculate base pointers for rows
+    src_row_base = src_ptr + src_idx * stride_src_n
+    dst_row_base = dst_ptr + expert_id * stride_dst_e + slot_id * stride_dst_c
+    
+    # 2. Loop over H
+    for off_h in range(0, H, BLOCK_SIZE_H):
+        offs_h = off_h + tl.arange(0, BLOCK_SIZE_H)
+        mask_h = offs_h < H
+        
+        # Pointers for this chunk
+        src_ptrs = src_row_base[:, None] + offs_h[None, :] * stride_src_h
+        dst_ptrs = dst_row_base[:, None] + offs_h[None, :] * stride_dst_h
+        
+        # Load and Store
+        vals = tl.load(src_ptrs, mask=mask_n[:, None] & mask_h[None, :], other=0.0)
+        tl.store(dst_ptrs, vals, mask=mask_n[:, None] & mask_h[None, :])
 
 
 @triton.jit
@@ -48,40 +47,39 @@ def _inverse_transform_kernel(
     indices_ptr, expert_ids_ptr, slot_ids_ptr,
     stride_src_e, stride_src_c, stride_src_h,
     stride_dst_n, stride_dst_h,
-    num_tokens, H,
+    num_tokens, 
+    H: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr
 ):
-    pid_n = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    mask_n = offs_n < num_tokens
-
-    offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-    mask_h = offs_h < H
-
-    # Load metadata
-    # indices_ptr: [num_tokens], destination row in dst
-    dst_idx = tl.load(indices_ptr + offs_n, mask=mask_n, other=0)
-    # expert_ids_ptr: [num_tokens], source expert
-    expert_id = tl.load(expert_ids_ptr + offs_n, mask=mask_n, other=0)
-    # slot_ids_ptr: [num_tokens], source slot
-    slot_id = tl.load(slot_ids_ptr + offs_n, mask=mask_n, other=0)
-
-    # Compute pointers
-    src_ptrs = src_ptr + (
-        expert_id[:, None] * stride_src_e +
-        slot_id[:, None] * stride_src_c +
-        offs_h[None, :] * stride_src_h
-    )
-    dst_ptrs = dst_ptr + (dst_idx[:, None] * stride_dst_n + offs_h[None, :] * stride_dst_h)
-
-    # Load
-    vals = tl.load(src_ptrs, mask=mask_n[:, None] & mask_h[None, :], other=0.0)
+    pid = tl.program_id(0)
     
-    # Atomic Add to Dst
-    tl.atomic_add(dst_ptrs, vals, mask=mask_n[:, None] & mask_h[None, :])
+    # 1. Load Metadata (Once per block of N)
+    offs_n = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_n = offs_n < num_tokens
+    
+    dst_idx = tl.load(indices_ptr + offs_n, mask=mask_n, other=0)
+    expert_id = tl.load(expert_ids_ptr + offs_n, mask=mask_n, other=0)
+    slot_id = tl.load(slot_ids_ptr + offs_n, mask=mask_n, other=0)
+    
+    # Pre-calculate base pointers for rows
+    src_row_base = src_ptr + expert_id * stride_src_e + slot_id * stride_src_c
+    dst_row_base = dst_ptr + dst_idx * stride_dst_n
+    
+    # 2. Loop over H
+    for off_h in range(0, H, BLOCK_SIZE_H):
+        offs_h = off_h + tl.arange(0, BLOCK_SIZE_H)
+        mask_h = offs_h < H
+        
+        # Pointers for this chunk
+        src_ptrs = src_row_base[:, None] + offs_h[None, :] * stride_src_h
+        dst_ptrs = dst_row_base[:, None] + offs_h[None, :] * stride_dst_h
+        
+        # Load
+        vals = tl.load(src_ptrs, mask=mask_n[:, None] & mask_h[None, :], other=0.0)
+        
+        # Atomic Add to Dst
+        tl.atomic_add(dst_ptrs, vals, mask=mask_n[:, None] & mask_h[None, :])
 
 
 def triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count):
@@ -130,10 +128,7 @@ def triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, 
     
     num_active = sorted_token_indices.size(0)
     
-    grid = lambda META: (
-        triton.cdiv(num_active, META['BLOCK_SIZE_N']),
-        triton.cdiv(H, META['BLOCK_SIZE_H'])
-    )
+    grid = lambda META: (triton.cdiv(num_active, META['BLOCK_SIZE_N']),)
     
     _transform_kernel[grid](
         valid_tokens, packed_output,
@@ -141,7 +136,8 @@ def triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, 
         valid_tokens.stride(0), valid_tokens.stride(1),
         packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
         num_active, H,
-        BLOCK_SIZE_N=32, BLOCK_SIZE_H=128
+        BLOCK_SIZE_N=64, BLOCK_SIZE_H=512,
+        num_stages=4, num_warps=4
     )
     
     return packed_output, sorted_token_indices, expert_counts
@@ -164,10 +160,7 @@ def triton_inverse_transform_dispatch_output(packed_output, original_indices, ex
     
     rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
     
-    grid = lambda META: (
-        triton.cdiv(total_active, META['BLOCK_SIZE_N']),
-        triton.cdiv(H, META['BLOCK_SIZE_H'])
-    )
+    grid = lambda META: (triton.cdiv(total_active, META['BLOCK_SIZE_N']),)
     
     _inverse_transform_kernel[grid](
         packed_output, rec_output,
@@ -175,7 +168,8 @@ def triton_inverse_transform_dispatch_output(packed_output, original_indices, ex
         packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
         rec_output.stride(0), rec_output.stride(1),
         total_active, H,
-        BLOCK_SIZE_N=32, BLOCK_SIZE_H=128
+        BLOCK_SIZE_N=64, BLOCK_SIZE_H=512,
+        num_stages=4, num_warps=4
     )
     
     return rec_output

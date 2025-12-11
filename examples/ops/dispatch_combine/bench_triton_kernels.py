@@ -1,6 +1,7 @@
 import torch
 import triton
 import time
+import mori
 from triton_kernels import triton_transform_dispatch_output, triton_inverse_transform_dispatch_output
 
 class MockConfig:
@@ -81,11 +82,11 @@ def run_benchmark():
     
     # Benchmark Parameters
     configs = [
-        (128, 7168, 288, 8),
+        (128*16, 7168, 288, 8),
     ]
     
-    print(f"{'N':<10} {'H':<10} {'Operation':<20} {'Baseline (ms)':<15} {'Triton (ms)':<15} {'Speedup':<10}")
-    print("-" * 85)
+    print(f"{'N':<10} {'H':<10} {'Operation':<20} {'Baseline (ms)':<15} {'Triton (ms)':<15} {'C++ GPU (ms)':<15} {'Speedup (Tri)':<15} {'Speedup (Cpp)':<15}")
+    print("-" * 115)
 
     for N, H, E, K in configs:
         config = MockConfig(E, 0)
@@ -99,21 +100,25 @@ def run_benchmark():
         # Warmup & Correctness Check
         base_packed, base_idx, base_counts = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
         tri_packed, tri_idx, tri_counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
-        
-        assert torch.allclose(base_packed, tri_packed), "Transform Output Mismatch"
+        cpp_packed, cpp_idx, cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
+
+        assert torch.allclose(base_packed, tri_packed), "Triton Transform Output Mismatch"
+        assert torch.allclose(base_packed, cpp_packed), "C++ Transform Output Mismatch"
         
         # Benchmark Transform
         ms_base_trans = triton.testing.do_bench(lambda: baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
         ms_tri_trans = triton.testing.do_bench(lambda: triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
+        ms_cpp_trans = triton.testing.do_bench(lambda: mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count))
         
-        print(f"{N:<10} {H:<10} {'Transform':<20} {ms_base_trans:<15.4f} {ms_tri_trans:<15.4f} {ms_base_trans/ms_tri_trans:<10.2f}")
+        print(f"{N:<10} {H:<10} {'Transform':<20} {ms_base_trans:<15.4f} {ms_tri_trans:<15.4f} {ms_cpp_trans:<15.4f} {ms_base_trans/ms_tri_trans:<15.2f} {ms_base_trans/ms_cpp_trans:<15.2f}")
         
         # Benchmark Inverse
         # Use the packed output from transform step
         ms_base_inv = triton.testing.do_bench(lambda: baseline_inverse_transform_dispatch_output(base_packed, base_idx, base_counts, N))
         ms_tri_inv = triton.testing.do_bench(lambda: triton_inverse_transform_dispatch_output(tri_packed, tri_idx, tri_counts, N))
+        ms_cpp_inv = triton.testing.do_bench(lambda: mori.inverse_transform_dispatch_output_gpu(cpp_packed, cpp_idx, cpp_counts, N))
         
-        print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15.4f} {ms_base_inv/ms_tri_inv:<10.2f}")
+        print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15.4f} {ms_cpp_inv:<15.4f} {ms_base_inv/ms_tri_inv:<15.2f} {ms_base_inv/ms_cpp_inv:<15.2f}")
 
 if __name__ == "__main__":
     run_benchmark()

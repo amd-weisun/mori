@@ -453,7 +453,7 @@ class EpDispatchCombineTestCase:
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
             is_pass = torch.equal(
-                dispatch_output[i], all_rank_input[src_pe][src_tok_id]
+                rec_output[i], all_rank_input[src_pe][src_tok_id]
             )
             if not is_pass:
                 print(
@@ -751,7 +751,8 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            
+            # EpDispatchCombineTestCase.transform_dispatch_output
+            # mori.triton_transform_dispatch_output
             packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
                 dispatch_output, 
                 dispatch_indices, 
@@ -760,6 +761,8 @@ class EpDispatchCombineTestCase:
             )
             gemm_output = packed_input 
             events[2 * i + 1].record()
+            # EpDispatchCombineTestCase.inverse_transform_dispatch_output
+            # mori.triton_inverse_transform_dispatch_output
             rec_output = mori.triton_inverse_transform_dispatch_output(
                 gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
             )

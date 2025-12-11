@@ -20,6 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
+#include "mori/ops/dispatch_combine/layout_transform_kernels.hpp"
 
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
@@ -210,6 +211,74 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
 }
 
+#define DISPATCH_FLOAT_HALF_BFLOAT16(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH( \
+      TYPE, NAME, \
+      AT_DISPATCH_CASE(at::ScalarType::Float, [&] { \
+        using scalar_t = float; \
+        using HipT = float; \
+        __VA_ARGS__(); \
+      }) \
+      AT_DISPATCH_CASE(at::ScalarType::Half, [&] { \
+        using scalar_t = at::Half; \
+        using HipT = __half; \
+        __VA_ARGS__(); \
+      }) \
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] { \
+        using scalar_t = at::BFloat16; \
+        using HipT = __hip_bfloat16; \
+        __VA_ARGS__(); \
+      }) \
+  )
+
+void TransformDispatchOutputGPU(
+    torch::Tensor dispatch_output, torch::Tensor packed_output,
+    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids) {
+    
+    int num_tokens = indices.size(0);
+    int H = dispatch_output.size(1);
+    
+    DISPATCH_FLOAT_HALF_BFLOAT16(dispatch_output.scalar_type(), "TransformDispatchOutputGPU", ([&] {
+        using T = scalar_t;
+        
+        mori::moe::LaunchTransformDispatchOutput<HipT>(
+            reinterpret_cast<const HipT*>(dispatch_output.data_ptr<T>()),
+            reinterpret_cast<HipT*>(packed_output.data_ptr<T>()),
+            indices.data_ptr<mori::moe::index_t>(),
+            expert_ids.data_ptr<mori::moe::index_t>(),
+            slot_ids.data_ptr<mori::moe::index_t>(),
+            dispatch_output.stride(0), dispatch_output.stride(1),
+            packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
+            num_tokens, H,
+            at::cuda::getCurrentHIPStream()
+        );
+    }));
+}
+
+void InverseTransformDispatchOutputGPU(
+    torch::Tensor packed_output, torch::Tensor rec_output,
+    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids) {
+    
+    int num_tokens = indices.size(0);
+    int H = packed_output.size(2);
+    
+    DISPATCH_FLOAT_HALF_BFLOAT16(packed_output.scalar_type(), "InverseTransformDispatchOutputGPU", ([&] {
+        using T = scalar_t;
+        
+        mori::moe::LaunchInverseTransformDispatchOutput<HipT>(
+            reinterpret_cast<const HipT*>(packed_output.data_ptr<T>()),
+            reinterpret_cast<HipT*>(rec_output.data_ptr<T>()),
+            indices.data_ptr<mori::moe::index_t>(),
+            expert_ids.data_ptr<mori::moe::index_t>(),
+            slot_ids.data_ptr<mori::moe::index_t>(),
+            packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
+            rec_output.stride(0), rec_output.stride(1),
+            num_tokens, H,
+            at::cuda::getCurrentHIPStream()
+        );
+    }));
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -236,6 +305,9 @@ namespace {}
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
+  m.def("transform_dispatch_output_gpu", &TransformDispatchOutputGPU);
+  m.def("inverse_transform_dispatch_output_gpu", &InverseTransformDispatchOutputGPU);
+
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)
