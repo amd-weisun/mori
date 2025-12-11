@@ -82,10 +82,13 @@ def run_benchmark():
     
     # Benchmark Parameters
     configs = [
-        (128*16, 7168, 288, 8),
+        (128*8, 7168, 288, 8),
+        (128*4, 7168, 288, 8),
+        (128*2, 7168, 288, 8),
+        (128*1, 7168, 288, 8),
     ]
     
-    print(f"{'N':<10} {'H':<10} {'Operation':<20} {'Baseline (ms)':<15} {'Triton (ms)':<15} {'C++ GPU (ms)':<15} {'Speedup (Tri)':<15} {'Speedup (Cpp)':<15}")
+    print(f"{'N':<10} {'H':<10} {'Operation':<20} {'Baseline (ms)':<15} {'Triton (ms)':<15} {'HIP GPU (ms)':<15} {'Speedup (Tri)':<15} {'Speedup (Cpp)':<15}")
     print("-" * 115)
 
     for N, H, E, K in configs:
@@ -103,7 +106,7 @@ def run_benchmark():
         cpp_packed, cpp_idx, cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
 
         assert torch.allclose(base_packed, tri_packed), "Triton Transform Output Mismatch"
-        assert torch.allclose(base_packed, cpp_packed), "C++ Transform Output Mismatch"
+        assert torch.allclose(base_packed, cpp_packed), "HIP Transform Output Mismatch"
         
         # Benchmark Transform
         ms_base_trans = triton.testing.do_bench(lambda: baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))

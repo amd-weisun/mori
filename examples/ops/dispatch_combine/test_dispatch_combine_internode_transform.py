@@ -383,7 +383,7 @@ class EpDispatchCombineTestCase:
         recv_count = dispatch_recv_num_token.item()
         
         # 1. Transform Layout
-        packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
+        packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
             dispatch_output, 
             dispatch_indices, 
             self.config, 
@@ -420,7 +420,7 @@ class EpDispatchCombineTestCase:
         gemm_output = packed_input * 1.0
         
         # 3. Inverse Transform
-        rec_output = mori.triton_inverse_transform_dispatch_output(
+        rec_output = mori.inverse_transform_dispatch_output_gpu(
             gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
         )
 
@@ -681,7 +681,10 @@ class EpDispatchCombineTestCase:
             total_recv_num_token = dispatch_recv_num_token[0].item()
             
             # --- Simulated GEMM Start ---
-            packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
+            # EpDispatchCombineTestCase.transform_dispatch_output
+            # mori.triton_transform_dispatch_output
+            # mori.transform_dispatch_output_gpu
+            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
                 dispatch_output, 
                 dispatch_indices, 
                 self.config, 
@@ -700,8 +703,10 @@ class EpDispatchCombineTestCase:
                 packed_input[expert_ids, slot_indices] *= scales.unsqueeze(-1)
 
             gemm_output = packed_input * 1.0
-
-            rec_output = mori.triton_inverse_transform_dispatch_output(
+            # EpDispatchCombineTestCase.inverse_transform_dispatch_output
+            # mori.triton_inverse_transform_dispatch_output
+            # mori.inverse_transform_dispatch_output_gpu
+            rec_output = mori.inverse_transform_dispatch_output_gpu(
                 gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
             )
 
@@ -753,7 +758,8 @@ class EpDispatchCombineTestCase:
             )
             # EpDispatchCombineTestCase.transform_dispatch_output
             # mori.triton_transform_dispatch_output
-            packed_input, sorted_indices, expert_counts = mori.triton_transform_dispatch_output(
+            # mori.transform_dispatch_output_gpu
+            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
                 dispatch_output, 
                 dispatch_indices, 
                 self.config, 
@@ -763,7 +769,8 @@ class EpDispatchCombineTestCase:
             events[2 * i + 1].record()
             # EpDispatchCombineTestCase.inverse_transform_dispatch_output
             # mori.triton_inverse_transform_dispatch_output
-            rec_output = mori.triton_inverse_transform_dispatch_output(
+            # mori.inverse_transform_dispatch_output_gpu
+            rec_output = mori.inverse_transform_dispatch_output_gpu(
                 gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
             )
         
