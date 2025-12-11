@@ -106,7 +106,7 @@ def run_benchmark():
         cpp_packed, cpp_idx, cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
 
         # Check counts match
-        assert torch.allclose(base_counts, cpp_counts), "HIP Expert Counts Mismatch"
+        assert torch.allclose(base_counts, cpp_counts.to(base_counts.dtype)), "HIP Expert Counts Mismatch"
 
         # Check Inverse Reconstruction (End-to-End Correctness)
         # This is robust to reordering within experts
