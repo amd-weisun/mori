@@ -70,14 +70,14 @@ __global__ void TransformDispatchOutputKernel(
 
 template <typename T>
 __device__ inline void VectorizedAtomicAdd(T* dst, T val) {
-    atomicAdd(dst, val);
+    AtomicAdd(dst, val);
 }
 
 // Specialization for __half to use __half2 optimization if possible
 // Note: This assumes 4-byte alignment for __half2 access
 template <>
 __device__ inline void VectorizedAtomicAdd<__half>(__half* dst, __half val) {
-    atomicAdd(dst, val);
+    AtomicAdd(dst, val);
 }
 
 template <typename T>
