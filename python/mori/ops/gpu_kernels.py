@@ -51,7 +51,7 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
     # Call the C++ binding
     # Note: We pass the full tensors. The kernel handles the indexing.
     # Ensure indices are int32 as expected by C++ (index_t is int32_t)
-    mori.transform_dispatch_output_gpu(
+    mori.cpp.transform_dispatch_output_gpu(
         valid_tokens, 
         packed_output,
         sorted_token_indices.to(torch.int32), 
@@ -80,7 +80,7 @@ def inverse_transform_dispatch_output_gpu(packed_output, original_indices, exper
     rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
     
     # Call the C++ binding
-    mori.inverse_transform_dispatch_output_gpu(
+    mori.cpp.inverse_transform_dispatch_output_gpu(
         packed_output,
         rec_output,
         original_indices.to(torch.int32),
