@@ -426,38 +426,38 @@ class EpDispatchCombineTestCase:
         )
 
         if self.rank == 0 and round == 0:
-            print("\n--- rec_output Visualization (Rank 0) ---")
-            print(f"rec_output Shape: {rec_output.shape}")
-            print(f"Original dispatch_output Shape: {dispatch_output.shape}")
-            print(f"simulated gemm_output Shape: {gemm_output.shape}")
-            if recv_count > 0:
-                expected_rec = dispatch_output[:recv_count]
-                valid_rec = rec_output[:recv_count]
+            # print("\n--- rec_output Visualization (Rank 0) ---")
+            # print(f"rec_output Shape: {rec_output.shape}")
+            # print(f"Original dispatch_output Shape: {dispatch_output.shape}")
+            # print(f"simulated gemm_output Shape: {gemm_output.shape}")
+            # if recv_count > 0:
+            #     expected_rec = dispatch_output[:recv_count]
+            #     valid_rec = rec_output[:recv_count]
                 
-                diff = (valid_rec - expected_rec).abs()
-                max_diff = diff.max().item()
+            #     diff = (valid_rec - expected_rec).abs()
+            #     max_diff = diff.max().item()
                 
-                print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
-                print(f"  Max Diff (Strict Order): {max_diff:.6f}")
-                if max_diff < 1e-2:
-                    print(">> SUCCESS: Reconstruction matches original input.")
-                else:
-                    print(">> FAILURE: Reconstruction mismatch.")
+            #     print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
+            #     print(f"  Max Diff (Strict Order): {max_diff:.6f}")
+            #     if max_diff < 1e-2:
+            #         print(">> SUCCESS: Reconstruction matches original input.")
+            #     else:
+            #         print(">> FAILURE: Reconstruction mismatch.")
                     
-                    # Debug: Check if it's just a permutation issue
-                    # Flatten to compare set of values
-                    rec_sorted, _ = torch.sort(valid_rec.flatten())
-                    exp_sorted, _ = torch.sort(expected_rec.flatten())
-                    sort_diff = (rec_sorted - exp_sorted).abs().max().item()
-                    print(f"  Max Diff (Sorted Values): {sort_diff:.6f}")
+            #         # Debug: Check if it's just a permutation issue
+            #         # Flatten to compare set of values
+            #         rec_sorted, _ = torch.sort(valid_rec.flatten())
+            #         exp_sorted, _ = torch.sort(expected_rec.flatten())
+            #         sort_diff = (rec_sorted - exp_sorted).abs().max().item()
+            #         print(f"  Max Diff (Sorted Values): {sort_diff:.6f}")
                     
-                    if sort_diff < 1e-2:
-                        print(">> DIAGNOSTIC: Values are correct but order is wrong (Permutation Issue).")
-                    else:
-                        print(">> DIAGNOSTIC: Values are incorrect.")
-            else:
-                print("No tokens received.")
-            print("--------------------------------------------\n")
+            #         if sort_diff < 1e-2:
+            #             print(">> DIAGNOSTIC: Values are correct but order is wrong (Permutation Issue).")
+            #         else:
+            #             print(">> DIAGNOSTIC: Values are incorrect.")
+            # else:
+            #     print("No tokens received.")
+            # print("--------------------------------------------\n")
 
             print("\n--- Sorted Indices Verification (Rank 0) ---")
             print(f"sorted_indices Shape: {sorted_indices.shape}")
@@ -496,7 +496,11 @@ class EpDispatchCombineTestCase:
 
         if recv_count > 0:
             expected_rec = dispatch_output[:recv_count]
+            print("\n--- rec_output check (Rank {self.rank}}) ---")
             print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
+            print(f"rec_output Shape: {rec_output.shape}")
+            print(f"Original dispatch_output Shape: {dispatch_output.shape}")
+            print(f"simulated gemm_output Shape: {gemm_output.shape}")
             if not torch.allclose(rec_output[:recv_count], expected_rec, atol=1e-2, rtol=1e-2):
                 print(f"Rank {self.rank}: Reconstruction mismatch!")
                 diff = (rec_output[:recv_count] - expected_rec).abs()
