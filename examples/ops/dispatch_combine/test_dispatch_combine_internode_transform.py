@@ -593,6 +593,8 @@ class EpDispatchCombineTestCase:
                 # error_round.add(round)
                 assert False
                 # pass
+            else:
+                print(f"{self.rank} token {i} pass")
 
             if dispatch_weights is not None:
                 got_weight, expected_weight = (
