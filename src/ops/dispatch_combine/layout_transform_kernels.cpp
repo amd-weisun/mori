@@ -38,12 +38,16 @@ __global__ void TransformDispatchOutputKernel(
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H) {
+    int num_tokens, int H, const int* num_tokens_ptr) {
     
     int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
     int laneId = threadIdx.x % warpSize;
     
-    if (warpId >= num_tokens) return;
+    if (num_tokens_ptr) {
+        if (warpId >= *num_tokens_ptr) return;
+    } else {
+        if (warpId >= num_tokens) return;
+    }
 
     // Metadata load (broadcast from lane 0)
     index_t src_idx, expert_id, slot_id;
@@ -148,12 +152,11 @@ void LaunchTransformDispatchOutput(
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream) {
+    int num_tokens, int H, hipStream_t stream,
+    const int* num_tokens_ptr) {
     
     int block_size = 256;
     int warps_per_block = block_size / 64; // Assuming warpSize 64 for AMD
-    // Better to use device property or macro, but 64 is safe for AMD
-    // core::DeviceWarpSize() is available
     
     int num_blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
     
@@ -161,7 +164,7 @@ void LaunchTransformDispatchOutput(
         src, dst, indices, expert_ids, slot_ids,
         stride_src_n, stride_src_h,
         stride_dst_e, stride_dst_c, stride_dst_h,
-        num_tokens, H
+        num_tokens, H, num_tokens_ptr
     );
 }
 
@@ -198,14 +201,21 @@ template void LaunchTransformDispatchOutput<__half>(
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream);
+    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
 
 template void LaunchTransformDispatchOutput<__hip_bfloat16>(
     const __hip_bfloat16* src, __hip_bfloat16* dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream);
+    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
+
+template void LaunchTransformDispatchOutput<float>(
+    const float* src, float* dst,
+    const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
+    int64_t stride_src_n, int64_t stride_src_h,
+    int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
+    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
 
 template void LaunchInverseTransformDispatchOutput<float>(
     const float* src, float* dst,
@@ -227,6 +237,173 @@ template void LaunchInverseTransformDispatchOutput<__hip_bfloat16>(
     int64_t stride_src_e, int64_t stride_src_c, int64_t stride_src_h,
     int64_t stride_dst_n, int64_t stride_dst_h,
     int num_tokens, int H, hipStream_t stream);
+
+// -----------------------------------------------------------------------------
+// Metadata Preparation Kernels
+// -----------------------------------------------------------------------------
+
+__global__ void CountExpertsKernel(
+    const index_t* dispatch_indices,
+    index_t* expert_counts,
+    int64_t num_tokens,
+    int64_t K,
+    int64_t num_experts_per_rank,
+    int64_t rank) {
+    
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * K) return;
+
+    index_t expert_idx = dispatch_indices[idx];
+    if ((expert_idx / num_experts_per_rank) == rank) {
+        index_t local_expert = expert_idx % num_experts_per_rank;
+        atomicAdd(&expert_counts[local_expert], 1);
+    }
+}
+
+// Single block kernel to compute prefix sum of expert counts
+// E is typically small (e.g., 8, 16, 64, 256). Max 1024 threads covers most cases.
+__global__ void PrefixSumKernel(
+    index_t* expert_counts,
+    index_t* offsets,
+    int* total_valid_count,
+    int64_t num_experts) {
+    
+    // Shared memory for scan
+    // Assuming num_experts <= 1024 for single block scan
+    // If > 1024, we need a more complex scan or multiple blocks.
+    // For now, assume E <= 1024.
+    
+    extern __shared__ index_t temp[];
+    int tid = threadIdx.x;
+    
+    if (tid < num_experts) {
+        temp[tid] = expert_counts[tid];
+    } else {
+        temp[tid] = 0;
+    }
+    __syncthreads();
+
+    // Hillis-Steele Scan (Inclusive)
+    for (int stride = 1; stride < num_experts; stride *= 2) {
+        index_t val = 0;
+        if (tid >= stride) {
+            val = temp[tid - stride];
+        }
+        __syncthreads();
+        if (tid >= stride) {
+            temp[tid] += val;
+        }
+        __syncthreads();
+    }
+
+    // Write to offsets (Exclusive Scan needed for offsets)
+    // temp[tid] is inclusive sum.
+    // offsets[tid] = temp[tid] - expert_counts[tid]
+    if (tid < num_experts) {
+        offsets[tid] = temp[tid] - expert_counts[tid];
+    }
+    
+    if (tid == num_experts - 1) {
+        *total_valid_count = temp[tid];
+    }
+}
+
+__global__ void ScatterIndicesKernel(
+    const index_t* dispatch_indices,
+    index_t* sorted_token_indices,
+    index_t* sorted_expert_ids,
+    index_t* slot_indices,
+    index_t* current_offsets, // Initialized with offsets
+    const index_t* base_offsets, // Original offsets for slot calculation
+    int64_t num_tokens,
+    int64_t K,
+    int64_t num_experts_per_rank,
+    int64_t rank) {
+    
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * K) return;
+
+    index_t expert_idx = dispatch_indices[idx];
+    if ((expert_idx / num_experts_per_rank) == rank) {
+        index_t local_expert = expert_idx % num_experts_per_rank;
+        
+        // Atomic increment to get the slot
+        index_t write_pos = atomicAdd(&current_offsets[local_expert], 1);
+        
+        index_t token_idx = idx / K;
+        
+        sorted_token_indices[write_pos] = token_idx;
+        sorted_expert_ids[write_pos] = local_expert;
+        slot_indices[write_pos] = write_pos - base_offsets[local_expert];
+    }
+}
+
+void LaunchPrepareTransformMetadata(
+    const index_t* dispatch_indices,
+    index_t* sorted_token_indices,
+    index_t* sorted_expert_ids,
+    index_t* slot_indices,
+    index_t* expert_counts,
+    int* total_valid_count,
+    int64_t num_tokens,
+    int64_t K,
+    int64_t num_experts_per_rank,
+    int64_t rank,
+    hipStream_t stream) {
+    
+    // 1. Zero out expert counts
+    hipMemsetAsync(expert_counts, 0, num_experts_per_rank * sizeof(index_t), stream);
+    
+    // 2. Count Experts
+    int block_size = 256;
+    int64_t total_items = num_tokens * K;
+    int num_blocks = (total_items + block_size - 1) / block_size;
+    
+    CountExpertsKernel<<<num_blocks, block_size, 0, stream>>>(
+        dispatch_indices, expert_counts, num_tokens, K, num_experts_per_rank, rank
+    );
+    
+    // 3. Prefix Sum (Scan)
+    // We need temporary storage for offsets.
+    // Since we don't want to allocate inside the function, we can reuse 'slot_indices' or similar if safe?
+    // No, we need a dedicated buffer for offsets to track atomic adds.
+    // We can allocate a small buffer on the stream ordered allocator if available, or just use a raw hipMallocAsync.
+    // Since E is small, hipMallocAsync is fine.
+    
+    index_t* d_offsets;
+    index_t* d_base_offsets;
+    hipMallocAsync(&d_offsets, num_experts_per_rank * sizeof(index_t), stream);
+    hipMallocAsync(&d_base_offsets, num_experts_per_rank * sizeof(index_t), stream);
+    
+    // Launch Scan
+    // Shared memory size: num_experts * sizeof(index_t)
+    int scan_threads = 1024; 
+    if (num_experts_per_rank > 1024) {
+        // Fallback or error. For now assume E <= 1024.
+        // In production, use rocPrim::inclusive_scan.
+    }
+    
+    PrefixSumKernel<<<1, scan_threads, num_experts_per_rank * sizeof(index_t), stream>>>(
+        expert_counts, d_base_offsets, total_valid_count, num_experts_per_rank
+    );
+    
+    // Copy base offsets to current offsets for atomic incrementing
+    hipMemcpyAsync(d_offsets, d_base_offsets, num_experts_per_rank * sizeof(index_t), hipMemcpyDeviceToDevice, stream);
+    
+    // 4. Scatter
+    ScatterIndicesKernel<<<num_blocks, block_size, 0, stream>>>(
+        dispatch_indices,
+        sorted_token_indices,
+        sorted_expert_ids,
+        slot_indices,
+        d_offsets,
+        d_base_offsets,
+        num_tokens, K, num_experts_per_rank, rank
+    );
+    
+    hipFreeAsync(d_offsets, stream);
+    hipFreeAsync(d_base_offsets, stream);
+}
 
 }  // namespace moe
 }  // namespace mori

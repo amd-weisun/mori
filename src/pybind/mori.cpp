@@ -233,10 +233,15 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
 void TransformDispatchOutputGPU(
     torch::Tensor dispatch_output, torch::Tensor packed_output,
-    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids) {
+    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids,
+    std::optional<torch::Tensor> num_tokens_tensor) {
     
     int num_tokens = indices.size(0);
     int H = dispatch_output.size(1);
+    const int* num_tokens_ptr = nullptr;
+    if (num_tokens_tensor.has_value()) {
+        num_tokens_ptr = num_tokens_tensor.value().data_ptr<int>();
+    }
     
     DISPATCH_FLOAT_HALF_BFLOAT16(dispatch_output.scalar_type(), "TransformDispatchOutputGPU", ([&] {
         using T = scalar_t;
@@ -250,7 +255,8 @@ void TransformDispatchOutputGPU(
             dispatch_output.stride(0), dispatch_output.stride(1),
             packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
             num_tokens, H,
-            at::cuda::getCurrentHIPStream()
+            at::cuda::getCurrentHIPStream(),
+            num_tokens_ptr
         );
     }));
 }
@@ -277,6 +283,38 @@ void InverseTransformDispatchOutputGPU(
             at::cuda::getCurrentHIPStream()
         );
     }));
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+PrepareTransformMetadataGPU(
+    torch::Tensor dispatch_indices,
+    int64_t num_experts_per_rank,
+    int64_t rank) {
+    
+    int64_t num_tokens = dispatch_indices.size(0);
+    int64_t K = dispatch_indices.size(1);
+    int64_t max_valid = num_tokens * K;
+    
+    auto options = dispatch_indices.options().dtype(torch::kInt32); // index_t is int32
+    
+    auto sorted_token_indices = torch::empty({max_valid}, options);
+    auto sorted_expert_ids = torch::empty({max_valid}, options);
+    auto slot_indices = torch::empty({max_valid}, options);
+    auto expert_counts = torch::empty({num_experts_per_rank}, options);
+    auto total_valid_count = torch::empty({1}, options.dtype(torch::kInt32));
+    
+    mori::moe::LaunchPrepareTransformMetadata(
+        dispatch_indices.data_ptr<mori::moe::index_t>(),
+        sorted_token_indices.data_ptr<mori::moe::index_t>(),
+        sorted_expert_ids.data_ptr<mori::moe::index_t>(),
+        slot_indices.data_ptr<mori::moe::index_t>(),
+        expert_counts.data_ptr<mori::moe::index_t>(),
+        total_valid_count.data_ptr<int>(),
+        num_tokens, K, num_experts_per_rank, rank,
+        at::cuda::getCurrentHIPStream()
+    );
+    
+    return std::make_tuple(sorted_token_indices, sorted_expert_ids, slot_indices, expert_counts, total_valid_count);
 }
 
 }  // namespace
@@ -307,6 +345,7 @@ namespace mori {
 void RegisterMoriOps(py::module_& m) {
   m.def("transform_dispatch_output_gpu", &TransformDispatchOutputGPU);
   m.def("inverse_transform_dispatch_output_gpu", &InverseTransformDispatchOutputGPU);
+  m.def("prepare_transform_metadata_gpu", &PrepareTransformMetadataGPU);
 
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)

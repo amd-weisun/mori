@@ -1,35 +1,6 @@
 import torch
 import mori
 
-# Helper functions for torch.compile to fuse metadata operations
-@torch.compile
-def _prepare_transform_metadata(dispatch_indices, recv_count, num_experts_per_rank, rank, device):
-    valid_indices = dispatch_indices[:recv_count]
-    _, K = valid_indices.shape
-    
-    flat_indices = valid_indices.view(-1)
-    is_local = (flat_indices // num_experts_per_rank) == rank
-    active_flat_indices = torch.nonzero(is_local).squeeze(-1)
-    
-    token_indices = active_flat_indices.div(K, rounding_mode='floor')
-    local_expert_ids = flat_indices[active_flat_indices] % num_experts_per_rank
-    
-    # Sort by expert ID
-    sort_order = torch.argsort(local_expert_ids)
-    sorted_token_indices = token_indices[sort_order]
-    sorted_expert_ids = local_expert_ids[sort_order]
-    
-    # Calculate counts
-    expert_counts = torch.bincount(sorted_expert_ids, minlength=num_experts_per_rank)
-    
-    # Optimized slot_indices generation
-    offsets = torch.zeros_like(expert_counts)
-    offsets[1:] = torch.cumsum(expert_counts[:-1], dim=0)
-    base_offsets = torch.repeat_interleave(offsets, expert_counts)
-    slot_indices = torch.arange(sorted_expert_ids.size(0), device=device) - base_offsets
-    
-    return sorted_token_indices, sorted_expert_ids, slot_indices, expert_counts
-
 @torch.compile
 def _prepare_inverse_metadata(expert_counts, device):
     E = expert_counts.size(0)
@@ -48,13 +19,18 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
     """
     GPU-accelerated version of transform_dispatch_output using C++ kernels.
     """
-    # 1. Metadata Preparation (Compiled)
-    sorted_token_indices, sorted_expert_ids, slot_indices, expert_counts = _prepare_transform_metadata(
-        dispatch_indices, 
-        recv_count, 
-        config.num_experts_per_rank, 
-        config.rank, 
-        dispatch_output.device
+    # 1. Metadata Preparation (C++ Kernel)
+    # This is now fully fused and asynchronous
+    (
+        sorted_token_indices, 
+        sorted_expert_ids, 
+        slot_indices, 
+        expert_counts, 
+        total_valid_count
+    ) = mori.cpp.prepare_transform_metadata_gpu(
+        dispatch_indices[:recv_count],
+        config.num_experts_per_rank,
+        config.rank
     )
     
     N_capacity = dispatch_output.size(0)
@@ -66,14 +42,16 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
     valid_tokens = dispatch_output[:recv_count]
     
     # Call the C++ binding
-    # Note: We pass the full tensors. The kernel handles the indexing.
-    # Ensure indices are int32 as expected by C++ (index_t is int32_t)
+    # We pass total_valid_count to allow the kernel to exit early if needed,
+    # although the kernel launch grid is based on max possible tokens.
+    # The kernel will check *total_valid_count if provided.
     mori.cpp.transform_dispatch_output_gpu(
         valid_tokens, 
         packed_output,
-        sorted_token_indices.to(torch.int32), 
-        sorted_expert_ids.to(torch.int32), 
-        slot_indices.to(torch.int32)
+        sorted_token_indices, 
+        sorted_expert_ids, 
+        slot_indices,
+        total_valid_count
     )
     
     return packed_output, sorted_token_indices, expert_counts
