@@ -453,7 +453,7 @@ class EpDispatchCombineTestCase:
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
             is_pass = torch.equal(
-                rec_output[i], all_rank_input[src_pe][src_tok_id]
+                dispatch_output[i], all_rank_input[src_pe][src_tok_id]
             )
             if not is_pass:
                 print(
