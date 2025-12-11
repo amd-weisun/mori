@@ -12,8 +12,25 @@ __device__ inline void AtomicAdd(T* address, T val) {
     atomicAdd(address, val);
 }
 
-// Specialization for bfloat16 if needed, or rely on HIP
-// HIP 5.x+ supports atomicAdd for __hip_bfloat16
+// Specialization for __half
+template <>
+__device__ inline void AtomicAdd<__half>(__half* address, __half val) {
+#if defined(__HIP_PLATFORM_AMD__)
+    unsafeAtomicAdd(address, val);
+#else
+    atomicAdd(address, val);
+#endif
+}
+
+// Specialization for __hip_bfloat16
+template <>
+__device__ inline void AtomicAdd<__hip_bfloat16>(__hip_bfloat16* address, __hip_bfloat16 val) {
+#if defined(__HIP_PLATFORM_AMD__)
+    unsafeAtomicAdd(address, val);
+#else
+    atomicAdd(address, val);
+#endif
+}
 
 template <typename T>
 __global__ void TransformDispatchOutputKernel(
