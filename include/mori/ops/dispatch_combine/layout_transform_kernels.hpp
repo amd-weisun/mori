@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 #include "mori/core/core.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include <hip/hip_fp8.h>
 #include <hip/library_types.h>
 
