@@ -496,7 +496,7 @@ class EpDispatchCombineTestCase:
 
         if recv_count > 0:
             expected_rec = dispatch_output[:recv_count]
-            print("\n--- rec_output check (Rank {self.rank}}) ---")
+            print(f"\n--- rec_output check (Rank {self.rank}) ---")
             print(f"Reconstruction Check (Valid Tokens: {recv_count}):")
             print(f"rec_output Shape: {rec_output.shape}")
             print(f"Original dispatch_output Shape: {dispatch_output.shape}")
