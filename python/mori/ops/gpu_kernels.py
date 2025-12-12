@@ -54,7 +54,8 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
         total_valid_count
     )
     
-    return packed_output, sorted_token_indices, expert_counts
+    valid_count = total_valid_count.item()
+    return packed_output, sorted_token_indices[:valid_count], expert_counts
 
 def inverse_transform_dispatch_output_gpu(packed_output, original_indices, expert_counts, original_N):
     """
