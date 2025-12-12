@@ -59,7 +59,7 @@ class EpDispatchCombineTestCase:
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
-            num_experts_per_rank=self.total_experts//self.world_size,
+            num_experts_per_rank= self.total_experts//self.world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
             block_num=32,
@@ -1371,8 +1371,8 @@ if __name__ == "__main__":
 
     world_size = num_node * gpu_per_node
     
-    assert num_experts % num_ranks == 0, "num_experts must be divisible by world_size"
-    num_experts_per_rank = num_total_experts // world_size
+    assert args_cli.num_total_experts % num_ranks == 0, "num_experts must be divisible by world_size"
+    num_experts_per_rank = args_cli.num_total_experts // world_size
     print(f"num_experts_per_rank: {num_experts_per_rank} | world_size: {world_size} | gpu_per_node: {gpu_per_node} | num_node: {num_node}")
     torch.multiprocessing.spawn(
         test_dispatch_combine,
