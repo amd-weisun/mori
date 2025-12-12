@@ -43,12 +43,14 @@ class EpDispatchCombineTestCase:
         gpu_per_node,
         world_size,
         max_tokens,
+        total_experts,
         kernel_type,
         dtype=torch.bfloat16,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
+        self.total_experts = total_experts
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
@@ -57,7 +59,7 @@ class EpDispatchCombineTestCase:
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
-            num_experts_per_rank=16,
+            num_experts_per_rank= self.total_experts//self.world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
             block_num=32,
@@ -816,7 +818,7 @@ class EpDispatchCombineTestCase:
 
 
 def test_dispatch_combine(
-    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, cmd="test"
+    local_rank, num_node, gpu_per_node, max_tokens,total_experts, kernel_type, cmd="test"
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -827,6 +829,7 @@ def test_dispatch_combine(
         gpu_per_node,
         world_size,
         max_tokens,
+        total_experts,
         kernel_type,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
@@ -865,6 +868,13 @@ parser.add_argument(
     help="Type of kernel to test",
     choices=["v0", "v1", "v1_ll"],
 )
+
+parser.add_argument(
+    "--total-experts",
+    type=int,
+    default=288, # 
+    help="Maximum number of input tokens per rank (default: 288)",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -873,12 +883,16 @@ if __name__ == "__main__":
     num_node = int(os.environ["WORLD_SIZE"])
 
     world_size = num_node * gpu_per_node
+    assert args_cli.total_experts % world_size == 0, "num_experts must be divisible by world_size"
+    num_experts_per_rank = args_cli.total_experts // world_size
+    print(f"num_experts_per_rank: {num_experts_per_rank} | world_size: {world_size} | gpu_per_node: {gpu_per_node} | num_node: {num_node}")
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(
             num_node,
             gpu_per_node,
             args_cli.max_tokens,
+            args_cli.total_experts,
             args_cli.kernel_type,
             args_cli.cmd,
         ),
