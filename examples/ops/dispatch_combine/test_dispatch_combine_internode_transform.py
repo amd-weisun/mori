@@ -73,16 +73,17 @@ class EpDispatchCombineTestCase:
         self.device = torch.device("cuda", local_rank)
 
         dist.init_process_group(
-            backend="cpu:gloo",
+            backend="gloo",
             rank=self.rank,
             world_size=self.world_size,
         )
 
-        print("init process group done")
+        print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
         world_group = torch.distributed.group.WORLD
         assert world_group is not None
 
         print("process group ok")
+        # Explicitly set the name if possible, or just register
         torch._C._distributed_c10d._register_process_group("default", world_group)
         mori.shmem.shmem_torch_process_group_init("default")
 
