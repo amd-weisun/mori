@@ -1132,7 +1132,21 @@ parser.add_argument(
 )
 args_cli = parser.parse_args()
 
+# Utility: print available CUDA devices
+def print_available_cuda_devices():
+    try:
+        count = torch.cuda.device_count()
+        print(f"CUDA available: {torch.cuda.is_available()} | device_count: {count}")
+        for i in range(count):
+            name = torch.cuda.get_device_name(i)
+            print(f"  [{i}] {name}")
+    except Exception as e:
+        print(f"Failed to query CUDA devices: {e}")
+
 if __name__ == "__main__":
+    # Print GPU inventory before spawning workers
+    print_available_cuda_devices()
+
     gpu_per_node = os.environ.get("GPU_PER_NODE", None)
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
     num_node = int(os.environ["WORLD_SIZE"])
