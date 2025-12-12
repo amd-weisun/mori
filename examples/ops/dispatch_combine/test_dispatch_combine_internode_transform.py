@@ -742,7 +742,7 @@ class EpDispatchCombineTestCase:
         del op
 
     def run_bench_once(self, op, test_data, repeat=10):
-        num_events = 2 * repeat + 1
+        num_events = 4 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
 
         (
@@ -855,6 +855,8 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
+            events[4 * i + 1].record()
+
             # EpDispatchCombineTestCase.transform_dispatch_output
             # mori.triton_transform_dispatch_output
             # mori.transform_dispatch_output_gpu
@@ -872,8 +874,10 @@ class EpDispatchCombineTestCase:
                     self.config,
                     total_recv_num_token
                 )
+            events[4 * i + 2].record()
+
             gemm_output = packed_input 
-            events[2 * i + 1].record()
+            
             # EpDispatchCombineTestCase.inverse_transform_dispatch_output
             # mori.triton_inverse_transform_dispatch_output
             # mori.inverse_transform_dispatch_output_gpu
@@ -885,6 +889,7 @@ class EpDispatchCombineTestCase:
                 rec_output = EpDispatchCombineTestCase.inverse_transform_dispatch_output(
                     gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
                 )
+            events[4 * i + 3].record()
         
             combine_output, _ = op.combine(
                 rec_output,
@@ -893,7 +898,7 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            events[2 * i + 2].record()
+            events[4 * i + 4].record()
         torch.cuda.synchronize()
 
         element_size = all_rank_input[self.rank].element_size()
@@ -908,10 +913,15 @@ class EpDispatchCombineTestCase:
         )
 
         disp_duration_list = []
+        trans_duration_list = []
+        inv_duration_list = []
         comb_duration_list = []
-        for i in range(1, num_events, 2):
-            disp_duration_list.append(events[i - 1].elapsed_time(events[i]))
-            comb_duration_list.append(events[i].elapsed_time(events[i + 1]))
+        for i in range(repeat):
+            base = 4 * i
+            disp_duration_list.append(events[base].elapsed_time(events[base + 1]))
+            trans_duration_list.append(events[base + 1].elapsed_time(events[base + 2]))
+            inv_duration_list.append(events[base + 2].elapsed_time(events[base + 3]))
+            comb_duration_list.append(events[base + 3].elapsed_time(events[base + 4]))
 
         disp_rdma_bandwidth_list = [
             total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
@@ -934,6 +944,8 @@ class EpDispatchCombineTestCase:
             comb_rdma_bandwidth_list,
             comb_bandwidth_list,
             ll_mode_scale,
+            trans_duration_list,
+            inv_duration_list,
         )
 
     def bench_dispatch_combine(self):
@@ -947,6 +959,8 @@ class EpDispatchCombineTestCase:
         comb_duration_us_list = []
         comb_rdma_bandwidth_GB_list = []
         comb_bandwidth_GB_list = []
+        trans_duration_us_list = []
+        inv_duration_us_list = []
 
         error_round = set()
         for i in range(1):
@@ -965,6 +979,8 @@ class EpDispatchCombineTestCase:
             comb_rdma_bandwidth,
             comb_bandwidth,
             ll_mode_scale,
+            trans_duration,
+            inv_duration,
         ) = self.run_bench_once(op, test_data, repeat)
 
         for i in range(repeat):
@@ -978,6 +994,8 @@ class EpDispatchCombineTestCase:
                 torch.zeros(1) for _ in range(self.world_size)
             ]
             comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
+            trans_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
+            inv_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
 
             dist.all_gather(
                 disp_duration_output, torch.tensor([disp_duration[i] * 1000])
@@ -993,6 +1011,8 @@ class EpDispatchCombineTestCase:
                 comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth[i]])
             )
             dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth[i]]))
+            dist.all_gather(trans_duration_output, torch.tensor([trans_duration[i] * 1000]))
+            dist.all_gather(inv_duration_output, torch.tensor([inv_duration[i] * 1000]))
 
             disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
             disp_rdma_bandwidth_GB_list.append(
@@ -1008,6 +1028,8 @@ class EpDispatchCombineTestCase:
             comb_bandwidth_GB_list.append(
                 [int(t.item()) for t in comb_bandwidth_output]
             )
+            trans_duration_us_list.append([int(t.item()) for t in trans_duration_output])
+            inv_duration_us_list.append([int(t.item()) for t in inv_duration_output])
 
         if self.rank == 0:
             for i in range(len(disp_duration_us_list)):
@@ -1051,10 +1073,14 @@ class EpDispatchCombineTestCase:
         comb_ll_bw = [int(e * ll_mode_scale) for e in comb_bw]
         comb_lat = collect_metrics(comb_duration_us_list[1:])
 
+        trans_lat = collect_metrics(trans_duration_us_list[1:])
+        inv_lat = collect_metrics(inv_duration_us_list[1:])
+
         from prettytable import PrettyTable
 
         disp_table = PrettyTable()
         comb_table = PrettyTable()
+        trans_table = PrettyTable()
         field_names = [
             "Metrics",
             "RDMA Bandwidth (GB/s)",
@@ -1116,9 +1142,19 @@ class EpDispatchCombineTestCase:
                 ],
             ]
         )
+        
+        trans_table.title = "Transform Overhead (us)"
+        trans_table.field_names = ["Metrics", "Transform", "Inverse"]
+        trans_table.add_rows([
+            ["Best", trans_lat[0], inv_lat[0]],
+            ["Worst", trans_lat[1], inv_lat[1]],
+            ["Average", trans_lat[2], inv_lat[2]],
+        ])
+
         if self.rank == 0:
             print(disp_table)
             print(comb_table)
+            print(trans_table)
 
         del op
 
