@@ -153,8 +153,13 @@ def run_benchmark():
         
         # Benchmark Transform
         ms_base_trans = triton.testing.do_bench(lambda: baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
-        # Disable Triton transform in benchmark due to memory fault at large N
+        # Triton transform (optional)
         ms_tri_trans = float('nan')
+        if args.enable_triton:
+            try:
+                ms_tri_trans = triton.testing.do_bench(lambda: triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
+            except Exception as e:
+                print("[WARN] Triton transform failed:", repr(e))
         ms_cpp_trans = triton.testing.do_bench(lambda: mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count))
         
         tri_speedup = 'NA'
@@ -172,9 +177,15 @@ def run_benchmark():
         del _base_packed, _base_idx, _base_counts
         torch.cuda.empty_cache()
 
-        # Triton inverse
-        # Disable Triton inverse in benchmark due to memory fault at large N
+        # Triton inverse (optional)
         ms_tri_inv = float('nan')
+        if args.enable_triton:
+            try:
+                _tri_packed, _tri_idx, _tri_counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+                ms_tri_inv = triton.testing.do_bench(lambda: triton_inverse_transform_dispatch_output(_tri_packed, _tri_idx, _tri_counts, N))
+                del _tri_packed, _tri_idx, _tri_counts
+            except Exception as e:
+                print("[WARN] Triton inverse failed:", repr(e))
 
         # C++ inverse
         _cpp_packed, _cpp_idx, _cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
@@ -199,6 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("--E", type=int, default=288, help="Experts per rank E")
     parser.add_argument("--K", type=int, default=8, help="Top-K routing choices")
     parser.add_argument("--mem", action="store_true", help="Print GPU memory stats before/after the single run")
+    parser.add_argument("--enable-triton", action="store_true", help="Enable Triton timings in benchmarks")
     args = parser.parse_args()
 
     if not args.once:

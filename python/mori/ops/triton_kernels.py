@@ -123,21 +123,36 @@ def triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, 
     base_offsets = torch.repeat_interleave(offsets, expert_counts)
     slot_indices = torch.arange(sorted_expert_ids.size(0), device=dispatch_output.device) - base_offsets
     
-    # 2. Data Movement (Triton)
+    # 2. Sanity checks on indices to avoid OOB
+    if torch.any(sorted_expert_ids < 0) or torch.any(sorted_expert_ids >= E):
+        raise RuntimeError("Triton: expert_ids out of range")
+    if torch.any(slot_indices < 0) or torch.any(slot_indices >= N_capacity):
+        raise RuntimeError("Triton: slot_indices out of range")
+
+    # 3. Data Movement (Triton)
     packed_output = torch.zeros((E, N_capacity, H), dtype=dispatch_output.dtype, device=dispatch_output.device)
     
     num_active = sorted_token_indices.size(0)
     
     grid = lambda META: (triton.cdiv(num_active, META['BLOCK_SIZE_N']),)
     
+    # Tunable launch parameters via env (with safe defaults)
+    import os
+    bs_n = int(os.environ.get('TRI_BLOCK_SIZE_N', '64'))
+    bs_h = int(os.environ.get('TRI_BLOCK_SIZE_H', '512'))
+    num_warps = int(os.environ.get('TRI_NUM_WARPS', '4'))
+    num_stages = int(os.environ.get('TRI_NUM_STAGES', '4'))
+    bs_n = max(1, min(bs_n, 256))
+    bs_h = max(1, min(bs_h, H))
+
     _transform_kernel[grid](
         valid_tokens, packed_output,
         sorted_token_indices, sorted_expert_ids, slot_indices,
         valid_tokens.stride(0), valid_tokens.stride(1),
         packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
         num_active, H,
-        BLOCK_SIZE_N=64, BLOCK_SIZE_H=512,
-        num_stages=4, num_warps=4
+        BLOCK_SIZE_N=bs_n, BLOCK_SIZE_H=bs_h,
+        num_stages=num_stages, num_warps=num_warps
     )
     
     return packed_output, sorted_token_indices, expert_counts
@@ -162,14 +177,22 @@ def triton_inverse_transform_dispatch_output(packed_output, original_indices, ex
     
     grid = lambda META: (triton.cdiv(total_active, META['BLOCK_SIZE_N']),)
     
+    import os
+    bs_n = int(os.environ.get('TRI_BLOCK_SIZE_N', '64'))
+    bs_h = int(os.environ.get('TRI_BLOCK_SIZE_H', '512'))
+    num_warps = int(os.environ.get('TRI_NUM_WARPS', '4'))
+    num_stages = int(os.environ.get('TRI_NUM_STAGES', '4'))
+    bs_n = max(1, min(bs_n, 256))
+    bs_h = max(1, min(bs_h, H))
+
     _inverse_transform_kernel[grid](
         packed_output, rec_output,
         original_indices, expert_ids, slot_indices,
         packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
         rec_output.stride(0), rec_output.stride(1),
         total_active, H,
-        BLOCK_SIZE_N=64, BLOCK_SIZE_H=512,
-        num_stages=4, num_warps=4
+        BLOCK_SIZE_N=bs_n, BLOCK_SIZE_H=bs_h,
+        num_stages=num_stages, num_warps=num_warps
     )
     
     return rec_output
