@@ -383,12 +383,23 @@ class EpDispatchCombineTestCase:
         recv_count = dispatch_recv_num_token.item()
         
         # 1. Transform Layout
-        packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
-            dispatch_output, 
-            dispatch_indices, 
-            self.config, 
-            recv_count
-        )
+        # Validate counts before transform
+        assert recv_count <= dispatch_output.size(0), "recv_count exceeds capacity"
+        assert dispatch_indices.size(0) >= recv_count, "indices shorter than recv_count"
+        if args_cli.transform_impl == "gpu":
+            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
+                dispatch_output,
+                dispatch_indices,
+                self.config,
+                recv_count,
+            )
+        else:
+            packed_input, sorted_indices, expert_counts = EpDispatchCombineTestCase.transform_dispatch_output(
+                dispatch_output,
+                dispatch_indices,
+                self.config,
+                recv_count,
+            )
 
         if self.rank == 0 and round == 0:
             print("\n--- Packed Output Visualization (Rank 0) ---")
@@ -410,9 +421,14 @@ class EpDispatchCombineTestCase:
         gemm_output = packed_input * 1.0
         
         # 3. Inverse Transform
-        rec_output = mori.inverse_transform_dispatch_output_gpu(
-            gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
-        )
+        if args_cli.transform_impl == "gpu":
+            rec_output = mori.inverse_transform_dispatch_output_gpu(
+                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+            )
+        else:
+            rec_output = EpDispatchCombineTestCase.inverse_transform_dispatch_output(
+                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+            )
 
         # Normalize accumulated contributions back to the original per-token value
         if recv_count > 0:
@@ -758,21 +774,34 @@ class EpDispatchCombineTestCase:
             # EpDispatchCombineTestCase.transform_dispatch_output
             # mori.triton_transform_dispatch_output
             # mori.transform_dispatch_output_gpu
-            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
-                dispatch_output, 
-                dispatch_indices, 
-                self.config, 
-                total_recv_num_token
-            )
+            if args_cli.transform_impl == "gpu":
+                packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
+                    dispatch_output,
+                    dispatch_indices,
+                    self.config,
+                    total_recv_num_token
+                )
+            else:
+                packed_input, sorted_indices, expert_counts = EpDispatchCombineTestCase.transform_dispatch_output(
+                    dispatch_output,
+                    dispatch_indices,
+                    self.config,
+                    total_recv_num_token
+                )
             torch.cuda.synchronize()
             # 2. Simulated GEMM (Multiply by 1.0)
             gemm_output = packed_input * 1.0
             # EpDispatchCombineTestCase.inverse_transform_dispatch_output
             # mori.triton_inverse_transform_dispatch_output
             # mori.inverse_transform_dispatch_output_gpu
-            rec_output = mori.inverse_transform_dispatch_output_gpu(
-                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
-            )
+            if args_cli.transform_impl == "gpu":
+                rec_output = mori.inverse_transform_dispatch_output_gpu(
+                    gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+                )
+            else:
+                rec_output = EpDispatchCombineTestCase.inverse_transform_dispatch_output(
+                    gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+                )
 
             if total_recv_num_token > 0:
                 token_counts = torch.bincount(sorted_indices, minlength=total_recv_num_token)
@@ -828,20 +857,33 @@ class EpDispatchCombineTestCase:
             # EpDispatchCombineTestCase.transform_dispatch_output
             # mori.triton_transform_dispatch_output
             # mori.transform_dispatch_output_gpu
-            packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
-                dispatch_output, 
-                dispatch_indices, 
-                self.config, 
-                total_recv_num_token
-            )
+            if args_cli.transform_impl == "gpu":
+                packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
+                    dispatch_output,
+                    dispatch_indices,
+                    self.config,
+                    total_recv_num_token
+                )
+            else:
+                packed_input, sorted_indices, expert_counts = EpDispatchCombineTestCase.transform_dispatch_output(
+                    dispatch_output,
+                    dispatch_indices,
+                    self.config,
+                    total_recv_num_token
+                )
             gemm_output = packed_input 
             events[2 * i + 1].record()
             # EpDispatchCombineTestCase.inverse_transform_dispatch_output
             # mori.triton_inverse_transform_dispatch_output
             # mori.inverse_transform_dispatch_output_gpu
-            rec_output = mori.inverse_transform_dispatch_output_gpu(
-                gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
-            )
+            if args_cli.transform_impl == "gpu":
+                rec_output = mori.inverse_transform_dispatch_output_gpu(
+                    gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+                )
+            else:
+                rec_output = EpDispatchCombineTestCase.inverse_transform_dispatch_output(
+                    gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
+                )
         
             combine_output, _ = op.combine(
                 rec_output,
@@ -1129,6 +1171,13 @@ parser.add_argument(
     default="v1",
     help="Type of kernel to test",
     choices=["v0", "v1", "v1_ll"],
+)
+parser.add_argument(
+    "--transform-impl",
+    type=str,
+    default="gpu",
+    help="Transform backend: gpu|python",
+    choices=["gpu", "python"],
 )
 args_cli = parser.parse_args()
 
