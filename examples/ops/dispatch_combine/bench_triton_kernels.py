@@ -82,6 +82,7 @@ def run_benchmark():
     
     # Benchmark Parameters
     configs = [
+        (128*16, 7168, 288, 8),
         (128*8, 7168, 288, 8),
         (128*4, 7168, 288, 8),
         (128*2, 7168, 288, 8),
@@ -100,9 +101,8 @@ def run_benchmark():
         dispatch_indices = torch.randint(0, E, (N, K), device=device, dtype=torch.int32)
         recv_count = N # Assume full buffer for stress test
         
-        # Warmup & Correctness Check
+        # Warmup & Correctness Check (compute one variant at a time to reduce peak memory)
         base_packed, base_idx, base_counts = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
-        tri_packed, tri_idx, tri_counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
         cpp_packed, cpp_idx, cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
 
         # Check counts match
@@ -145,6 +145,11 @@ def run_benchmark():
         # If we feed the same inputs (logically), we should get same outputs.
         assert torch.allclose(base_rec, cpp_rec, atol=1e-2, rtol=1e-2), "HIP Inverse/Reconstruction Mismatch"
         
+        # Free large intermediates before benchmarking to keep peak memory low
+        del base_packed, base_idx, base_counts
+        del cpp_packed, cpp_idx, cpp_counts
+        torch.cuda.empty_cache()
+        
         # Benchmark Transform
         ms_base_trans = triton.testing.do_bench(lambda: baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
         ms_tri_trans = triton.testing.do_bench(lambda: triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
@@ -153,10 +158,24 @@ def run_benchmark():
         print(f"{N:<10} {H:<10} {'Transform':<20} {ms_base_trans:<15.4f} {ms_tri_trans:<15.4f} {ms_cpp_trans:<15.4f} {ms_base_trans/ms_tri_trans:<15.2f} {ms_base_trans/ms_cpp_trans:<15.2f}")
         
         # Benchmark Inverse
-        # Use the packed output from transform step
-        ms_base_inv = triton.testing.do_bench(lambda: baseline_inverse_transform_dispatch_output(base_packed, base_idx, base_counts, N))
-        ms_tri_inv = triton.testing.do_bench(lambda: triton_inverse_transform_dispatch_output(tri_packed, tri_idx, tri_counts, N))
-        ms_cpp_inv = triton.testing.do_bench(lambda: mori.inverse_transform_dispatch_output_gpu(cpp_packed, cpp_idx, cpp_counts, N))
+        # Recompute packed outputs per implementation to avoid holding all variants concurrently
+        # Baseline inverse
+        _base_packed, _base_idx, _base_counts = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+        ms_base_inv = triton.testing.do_bench(lambda: baseline_inverse_transform_dispatch_output(_base_packed, _base_idx, _base_counts, N))
+        del _base_packed, _base_idx, _base_counts
+        torch.cuda.empty_cache()
+
+        # Triton inverse
+        _tri_packed, _tri_idx, _tri_counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+        ms_tri_inv = triton.testing.do_bench(lambda: triton_inverse_transform_dispatch_output(_tri_packed, _tri_idx, _tri_counts, N))
+        del _tri_packed, _tri_idx, _tri_counts
+        torch.cuda.empty_cache()
+
+        # C++ inverse
+        _cpp_packed, _cpp_idx, _cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
+        ms_cpp_inv = triton.testing.do_bench(lambda: mori.inverse_transform_dispatch_output_gpu(_cpp_packed, _cpp_idx, _cpp_counts, N))
+        del _cpp_packed, _cpp_idx, _cpp_counts
+        torch.cuda.empty_cache()
         
         print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15.4f} {ms_cpp_inv:<15.4f} {ms_base_inv/ms_tri_inv:<15.2f} {ms_base_inv/ms_cpp_inv:<15.2f}")
 
