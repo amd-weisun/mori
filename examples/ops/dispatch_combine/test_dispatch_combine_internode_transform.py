@@ -742,7 +742,10 @@ class EpDispatchCombineTestCase:
         del op
 
     def run_bench_once(self, op, test_data, repeat=10):
-        num_events = 4 * repeat + 1
+        if args_cli.detailed_profiling:
+            num_events = 4 * repeat + 1
+        else:
+            num_events = 2 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
 
         (
@@ -855,7 +858,8 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            events[4 * i + 1].record()
+            if args_cli.detailed_profiling:
+                events[4 * i + 1].record()
 
             # EpDispatchCombineTestCase.transform_dispatch_output
             # mori.triton_transform_dispatch_output
@@ -874,7 +878,10 @@ class EpDispatchCombineTestCase:
                     self.config,
                     total_recv_num_token
                 )
-            events[4 * i + 2].record()
+            if args_cli.detailed_profiling:
+                events[4 * i + 2].record()
+            else:
+                events[2 * i + 1].record()
 
             gemm_output = packed_input 
             
@@ -889,7 +896,8 @@ class EpDispatchCombineTestCase:
                 rec_output = EpDispatchCombineTestCase.inverse_transform_dispatch_output(
                     gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
                 )
-            events[4 * i + 3].record()
+            if args_cli.detailed_profiling:
+                events[4 * i + 3].record()
         
             combine_output, _ = op.combine(
                 rec_output,
@@ -898,7 +906,10 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            events[4 * i + 4].record()
+            if args_cli.detailed_profiling:
+                events[4 * i + 4].record()
+            else:
+                events[2 * i + 2].record()
         torch.cuda.synchronize()
 
         element_size = all_rank_input[self.rank].element_size()
@@ -916,12 +927,23 @@ class EpDispatchCombineTestCase:
         trans_duration_list = []
         inv_duration_list = []
         comb_duration_list = []
-        for i in range(repeat):
-            base = 4 * i
-            disp_duration_list.append(events[base].elapsed_time(events[base + 1]))
-            trans_duration_list.append(events[base + 1].elapsed_time(events[base + 2]))
-            inv_duration_list.append(events[base + 2].elapsed_time(events[base + 3]))
-            comb_duration_list.append(events[base + 3].elapsed_time(events[base + 4]))
+        
+        if args_cli.detailed_profiling:
+            for i in range(repeat):
+                base = 4 * i
+                disp_duration_list.append(events[base].elapsed_time(events[base + 1]))
+                trans_duration_list.append(events[base + 1].elapsed_time(events[base + 2]))
+                inv_duration_list.append(events[base + 2].elapsed_time(events[base + 3]))
+                comb_duration_list.append(events[base + 3].elapsed_time(events[base + 4]))
+        else:
+            for i in range(repeat):
+                base = 2 * i
+                # In non-detailed mode, disp_duration includes transform
+                disp_duration_list.append(events[base].elapsed_time(events[base + 1]))
+                # In non-detailed mode, comb_duration includes inverse
+                comb_duration_list.append(events[base + 1].elapsed_time(events[base + 2]))
+                trans_duration_list.append(0.0)
+                inv_duration_list.append(0.0)
 
         disp_rdma_bandwidth_list = [
             total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
@@ -937,8 +959,13 @@ class EpDispatchCombineTestCase:
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
-        disp_trans_duration_list = [d + t for d, t in zip(disp_duration_list, trans_duration_list)]
-        inv_comb_duration_list = [i + c for i, c in zip(inv_duration_list, comb_duration_list)]
+        if args_cli.detailed_profiling:
+            disp_trans_duration_list = [d + t for d, t in zip(disp_duration_list, trans_duration_list)]
+            inv_comb_duration_list = [i + c for i, c in zip(inv_duration_list, comb_duration_list)]
+        else:
+            # In non-detailed mode, disp_duration ALREADY includes transform
+            disp_trans_duration_list = disp_duration_list
+            inv_comb_duration_list = comb_duration_list
 
         disp_trans_rdma_bandwidth_list = [
             total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_trans_duration_list
@@ -1213,36 +1240,38 @@ class EpDispatchCombineTestCase:
             ]
         )
         
-        trans_table.title = "Transform Overhead (us)"
-        trans_table.field_names = ["Metrics", "Transform", "Inverse"]
-        trans_table.add_rows([
-            ["Best", trans_lat[0], inv_lat[0]],
-            ["Worst", trans_lat[1], inv_lat[1]],
-            ["Average", trans_lat[2], inv_lat[2]],
-        ])
+        if args_cli.detailed_profiling:
+            trans_table.title = "Transform Overhead (us)"
+            trans_table.field_names = ["Metrics", "Transform", "Inverse"]
+            trans_table.add_rows([
+                ["Best", trans_lat[0], inv_lat[0]],
+                ["Worst", trans_lat[1], inv_lat[1]],
+                ["Average", trans_lat[2], inv_lat[2]],
+            ])
 
-        disp_trans_table.title = "Dispatch + Transform Performance"
-        disp_trans_table.field_names = field_names
-        disp_trans_table.add_rows([
-            ["Best", disp_trans_rdma_bw[1], disp_trans_bw[1], disp_trans_ll_bw[1], disp_trans_lat[0]],
-            ["Worst", disp_trans_rdma_bw[0], disp_trans_bw[0], disp_trans_ll_bw[0], disp_trans_lat[1]],
-            ["Average", disp_trans_rdma_bw[2], disp_trans_bw[2], disp_trans_ll_bw[2], disp_trans_lat[2]],
-        ])
+            disp_trans_table.title = "Dispatch + Transform Performance"
+            disp_trans_table.field_names = field_names
+            disp_trans_table.add_rows([
+                ["Best", disp_trans_rdma_bw[1], disp_trans_bw[1], disp_trans_ll_bw[1], disp_trans_lat[0]],
+                ["Worst", disp_trans_rdma_bw[0], disp_trans_bw[0], disp_trans_ll_bw[0], disp_trans_lat[1]],
+                ["Average", disp_trans_rdma_bw[2], disp_trans_bw[2], disp_trans_ll_bw[2], disp_trans_lat[2]],
+            ])
 
-        inv_comb_table.title = "Inverse + Combine Performance"
-        inv_comb_table.field_names = field_names
-        inv_comb_table.add_rows([
-            ["Best", inv_comb_rdma_bw[1], inv_comb_bw[1], inv_comb_ll_bw[1], inv_comb_lat[0]],
-            ["Worst", inv_comb_rdma_bw[0], inv_comb_bw[0], inv_comb_ll_bw[0], inv_comb_lat[1]],
-            ["Average", inv_comb_rdma_bw[2], inv_comb_bw[2], inv_comb_ll_bw[2], inv_comb_lat[2]],
-        ])
+            inv_comb_table.title = "Inverse + Combine Performance"
+            inv_comb_table.field_names = field_names
+            inv_comb_table.add_rows([
+                ["Best", inv_comb_rdma_bw[1], inv_comb_bw[1], inv_comb_ll_bw[1], inv_comb_lat[0]],
+                ["Worst", inv_comb_rdma_bw[0], inv_comb_bw[0], inv_comb_ll_bw[0], inv_comb_lat[1]],
+                ["Average", inv_comb_rdma_bw[2], inv_comb_bw[2], inv_comb_ll_bw[2], inv_comb_lat[2]],
+            ])
 
         if self.rank == 0:
             print(disp_table)
             print(comb_table)
-            print(trans_table)
-            print(disp_trans_table)
-            print(inv_comb_table)
+            if args_cli.detailed_profiling:
+                print(trans_table)
+                print(disp_trans_table)
+                print(inv_comb_table)
 
         del op
 
@@ -1303,6 +1332,11 @@ parser.add_argument(
     default="gpu",
     help="Transform backend: gpu|python",
     choices=["gpu", "python"],
+)
+parser.add_argument(
+    "--detailed-profiling",
+    action="store_true",
+    help="Enable detailed profiling of transform kernels (may add overhead)",
 )
 args_cli = parser.parse_args()
 
