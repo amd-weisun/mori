@@ -1,6 +1,7 @@
 import torch
 import triton
 import time
+import argparse
 import mori
 from triton_kernels import triton_transform_dispatch_output, triton_inverse_transform_dispatch_output
 
@@ -180,4 +181,45 @@ def run_benchmark():
         print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15.4f} {ms_cpp_inv:<15.4f} {ms_base_inv/ms_tri_inv:<15.2f} {ms_base_inv/ms_cpp_inv:<15.2f}")
 
 if __name__ == "__main__":
-    run_benchmark()
+    parser = argparse.ArgumentParser(description="Benchmark or single-run dispatch combine kernels")
+    parser.add_argument("--once", action="store_true", help="Run a single kernel call for debugging")
+    parser.add_argument("--op", choices=["transform", "inverse"], default="transform", help="Operation to run once when using --once")
+    parser.add_argument("--impl", choices=["baseline", "triton", "cpp"], default="cpp", help="Implementation to run once when using --once")
+    parser.add_argument("--N", type=int, default=128*8, help="N (capacity) size")
+    parser.add_argument("--H", type=int, default=7168, help="Hidden size H")
+    parser.add_argument("--E", type=int, default=288, help="Experts per rank E")
+    parser.add_argument("--K", type=int, default=8, help="Top-K routing choices")
+    args = parser.parse_args()
+
+    if not args.once:
+        run_benchmark()
+    else:
+        device = torch.device("cuda")
+        N, H, E, K = args.N, args.H, args.E, args.K
+        config = MockConfig(E, 0)
+        dispatch_output = torch.randn(N, H, device=device, dtype=torch.bfloat16)
+        dispatch_indices = torch.randint(0, E, (N, K), device=device, dtype=torch.int32)
+        recv_count = N
+
+        if args.op == "transform":
+            if args.impl == "baseline":
+                _ = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+            elif args.impl == "triton":
+                _ = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+            else:  # cpp
+                _ = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
+            torch.cuda.synchronize()
+            print(f"Ran single transform: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
+        else:  # inverse
+            # Need packed outputs from chosen implementation first
+            if args.impl == "baseline":
+                packed, idx, counts = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+                _ = baseline_inverse_transform_dispatch_output(packed, idx, counts, N)
+            elif args.impl == "triton":
+                packed, idx, counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
+                _ = triton_inverse_transform_dispatch_output(packed, idx, counts, N)
+            else:  # cpp
+                packed, idx, counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
+                _ = mori.inverse_transform_dispatch_output_gpu(packed, idx, counts, N)
+            torch.cuda.synchronize()
+            print(f"Ran single inverse: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
