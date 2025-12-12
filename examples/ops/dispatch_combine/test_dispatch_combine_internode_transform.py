@@ -1371,7 +1371,7 @@ if __name__ == "__main__":
 
     world_size = num_node * gpu_per_node
     
-    assert args_cli.total_experts % num_ranks == 0, "num_experts must be divisible by world_size"
+    assert args_cli.total_experts % world_size == 0, "num_experts must be divisible by world_size"
     num_experts_per_rank = args_cli.total_experts // world_size
     print(f"num_experts_per_rank: {num_experts_per_rank} | world_size: {world_size} | gpu_per_node: {gpu_per_node} | num_node: {num_node}")
     torch.multiprocessing.spawn(
