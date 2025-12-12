@@ -406,24 +406,19 @@ class EpDispatchCombineTestCase:
             print("--------------------------------------------\n")
         
         # 2. Simulated GEMM (Multiply by 1.0)
-        # Scale the input so that the sum over experts equals the original token
-        # This ensures compatibility with the test expectation (identity per rank)
-        if recv_count > 0:
-            token_counts = torch.bincount(sorted_indices, minlength=recv_count)
-            scales = 1.0 / token_counts[sorted_indices]
-            
-            E = self.config.num_experts_per_rank
-            expert_ids = torch.repeat_interleave(torch.arange(E, device=self.device), expert_counts)
-            slot_indices = torch.cat([torch.arange(c, device=self.device) for c in expert_counts])
-            
-            packed_input[expert_ids, slot_indices] *= scales.unsqueeze(-1)
-
+        # Keep packed_input unchanged; adjust after inverse using token_counts.
         gemm_output = packed_input * 1.0
         
         # 3. Inverse Transform
         rec_output = mori.inverse_transform_dispatch_output_gpu(
             gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
         )
+
+        # Normalize accumulated contributions back to the original per-token value
+        if recv_count > 0:
+            token_counts = torch.bincount(sorted_indices, minlength=recv_count)
+            valid = token_counts > 0
+            rec_output[:recv_count][valid] = rec_output[:recv_count][valid] / token_counts[valid].unsqueeze(-1)
 
         if self.rank == 0 and round == 0:
             # print("\n--- rec_output Visualization (Rank 0) ---")
@@ -771,16 +766,6 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
             # 2. Simulated GEMM (Multiply by 1.0)
-            if total_recv_num_token > 0:
-                token_counts = torch.bincount(sorted_indices, minlength=total_recv_num_token)
-                scales = 1.0 / token_counts[sorted_indices]
-                
-                E = self.config.num_experts_per_rank
-                expert_ids = torch.repeat_interleave(torch.arange(E, device=self.device), expert_counts)
-                slot_indices = torch.cat([torch.arange(c, device=self.device) for c in expert_counts])
-                
-                packed_input[expert_ids, slot_indices] *= scales.unsqueeze(-1)
-
             gemm_output = packed_input * 1.0
             # EpDispatchCombineTestCase.inverse_transform_dispatch_output
             # mori.triton_inverse_transform_dispatch_output
@@ -788,6 +773,11 @@ class EpDispatchCombineTestCase:
             rec_output = mori.inverse_transform_dispatch_output_gpu(
                 gemm_output, sorted_indices, expert_counts, dispatch_output.size(0)
             )
+
+            if total_recv_num_token > 0:
+                token_counts = torch.bincount(sorted_indices, minlength=total_recv_num_token)
+                valid = token_counts > 0
+                rec_output[:total_recv_num_token][valid] = rec_output[:total_recv_num_token][valid] / token_counts[valid].unsqueeze(-1)
 
             if total_recv_num_token > 0:
                 expected_rec = dispatch_output[:total_recv_num_token]
