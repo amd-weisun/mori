@@ -153,10 +153,16 @@ def run_benchmark():
         
         # Benchmark Transform
         ms_base_trans = triton.testing.do_bench(lambda: baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
-        ms_tri_trans = triton.testing.do_bench(lambda: triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count))
+        # Disable Triton transform in benchmark due to memory fault at large N
+        ms_tri_trans = float('nan')
         ms_cpp_trans = triton.testing.do_bench(lambda: mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count))
         
-        print(f"{N:<10} {H:<10} {'Transform':<20} {ms_base_trans:<15.4f} {ms_tri_trans:<15.4f} {ms_cpp_trans:<15.4f} {ms_base_trans/ms_tri_trans:<15.2f} {ms_base_trans/ms_cpp_trans:<15.2f}")
+        tri_speedup = 'NA'
+        try:
+            tri_speedup = f"{ms_base_trans/ms_tri_trans:<15.2f}"
+        except Exception:
+            tri_speedup = f"{'NA':<15}"
+        print(f"{N:<10} {H:<10} {'Transform':<20} {ms_base_trans:<15.4f} {ms_tri_trans:<15} {ms_cpp_trans:<15.4f} {tri_speedup} {ms_base_trans/ms_cpp_trans:<15.2f}")
         
         # Benchmark Inverse
         # Recompute packed outputs per implementation to avoid holding all variants concurrently
@@ -167,10 +173,8 @@ def run_benchmark():
         torch.cuda.empty_cache()
 
         # Triton inverse
-        _tri_packed, _tri_idx, _tri_counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
-        ms_tri_inv = triton.testing.do_bench(lambda: triton_inverse_transform_dispatch_output(_tri_packed, _tri_idx, _tri_counts, N))
-        del _tri_packed, _tri_idx, _tri_counts
-        torch.cuda.empty_cache()
+        # Disable Triton inverse in benchmark due to memory fault at large N
+        ms_tri_inv = float('nan')
 
         # C++ inverse
         _cpp_packed, _cpp_idx, _cpp_counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
@@ -178,7 +182,12 @@ def run_benchmark():
         del _cpp_packed, _cpp_idx, _cpp_counts
         torch.cuda.empty_cache()
         
-        print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15.4f} {ms_cpp_inv:<15.4f} {ms_base_inv/ms_tri_inv:<15.2f} {ms_base_inv/ms_cpp_inv:<15.2f}")
+        tri_inv_speedup = 'NA'
+        try:
+            tri_inv_speedup = f"{ms_base_inv/ms_tri_inv:<15.2f}"
+        except Exception:
+            tri_inv_speedup = f"{'NA':<15}"
+        print(f"{N:<10} {H:<10} {'Inverse':<20} {ms_base_inv:<15.4f} {ms_tri_inv:<15} {ms_cpp_inv:<15.4f} {tri_inv_speedup} {ms_base_inv/ms_cpp_inv:<15.2f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark or single-run dispatch combine kernels")
