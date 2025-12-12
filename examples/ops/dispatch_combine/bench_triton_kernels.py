@@ -189,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--H", type=int, default=7168, help="Hidden size H")
     parser.add_argument("--E", type=int, default=288, help="Experts per rank E")
     parser.add_argument("--K", type=int, default=8, help="Top-K routing choices")
+    parser.add_argument("--mem", action="store_true", help="Print GPU memory stats before/after the single run")
     args = parser.parse_args()
 
     if not args.once:
@@ -201,6 +202,19 @@ if __name__ == "__main__":
         dispatch_indices = torch.randint(0, E, (N, K), device=device, dtype=torch.int32)
         recv_count = N
 
+        def print_mem(tag):
+            if not args.mem:
+                return
+            stats = {
+                'allocated': torch.cuda.memory_allocated(device),
+                'reserved': torch.cuda.memory_reserved(device),
+                'max_allocated': torch.cuda.max_memory_allocated(device),
+                'max_reserved': torch.cuda.max_memory_reserved(device),
+            }
+            print(f"[MEM {tag}] alloc={stats['allocated']}, reserv={stats['reserved']}, max_alloc={stats['max_allocated']}, max_reserv={stats['max_reserved']}")
+
+        print_mem("before")
+
         if args.op == "transform":
             if args.impl == "baseline":
                 _ = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
@@ -209,6 +223,7 @@ if __name__ == "__main__":
             else:  # cpp
                 _ = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
             torch.cuda.synchronize()
+            print_mem("after")
             print(f"Ran single transform: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
         else:  # inverse
             # Need packed outputs from chosen implementation first
@@ -222,4 +237,5 @@ if __name__ == "__main__":
                 packed, idx, counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
                 _ = mori.inverse_transform_dispatch_output_gpu(packed, idx, counts, N)
             torch.cuda.synchronize()
+            print_mem("after")
             print(f"Ran single inverse: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
