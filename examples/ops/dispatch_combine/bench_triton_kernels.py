@@ -250,13 +250,15 @@ if __name__ == "__main__":
             # Need packed outputs from chosen implementation first
             if args.impl == "baseline":
                 packed, idx, counts = baseline_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
-                _ = baseline_inverse_transform_dispatch_output(packed, idx, counts, N)
+                rec_output = baseline_inverse_transform_dispatch_output(packed, idx, counts, N)
             elif args.impl == "triton":
                 packed, idx, counts = triton_transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count)
-                _ = triton_inverse_transform_dispatch_output(packed, idx, counts, N)
+                rec_output = triton_inverse_transform_dispatch_output(packed, idx, counts, N)
             else:  # cpp
                 packed, idx, counts = mori.transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count)
-                _ = mori.inverse_transform_dispatch_output_gpu(packed, idx, counts, N)
+                rec_output = mori.inverse_transform_dispatch_output_gpu(packed, idx, counts, N)
             torch.cuda.synchronize()
             print_mem("after")
             print(f"Ran single inverse: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
+            print(f"inverse transform inputs: shape  disptach_output: {packed.shape}, shape dispatch_indices: {idx.shape}, counts: {counts.shape}")
+            print(f"inverse transform outputs shape rec_output: {rec_output.packed}, shape idx: {idx.shape}")
