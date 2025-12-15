@@ -1,5 +1,6 @@
 #include "mori/ops/dispatch_combine/layout_transform_kernels.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
+#include <algorithm>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 
@@ -40,14 +41,26 @@ __global__ void TransformDispatchOutputKernel(
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
     int num_tokens, int H, const int* num_tokens_ptr) {
     
+    constexpr int kTileH = 256;
+    int tiles_per_token = std::max(1, (H + kTileH - 1) / kTileH);
+
     int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
     int laneId = threadIdx.x % warpSize;
-    
+
+    int valid_tokens = num_tokens;
     if (num_tokens_ptr) {
-        if (warpId >= *num_tokens_ptr) return;
-    } else {
-        if (warpId >= num_tokens) return;
+        valid_tokens = *num_tokens_ptr;
+        if (warpId >= valid_tokens * tiles_per_token) return;
+    } else if (warpId >= num_tokens * tiles_per_token) {
+        return;
     }
+
+    if (valid_tokens == 0) return;
+
+    int token_id = warpId % num_tokens;
+    if (token_id >= valid_tokens) return;
+    int tile_id = warpId / num_tokens;
+    if (tile_id >= tiles_per_token) return;
 
     // Metadata load (broadcast from lane 0)
     index_t src_idx, expert_id, slot_id;
@@ -63,11 +76,20 @@ __global__ void TransformDispatchOutputKernel(
     const T* src_row = src + src_idx * stride_src_n;
     T* dst_row = dst + expert_id * stride_dst_e + slot_id * stride_dst_c;
 
+    int tile_start = tile_id * kTileH;
+    int tile_end = std::min(tile_start + kTileH, H);
+    int tile_len = tile_end - tile_start;
+    if (tile_len <= 0) return;
+
+    const T* src_tile = src_row + tile_start;
+    T* dst_tile = dst_row + tile_start;
+
     if (stride_src_h == 1 && stride_dst_h == 1) {
-         core::WarpCopy(dst_row, src_row, H);
+         core::WarpCopy(dst_tile, src_tile, tile_len);
     } else {
-        for (int i = laneId; i < H; i += warpSize) {
-            dst_row[i * stride_dst_h] = src_row[i * stride_src_h];
+        for (int i = laneId; i < tile_len; i += warpSize) {
+            int global_idx = tile_start + i;
+            dst_row[global_idx * stride_dst_h] = src_row[global_idx * stride_src_h];
         }
     }
 }
@@ -154,11 +176,14 @@ void LaunchTransformDispatchOutput(
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
     int num_tokens, int H, hipStream_t stream,
     const int* num_tokens_ptr) {
+    // num_tokens: 
     
+    constexpr int kTileH = 256;
+    int tiles_per_token = std::max(1, (H + kTileH - 1) / kTileH);
+    int num_warps = num_tokens * tiles_per_token;
     int block_size = 256;
     int warps_per_block = block_size / 64; // Assuming warpSize 64 for AMD
-    
-    int num_blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
+    int num_blocks = (num_warps + warps_per_block - 1) / warps_per_block;
     
     TransformDispatchOutputKernel<T><<<num_blocks, block_size, 0, stream>>>(
         src, dst, indices, expert_ids, slot_ids,
