@@ -261,4 +261,4 @@ if __name__ == "__main__":
             print_mem("after")
             print(f"Ran single inverse: impl={args.impl}, shape=({N},{H}), E={E}, K={K}")
             print(f"inverse transform inputs: shape  disptach_output: {packed.shape}, shape dispatch_indices: {idx.shape}, counts: {counts.shape}")
-            print(f"inverse transform outputs shape rec_output: {rec_output.packed}, shape idx: {idx.shape}")
+            print(f"inverse transform outputs shape rec_output: {rec_output.shape}")
