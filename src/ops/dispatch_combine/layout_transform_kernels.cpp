@@ -50,24 +50,22 @@ __global__ void TransformDispatchOutputKernel(
     int valid_tokens = num_tokens;
     if (num_tokens_ptr) {
         valid_tokens = *num_tokens_ptr;
-        if (warpId >= valid_tokens * tiles_per_token) return;
-    } else if (warpId >= num_tokens * tiles_per_token) {
-        return;
     }
-
     if (valid_tokens == 0) return;
 
-    int token_id = warpId % num_tokens;
+    int total_valid_warps = valid_tokens * tiles_per_token;
+    if (warpId >= total_valid_warps) return;
+
+    int tile_id = warpId % tiles_per_token;
+    int token_id = warpId / tiles_per_token;
     if (token_id >= valid_tokens) return;
-    int tile_id = warpId / num_tokens;
-    if (tile_id >= tiles_per_token) return;
 
     // Metadata load (broadcast from lane 0)
     index_t src_idx, expert_id, slot_id;
     if (laneId == 0) {
-        src_idx = indices[warpId];
-        expert_id = expert_ids[warpId];
-        slot_id = slot_ids[warpId];
+        src_idx = indices[token_id];
+        expert_id = expert_ids[token_id];
+        slot_id = slot_ids[token_id];
     }
     src_idx = __shfl(src_idx, 0);
     expert_id = __shfl(expert_id, 0);
