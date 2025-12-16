@@ -39,6 +39,7 @@ class Buffer:
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
+        self.num_qps_per_rank = num_qps_per_rank
         
         # Cache for MORI ops
         self.ops = {}
@@ -64,10 +65,14 @@ class Buffer:
                 scale_dim=scale_dim,
                 scale_type_size=1 if scale_dim > 0 else 0,
                 max_token_type_size=4, 
-                max_num_inp_token_per_rank=8192, # Increased limit
-                num_experts_per_rank=8, # Default assumption
-                num_experts_per_token=1, # Default assumption
-                kernel_type=kernel_type
+                max_num_inp_token_per_rank=128, # Increased limit
+                num_experts_per_rank=self.num_qps_per_rank, # Default assumption
+                num_experts_per_token=8, # topK
+                warp_num_per_block=16,
+                block_num=32,
+                kernel_type=kernel_type,
+                gpu_per_node=8,
+                rdma_block_num=16,
             )
             self.ops[key] = EpDispatchCombineOp(config)
         return self.ops[key]
