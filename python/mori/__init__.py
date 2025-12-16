@@ -31,5 +31,9 @@ from .ops import (
     triton_inverse_transform_dispatch_output,
     transform_dispatch_output_gpu,
     inverse_transform_dispatch_output_gpu,
+    Buffer,
+    Config,
+    EventHandle,
+    EventOverlap,
 )
 

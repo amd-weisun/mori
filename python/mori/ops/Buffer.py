@@ -1,0 +1,305 @@
+import os
+import torch
+import torch.distributed as dist
+from typing import Callable, List, Tuple, Optional, Union
+
+from mori.ops.dispatch_combine import EpDispatchCombineOp, EpDispatchCombineConfig, EpDispatchCombineKernelType
+
+# Mock classes to maintain API compatibility
+class Config:
+    def __init__(self, num_sms: int, *args):
+        self.num_sms = num_sms
+
+class EventHandle:
+    def __init__(self, event=None):
+        self.event = event
+
+class EventOverlap:
+    def __init__(self, event=None, tensors=None):
+        self.event = event
+        self.tensors = tensors
+
+class Buffer:
+    """
+    The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model.
+    Re-implemented using MORI backend.
+    """
+
+    num_sms: int = 20
+
+    def __init__(self, group: dist.ProcessGroup,
+                 num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1) -> None:
+        """
+        Initialize the communication buffer.
+        """
+        self.rank = group.rank()
+        self.group_size = group.size()
+        self.group = group
+        self.num_nvl_bytes = num_nvl_bytes
+        self.num_rdma_bytes = num_rdma_bytes
+        self.low_latency_mode = low_latency_mode
+        
+        # Cache for MORI ops
+        self.ops = {}
+
+    def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
+        key = (dtype, hidden_dim, scale_dim, self.low_latency_mode)
+        if key not in self.ops:
+            # Determine kernel type
+            kernel_type = EpDispatchCombineKernelType.IntraNode
+            # Simple heuristic for kernel type
+            if self.group_size > 8: 
+                 kernel_type = EpDispatchCombineKernelType.InterNodeV1
+            
+            if self.low_latency_mode:
+                 kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
+
+            # TODO: These parameters might need to be tuned or exposed
+            config = EpDispatchCombineConfig(
+                data_type=dtype,
+                rank=self.rank,
+                world_size=self.group_size,
+                hidden_dim=hidden_dim,
+                scale_dim=scale_dim,
+                scale_type_size=1 if scale_dim > 0 else 0,
+                max_token_type_size=4, 
+                max_num_inp_token_per_rank=8192, # Increased limit
+                num_experts_per_rank=8, # Default assumption
+                num_experts_per_token=1, # Default assumption
+                kernel_type=kernel_type
+            )
+            self.ops[key] = EpDispatchCombineOp(config)
+        return self.ops[key]
+
+    @staticmethod
+    def set_num_sms(new_num_sms: int) -> None:
+        Buffer.num_sms = new_num_sms
+
+    @staticmethod
+    def capture() -> EventOverlap:
+        return EventOverlap(EventHandle())
+
+    @staticmethod
+    def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+        # MORI handles buffer sizing internally
+        return 0
+
+    def get_local_buffer_tensor(self, dtype: torch.dtype, size: Optional[torch.Size] = None,
+                                offset: int = 0, use_rdma_buffer: bool = False) -> torch.Tensor:
+        # Not directly supported by MORI in the same way
+        # We could potentially use op.get_registered_combine_input_buffer if we knew the config
+        raise NotImplementedError("get_local_buffer_tensor is not supported in MORI backend yet.")
+
+    @staticmethod
+    def get_dispatch_config(num_ranks: int) -> Config:
+        return Config(Buffer.num_sms)
+
+    @staticmethod
+    def get_combine_config(num_ranks: int) -> Config:
+        return Config(Buffer.num_sms)
+
+    def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
+                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                            allocate_on_comm_stream: bool = False) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap]:
+        """
+        Calculate the layout required for later communication.
+        In MORI, layout calculation is integrated into dispatch.
+        Returning dummy values to satisfy API.
+        """
+        num_tokens = topk_idx.size(0)
+        num_ranks = self.group_size
+        
+        return (torch.zeros(num_ranks, dtype=torch.int, device=topk_idx.device),
+                None,
+                torch.zeros(num_experts, dtype=torch.int, device=topk_idx.device),
+                torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device=topk_idx.device),
+                EventOverlap())
+
+    def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                 handle: Optional[Tuple] = None,
+                 num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                 is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
+                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
+                 config: Optional[Config] = None,
+                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                 allocate_on_comm_stream: bool = False) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
+                  Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+        """
+        Dispatch tokens to different ranks, both intranode and internode settings are supported.
+        Intranode kernels require all the ranks should be visible via NVLink.
+        Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
+            index should be visible via RDMA.
+
+        Arguments:
+            x: `torch.Tensor` or tuple of `torch.Tensor`, for the first type, the shape must be `[num_tokens, hidden]`,
+                and type must be `torch.bfloat16`; for the second type, the first element of the tuple must be shaped as
+                `[num_tokens, hidden]` with type `torch.float8_e4m3fn`, the second must be `[num_tokens, hidden // 128]`
+                 (requiring divisible) with type `torch.float`.
+            handle: an optional communication handle, if set, the CPU will reuse the layout information to save some time.
+            num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
+            num_tokens_per_rdma_rank: `[num_rdma_ranks]` with `torch.int`, the number of tokens to be sent to each RDMA
+                rank (with the same GPU index), return `None` for intranode settings.
+            is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
+            num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
+            topk_idx: `[num_tokens, num_topk]` with `torch.int64`, the expert indices selected by each token,
+                `-1` means no selections.
+            topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.
+            expert_alignment: align the number of tokens received by each local expert to this variable.
+            config: the performance tuning config.
+            previous_event: the event to wait before actually executing the kernel.
+            async_finish: the current stream will not wait for the communication kernels to be finished if set.
+            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+
+        Returns:
+            recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
+                received token count.
+            recv_topk_idx: received expert indices.
+            recv_topk_weights: received expert weights.
+            num_recv_tokens_per_expert_list: Python list shaped `[num_local_experts]`, the received token count by
+                each local expert, aligned to the input `expert_alignment`.
+            handle: the returned communication handle.
+            event: the event after executing the kernel (valid only if `async_finish` is set).
+        """
+        
+        if isinstance(x, tuple):
+            inp, inp_scales = x
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        else:
+            inp = x
+            inp_scales = None
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = 0
+
+        op = self._get_op(dtype, hidden_dim, scale_dim)
+        
+        if topk_idx is None or topk_weights is None:
+             raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
+
+        # MORI dispatch
+        dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
+            op.dispatch(inp, topk_weights, inp_scales, topk_idx)
+
+        # Construct return values
+        recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
+        recv_topk_idx = dispatch_indices
+        recv_topk_weights = dispatch_weights
+        
+        # Dummy per-expert count
+        num_recv_tokens_per_expert_list = [0] * 8 
+        
+        # Store dispatch_indices in handle for combine
+        new_handle = (dispatch_indices,)
+        
+        return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle, EventOverlap()
+
+    def combine(self, x: torch.Tensor, handle: Tuple,
+                topk_weights: Optional[torch.Tensor] = None,
+                config: Optional[Config] = None,
+                previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                allocate_on_comm_stream: bool = False) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        """
+        Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
+            settings are supported.
+        Intranode kernels require all the ranks should be visible via NVLink.
+        Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
+            index should be visible via RDMA.
+
+        Arguments:
+            x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its original ranks.
+            handle: a must-set communication handle, you can obtain this from the dispatch function.
+            topk_weights: `[num_tokens, num_topk]` with `torch.float`, the tokens' top-k weights for reducing to its original ranks.
+            config: the performance tuning config.
+            previous_event: the event to wait before actually executing the kernel.
+            async_finish: the current stream will not wait for the communication kernels to be finished if set.
+            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+
+        Returns:
+            recv_x: the reduced token from its dispatched ranks.
+            recv_topk_weights: the reduced top-k weights from its dispatch ranks.
+            event: the event after executing the kernel (valid only if `async_finish` is set).
+        """
+        
+        dtype = x.dtype
+        hidden_dim = x.size(1)
+        op = self._get_op(dtype, hidden_dim)
+        
+        # Retrieve indices from handle
+        if not handle or len(handle) < 1:
+             raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
+        
+        dispatch_indices = handle[0]
+        
+        # MORI combine
+        combined_x = op.combine(x, topk_weights, dispatch_indices)
+        
+        return combined_x, None, EventOverlap()
+
+    # noinspection PyTypeChecker
+    def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                           handle: Optional[Tuple] = None,
+                           num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                           is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
+                           topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
+                           config: Optional[Config] = None,
+                           previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                           allocate_on_comm_stream: bool = False) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
+            Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+        """
+        Internode dispatch implementation.
+        Mapped to dispatch in MORI.
+        """
+        return self.dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank,
+                             is_token_in_rank, num_tokens_per_expert,
+                             topk_idx, topk_weights, expert_alignment,
+                             config, previous_event, async_finish,
+                             allocate_on_comm_stream)
+
+    # noinspection PyTypeChecker
+    def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],
+                          topk_weights: Optional[torch.Tensor] = None,
+                          config: Optional[Config] = None,
+                          previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                          allocate_on_comm_stream: bool = False) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        """
+        Internode combine implementation.
+        Mapped to combine in MORI.
+        """
+        return self.combine(x, handle, topk_weights, config, previous_event, async_finish, allocate_on_comm_stream)
+
+    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
+        # Not needed or supported in MORI
+        pass
+
+    # noinspection PyTypeChecker
+    def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                             num_max_dispatch_tokens_per_rank: int, num_experts: int,
+                             use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
+            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
+        """
+        Low latency dispatch.
+        Not fully supported with the same API.
+        """
+        raise NotImplementedError("low_latency_dispatch is not supported. Use dispatch with low_latency_mode=True.")
+
+    # noinspection PyTypeChecker
+    def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                            handle: tuple, zero_copy: bool = False, async_finish: bool = False,
+                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
+            Tuple[torch.Tensor, EventOverlap, Callable]:
+        """
+        Low latency combine.
+        Not fully supported with the same API.
+        """
+        raise NotImplementedError("low_latency_combine is not supported. Use combine.")
+
+    def get_next_low_latency_combine_buffer(self, handle: object):
+        raise NotImplementedError("get_next_low_latency_combine_buffer is not supported.")
