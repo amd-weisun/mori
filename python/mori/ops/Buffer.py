@@ -39,7 +39,6 @@ class Buffer:
         before constructing the buffer so that `shmem_torch_process_group_init`
         has been invoked. The constructor will trigger the initialization if needed.
         """
-        Buffer.initialize_shmem(group_name, group)
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
@@ -47,9 +46,12 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.num_qps_per_rank = num_qps_per_rank
-        
+        self.gpu_per_node = 8  # Assuming 8 GPUs per node
+        self.world_size = dist.get_world_size(group=group)
         # Cache for MORI ops
+        self.group_name = group_name
         self.ops = {}
+        self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
         key = (dtype, hidden_dim, scale_dim, self.low_latency_mode)
@@ -84,6 +86,38 @@ class Buffer:
             self.ops[key] = EpDispatchCombineOp(config)
         return self.ops[key]
 
+    def setup(self):
+        local_rank = self.rank % self.gpu_per_node
+        torch.cuda.set_device(local_rank)
+        self.device = torch.device("cuda", local_rank)
+
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="gloo",
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+
+        print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
+        world_group = torch.distributed.group.WORLD
+        assert world_group is not None
+
+        print("process group ok")
+        # Explicitly set the name if possible, or just register
+        torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
+        try:
+            mori.shmem.shmem_torch_process_group_init(self.group_name)
+        except RuntimeError:
+            pass
+
+        print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
+
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(999)
+
+    def cleanup(self):
+        mori.shmem.shmem_finalize()
+        dist.destroy_process_group()
     @staticmethod
     def initialize_shmem(group_name: str = "default", group: Optional[dist.ProcessGroup] = None) -> None:
         """Register a process group and initialize MORI shared state.
