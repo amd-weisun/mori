@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
+from mori import shmem
 from mori.ops.dispatch_combine import EpDispatchCombineOp, EpDispatchCombineConfig, EpDispatchCombineKernelType
 
 # Mock classes to maintain API compatibility
@@ -29,10 +30,16 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1) -> None:
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1,
+                 group_name: str = "default") -> None:
         """
         Initialize the communication buffer.
+
+        Note: MORI relies on `mori.shmem` shared memory state. Call
+        before constructing the buffer so that `shmem_torch_process_group_init`
+        has been invoked. The constructor will trigger the initialization if needed.
         """
+        Buffer.initialize_shmem(group_name, group)
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
@@ -76,6 +83,20 @@ class Buffer:
             )
             self.ops[key] = EpDispatchCombineOp(config)
         return self.ops[key]
+
+    @staticmethod
+    def initialize_shmem(group_name: str = "default", group: Optional[dist.ProcessGroup] = None) -> None:
+        """Register a process group and initialize MORI shared state.
+
+        The process group registration mirrors the manual setup shown in the example
+        scripts so that `shmem_torch_process_group_init` can locate the correct group.
+        """
+        if group is not None:
+            try:
+                torch._C._distributed_c10d._register_process_group(group_name, group)
+            except RuntimeError:
+                pass
+        shmem.shmem_torch_process_group_init(group_name)
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
