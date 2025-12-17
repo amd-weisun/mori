@@ -96,12 +96,12 @@ class Buffer:
         torch.cuda.set_device(local_rank)
         self.device = torch.device("cuda", local_rank)
 
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend="gloo",
-                rank=self.rank,
-                world_size=self.world_size,
-            )
+        # if not dist.is_initialized():
+        #     dist.init_process_group(
+        #         backend="gloo",
+        #         rank=self.rank,
+        #         world_size=self.world_size,
+        #     )
 
         print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
         world_group = torch.distributed.group.WORLD
