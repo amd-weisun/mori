@@ -126,25 +126,6 @@ class Buffer:
     def cleanup(self):
         mori.shmem.shmem_finalize()
         dist.destroy_process_group()
-    @staticmethod
-    def initialize_shmem(group_name: str = "default", group: Optional[dist.ProcessGroup] = None) -> None:
-        """Register a process group and initialize MORI shared state.
-
-        The process group registration mirrors the manual setup shown in the example
-        scripts so that `shmem_torch_process_group_init` can locate the correct group.
-        """
-        if group is not None:
-            try:
-                torch._C._distributed_c10d._register_process_group(group_name, group)
-            except RuntimeError:
-                pass
-        try:
-            shmem.shmem_torch_process_group_init(group_name)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("Failed to initialize shmem for group %s", group_name)
-            raise RuntimeError(
-                f"Unable to initialize MORI shmem for group '{group_name}'"
-            ) from exc
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -255,9 +236,10 @@ class Buffer:
         if topk_idx is None or topk_weights is None:
              raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
 
-        # MORI dispatch
+        # MORI dispatch expects int32 indices.
+        dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
-            op.dispatch(inp, topk_weights, inp_scales, topk_idx)
+            op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
