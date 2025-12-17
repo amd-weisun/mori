@@ -93,7 +93,7 @@ def test_buffer_dispatch_combine():
     
     print("Queuing tasks...")
     for rank in range(world_size):
-        manager.task_queue.put((run_buffer_test, []))
+        manager.task_queue.put((run_buffer_test, [world_size]))
         
     results = []
     print("Waiting for results...")
