@@ -111,4 +111,9 @@ def test_buffer_dispatch_combine():
         assert res is True
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     test_buffer_dispatch_combine()
