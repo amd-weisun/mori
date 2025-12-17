@@ -109,7 +109,13 @@ class Buffer:
 
         print("process group ok")
         # Explicitly set the name if possible, or just register
-        torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
+        try:
+            torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
+        except RuntimeError:
+            logger.info(
+                "Process group '%s' already registered, reusing existing group",
+                self.group_name,
+            )
         try:
             mori.shmem.shmem_torch_process_group_init(self.group_name)
         except Exception as exc:  # pylint: disable=broad-except
