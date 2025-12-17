@@ -5,7 +5,7 @@ import torch.distributed as dist
 from mori.ops.Buffer import Buffer
 from tests.python.utils import TorchDistProcessManager
 
-def run_buffer_test(rank, world_size):
+def run_buffer_test(rank, world_size, group_name="default"):
     # Buffer expects the process group to be initialized if we want to use an existing one,
     # or it initializes it itself.
     # TorchDistProcessManager initializes the process group and registers "default".
@@ -23,8 +23,8 @@ def run_buffer_test(rank, world_size):
     num_qps_per_rank = num_experts // world_size
     
     group = dist.group.WORLD
-    print(f"[Rank {rank}] Creating Buffer...")
-    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, group_name="default")
+    print(f"[Rank {rank}] Creating Buffer (group={group_name})...")
+    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, group_name=group_name)
     print(f"[Rank {rank}] Buffer created.")
     
     # Create dummy data
@@ -93,7 +93,8 @@ def test_buffer_dispatch_combine():
     
     print("Queuing tasks...")
     for rank in range(world_size):
-        manager.task_queue.put((run_buffer_test, [world_size]))
+        group_name = f"buffer_group_{rank}"
+        manager.task_queue.put((run_buffer_test, [world_size, group_name]))
         
     results = []
     print("Waiting for results...")
