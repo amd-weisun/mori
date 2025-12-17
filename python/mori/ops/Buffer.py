@@ -1,3 +1,4 @@
+import logging
 import mori
 import os
 import torch
@@ -20,6 +21,9 @@ class EventOverlap:
     def __init__(self, event=None, tensors=None):
         self.event = event
         self.tensors = tensors
+
+logger = logging.getLogger(__name__)
+
 
 class Buffer:
     """
@@ -108,8 +112,11 @@ class Buffer:
         torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
         try:
             mori.shmem.shmem_torch_process_group_init(self.group_name)
-        except RuntimeError:
-            pass
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Failed to initialize MORI shmem for group %s", self.group_name)
+            raise RuntimeError(
+                f"Unable to initialize MORI shmem for group '{self.group_name}'"
+            ) from exc
 
         print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
 
@@ -131,7 +138,13 @@ class Buffer:
                 torch._C._distributed_c10d._register_process_group(group_name, group)
             except RuntimeError:
                 pass
-        shmem.shmem_torch_process_group_init(group_name)
+        try:
+            shmem.shmem_torch_process_group_init(group_name)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Failed to initialize shmem for group %s", group_name)
+            raise RuntimeError(
+                f"Unable to initialize MORI shmem for group '{group_name}'"
+            ) from exc
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
