@@ -15,12 +15,10 @@ def run_buffer_test(rank, world_size, group_name="default"):
     
     # Create Buffer
     # We use the default group which is WORLD
-    # Set num_qps_per_rank such that total experts covers our random indices
-    # We want num_experts (8) to be valid.
-    # total_experts = num_qps_per_rank * world_size
-    # So num_qps_per_rank = num_experts // world_size
-    num_experts = 8
-    num_qps_per_rank = num_experts // world_size
+    # Configure experts per rank to match the data the kernel sees.
+    num_experts_per_rank = 2
+    num_experts = num_experts_per_rank * world_size
+    num_qps_per_rank = num_experts_per_rank
     
     group = dist.group.WORLD
     print(f"[Rank {rank}] Creating Buffer (group={group_name})...")

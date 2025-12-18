@@ -35,7 +35,7 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1,
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, gpu_per_node: int = 1,
                  group_name: str = "default") -> None:
         """
         Initialize the communication buffer.
@@ -51,7 +51,7 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.num_qps_per_rank = num_qps_per_rank
-        self.gpu_per_node = 8  # Assuming 8 GPUs per node
+        self.gpu_per_node = gpu_per_node  # Assuming 8 GPUs per node
         self.world_size = dist.get_world_size(group=group)
         # Cache for MORI ops
         self.group_name = group_name
@@ -86,7 +86,7 @@ class Buffer:
                 warp_num_per_block=16,
                 block_num=32,
                 kernel_type=kernel_type,
-                gpu_per_node=8,
+                gpu_per_node=self.gpu_per_node,
                 rdma_block_num=16,
             )
             self.ops[key] = EpDispatchCombineOp(config)
