@@ -144,11 +144,6 @@ class Buffer:
         #     logger.warning("dist.destroy_process_group failed")
         self._cleanup_done = True
 
-    def __del__(self):
-        try:
-            self.cleanup()
-        except Exception:  # pylint: disable=broad-except
-            logger.warning("Exception raised during Buffer cleanup in __del__")
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
