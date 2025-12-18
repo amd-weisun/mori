@@ -350,7 +350,7 @@ class Buffer:
         # MORI combine
         combined_x = op.combine(x, topk_weights, dispatch_indices)
         
-        return combined_x, None, EventOverlap()
+        return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
 
     # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
