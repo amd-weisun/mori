@@ -56,6 +56,7 @@ class Buffer:
         # Cache for MORI ops
         self.group_name = group_name
         self.ops = {}
+        self._cleanup_done = False
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
@@ -130,8 +131,24 @@ class Buffer:
         self.rng.manual_seed(999)
 
     def cleanup(self):
-        mori.shmem.shmem_finalize()
-        dist.destroy_process_group()
+        if self._cleanup_done:
+            return
+        try:
+            mori.shmem.shmem_finalize()
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("mori.shmem.shmem_finalize failed")
+        # try:
+        #     if dist.is_initialized():
+        #         dist.destroy_process_group()
+        # except Exception:  # pylint: disable=broad-except
+        #     logger.warning("dist.destroy_process_group failed")
+        self._cleanup_done = True
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Exception raised during Buffer cleanup in __del__")
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
