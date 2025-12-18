@@ -302,7 +302,7 @@ class Buffer:
                 local_indices = local_indices[mask]
                 counts = torch.bincount(local_indices, minlength=num_local_experts)
                 if counts.numel() > 0:
-                    num_recv_tokens_per_expert_list = counts.to(torch.int64).tolist()
+                    num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
         new_handle = (dispatch_indices,)
