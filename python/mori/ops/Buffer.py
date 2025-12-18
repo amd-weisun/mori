@@ -264,6 +264,27 @@ class Buffer:
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
+        def _normalize_recv_num_token(value):
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    return 0
+                return int(value.view(-1)[0].item())
+            if isinstance(value, (list, tuple)) and value:
+                return int(value[0])
+            return int(value)
+
+        num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
+
+        def _truncate(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor[:num_valid_tokens]
+
+        dispatch_output = _truncate(dispatch_output)
+        dispatch_weights = _truncate(dispatch_weights)
+        dispatch_scales = _truncate(dispatch_scales)
+        dispatch_indices = _truncate(dispatch_indices)
+
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
         recv_topk_idx = dispatch_indices
