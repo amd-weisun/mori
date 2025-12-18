@@ -351,7 +351,7 @@ class Buffer:
         print(f"[inp shape {x.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  dispatch_indices shape={dispatch_indices.shape}, dtype = {dispatch_indices.dtype}")
         
         # MORI combine
-        combined_x = op.combine(x, topk_weights, dispatch_indices)
+        combined_x = op.combine(x, topk_weights, dispatch_indices, call_reset=True)
         
         return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
 
