@@ -21,14 +21,15 @@ def run_buffer_test(rank, world_size, group_name="default"):
     num_qps_per_rank = num_experts_per_rank
     
     group = dist.group.WORLD
+    num_tokens = 4096
+    hidden_dim = 7169 # 4096 
+    topk = 8
     print(f"[Rank {rank}] Creating Buffer (group={group_name})...")
-    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, group_name=group_name)
+    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, group_name=group_name)
     print(f"[Rank {rank}] Buffer created.")
     
     # Create dummy data
-    num_tokens = 128
-    hidden_dim = 4096
-    topk = 8
+
     
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=buffer.device)
     
