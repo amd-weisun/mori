@@ -61,11 +61,12 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # recv_x is [num_recv_tokens, hidden]
     
     print(f"[Rank {rank}] Combining...")
-    combined_x, _, event = buffer.combine(recv_x, handle, topk_weights=None) # topk_weights not used in combine for now?
+    combined_out, _, event = buffer.combine(recv_x, handle, topk_weights=None) # topk_weights not used in combine for now?
     print(f"[Rank {rank}] Combine done.")
-    
-    assert combined_x.shape == x.shape
-    assert combined_x.dtype == x.dtype
+    combined_tensor = combined_out[0] if isinstance(combined_out, tuple) else combined_out
+
+    assert combined_tensor.shape == x.shape
+    assert combined_tensor.dtype == x.dtype
     dist.barrier()
     buffer.cleanup()
     
