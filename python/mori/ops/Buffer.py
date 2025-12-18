@@ -35,7 +35,7 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, gpu_per_node: int = 1,
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank = 128, gpu_per_node: int = 1,
                  group_name: str = "default") -> None:
         """
         Initialize the communication buffer.

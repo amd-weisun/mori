@@ -16,7 +16,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # Create Buffer
     # We use the default group which is WORLD
     # Configure experts per rank to match the data the kernel sees.
-    num_experts_per_rank = 2
+    num_experts_per_rank = 8
     num_experts = num_experts_per_rank * world_size
     num_qps_per_rank = num_experts_per_rank
     
@@ -27,8 +27,8 @@ def run_buffer_test(rank, world_size, group_name="default"):
     
     # Create dummy data
     num_tokens = 128
-    hidden_dim = 64
-    topk = 2
+    hidden_dim = 4096
+    topk = 8
     
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=buffer.device)
     
