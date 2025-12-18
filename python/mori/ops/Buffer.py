@@ -53,6 +53,7 @@ class Buffer:
         self.num_qps_per_rank = num_qps_per_rank
         self.gpu_per_node = gpu_per_node  # Assuming 8 GPUs per node
         self.world_size = dist.get_world_size(group=group)
+        self.max_num_inp_token_per_rank = max_num_inp_token_per_rank
         # Cache for MORI ops
         self.group_name = group_name
         self.ops = {}
@@ -80,7 +81,7 @@ class Buffer:
                 scale_dim=scale_dim,
                 scale_type_size=1 if scale_dim > 0 else 0,
                 max_token_type_size=4, 
-                max_num_inp_token_per_rank=128, # Increased limit
+                max_num_inp_token_per_rank=self.max_num_inp_token_per_rank, # Increased limit
                 num_experts_per_rank=self.num_qps_per_rank, # Default assumption
                 num_experts_per_token=8, # topK
                 warp_num_per_block=16,
