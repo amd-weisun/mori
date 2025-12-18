@@ -260,7 +260,7 @@ class Buffer:
         
         #DEBUG ONLY
         print(f"[Rank {self.rank}] Dispatching with dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, num_tokens={inp.size(0)}")
-        print(f"[inp shape {inp.shape if not isinstance(x, tuple)  else inp[0].shape}] , topk_weights shape {topk_weights.shape},  topk_idx shape={dispatch_indices_arg.shape}")
+        print(f"[inp shape {inp.shape if not isinstance(x, tuple)  else inp[0].shape}] , topk_weights shape {topk_weights.shape}, dtype = {topk_weights.dtype},  topk_idx shape={dispatch_indices_arg.shape}, dtype = {dispatch_indices_arg.dtype}")
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
