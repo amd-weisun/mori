@@ -65,6 +65,11 @@ def run_buffer_test(rank, world_size, group_name="default"):
     combined_out, _, event = buffer.combine(recv_x, handle, topk_weights=None) # topk_weights not used in combine for now?
     print(f"[Rank {rank}] Combine done.")
     combined_tensor = combined_out[0] if isinstance(combined_out, tuple) else combined_out
+    recv_tensor = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+
+    pytest.assume(
+    torch.allclose(combined_tensor, recv_tensor, atol=1e-3, rtol=1e-3),
+    "combined output should route back to the dispatched tensor")
 
     assert combined_tensor.shape == x.shape
     assert combined_tensor.dtype == x.dtype
