@@ -290,8 +290,19 @@ class Buffer:
         recv_topk_idx = dispatch_indices
         recv_topk_weights = dispatch_weights
         
-        # Dummy per-expert count
-        num_recv_tokens_per_expert_list = [0] * 8 
+        # Count how many tokens each local expert actually received using the truncated indices.
+        num_local_experts = self.num_qps_per_rank
+        num_recv_tokens_per_expert_list = [0] * num_local_experts
+        if dispatch_indices is not None and dispatch_indices.numel() > 0:
+            flat_indices = dispatch_indices.reshape(-1)
+            local_offset = self.rank * self.num_qps_per_rank
+            local_indices = flat_indices - local_offset
+            mask = (local_indices >= 0) & (local_indices < num_local_experts)
+            if mask.any():
+                local_indices = local_indices[mask]
+                counts = torch.bincount(local_indices, minlength=num_local_experts)
+                if counts.numel() > 0:
+                    num_recv_tokens_per_expert_list = counts.to(torch.int64).tolist()
         
         # Store dispatch_indices in handle for combine
         new_handle = (dispatch_indices,)
