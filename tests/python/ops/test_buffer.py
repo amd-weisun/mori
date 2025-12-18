@@ -68,7 +68,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     assert combined_tensor.shape == x.shape
     assert combined_tensor.dtype == x.dtype
     dist.barrier()
-    buffer.cleanup()
+    # buffer.cleanup()
     
     return True
 
