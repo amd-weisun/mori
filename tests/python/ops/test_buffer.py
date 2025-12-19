@@ -57,6 +57,9 @@ def run_buffer_test(rank, world_size, group_name="default"):
         
     assert recv_x.shape[1] == hidden_dim
     assert recv_x.dtype == torch.bfloat16
+
+    print(f"[Rank {rank}] recv_x  shape: {recv_x.shape}, dtype: {recv_x.dtype}")   
+    print(f"[Rank {rank}] recv_x  value {recv_x}")
     
     # Combine
     # For combine, we need to send back something of the same shape as recv_x
