@@ -31,7 +31,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # Create dummy data
 
     
-    x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=buffer.device)
+    x = torch.full((num_tokens, hidden_dim), 1.0 + rank, dtype=torch.bfloat16, device=buffer.device)
     if(rank == 0):
         print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
         print(f"[Rank {rank}] input tensor x value {x}")
@@ -47,9 +47,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # The dispatch/combine op config has num_experts_per_rank.
     
     topk_idx = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int64, device=buffer.device)
-    topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32, device=buffer.device)
-    # Normalize weights
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = torch.ones(num_tokens, topk, dtype=torch.float32, device=buffer.device)
     
     # Dispatch
     print(f"[Rank {rank}] Dispatching...")
