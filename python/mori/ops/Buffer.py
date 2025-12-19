@@ -35,7 +35,8 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank = 128, gpu_per_node: int = 1,
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: int = 1,
+                 num_experts_per_token : int = 8,
                  group_name: str = "default") -> None:
         """
         Initialize the communication buffer.
@@ -54,6 +55,7 @@ class Buffer:
         self.gpu_per_node = gpu_per_node  # Assuming 8 GPUs per node
         self.world_size = dist.get_world_size(group=group)
         self.max_num_inp_token_per_rank = max_num_inp_token_per_rank
+        self.num_experts_per_token = num_experts_per_token
         # Cache for MORI ops
         self.group_name = group_name
         self.ops = {}
@@ -83,7 +85,7 @@ class Buffer:
                 max_token_type_size=4, 
                 max_num_inp_token_per_rank=self.max_num_inp_token_per_rank, # Increased limit
                 num_experts_per_rank=self.num_qps_per_rank, # Default assumption
-                num_experts_per_token=8, # topK
+                num_experts_per_token=self.num_experts_per_token, # topK
                 warp_num_per_block=16,
                 block_num=32,
                 kernel_type=kernel_type,

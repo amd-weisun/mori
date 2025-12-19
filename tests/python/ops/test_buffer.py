@@ -21,17 +21,19 @@ def run_buffer_test(rank, world_size, group_name="default"):
     num_qps_per_rank = num_experts_per_rank
     
     group = dist.group.WORLD
-    num_tokens = 16
+    num_tokens = 8
     hidden_dim = 8 # 4096 
-    topk = 8
+    topk = 4
     print(f"[Rank {rank}] Creating Buffer (group={group_name})...")
-    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, gpu_per_node = world_size, group_name=group_name)
+    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, num_experts_per_token =topk, gpu_per_node = world_size, group_name=group_name)
     print(f"[Rank {rank}] Buffer created.")
     
     # Create dummy data
 
     
-    x = torch.full((num_tokens, hidden_dim), 1.0 + rank, dtype=torch.bfloat16, device=buffer.device)
+    # Give each token row a deterministic pattern: (token_index * rank) repeated across the hidden dimension.
+    row_values = torch.arange(num_tokens, dtype=torch.float32, device=buffer.device) * rank
+    x = row_values.unsqueeze(1).expand(num_tokens, hidden_dim).to(torch.bfloat16)
     # if(rank == 0):
     print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
     print(f"[Rank {rank}] input tensor x value {x}")
