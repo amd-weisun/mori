@@ -101,9 +101,9 @@ def run_buffer_test(rank, world_size, group_name="default"):
                 (idx // num_experts_per_rank)
                 for idx in topk_idx[i].cpu().tolist()
             ]
-            print(f"pes {pes}...")
+            print(f"topk_idx[{i}] = {topk_idx[i].cpu().tolist()}...")
             unique_pes = len(set(pes))
-            print(f"unique_pes = {unique_pes}...")
+            print(f"pes {pes}, unique_pes = {unique_pes}...")
             got, expected = combined_tensor[i], (
             x[i].to(torch.float32) * unique_pes
             ).to(torch.bfloat16)
