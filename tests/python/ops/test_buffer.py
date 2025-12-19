@@ -64,8 +64,8 @@ def run_buffer_test(rank, world_size, group_name="default"):
     print(f"[Rank {rank}] recv_x  value {recv_x}")
     print(f"[Rank {rank}] recv_topk_idx  shape: {recv_topk_idx.shape}, dtype: {recv_topk_idx.dtype}")   
     print(f"[Rank {rank}] recv_topk_idx  value {recv_topk_idx}")
-    print(f"[Rank {rank}] handle  shape: {handle[0].shape}, dtype: {handle[0].dtype}")   
-    print(f"[Rank {rank}] handle  value {handle[0]}")
+    print(f"[Rank {rank}] dispatch indices shape: {handle[0].shape}, dtype: {handle[0].dtype}")   
+    print(f"[Rank {rank}] dispatch indices value {handle[0]}")
     
     # Combine
     # For combine, we need to send back something of the same shape as recv_x
@@ -81,8 +81,8 @@ def run_buffer_test(rank, world_size, group_name="default"):
     print(f"[Rank {rank}] combine tensor  shape: {combined_tensor.shape}, dtype: {combined_tensor.dtype}")   
     print(f"[Rank {rank}] combined_tensor  value {combined_tensor}")
 
-    print(f"[Rank {rank}] combine_output_weight  shape: {combine_output_weight.shape}, dtype: {combine_output_weight.dtype}")   
-    print(f"[Rank {rank}] combine_output_weight  value {combine_output_weight}")
+    # print(f"[Rank {rank}] combine_output_weight  shape: {combine_output_weight.shape}, dtype: {combine_output_weight.dtype}")   
+    # print(f"[Rank {rank}] combine_output_weight  value {combine_output_weight}")
 
     assert combined_tensor.shape == x.shape
     assert combined_tensor.dtype == x.dtype
