@@ -48,7 +48,8 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # So total experts = num_qps_per_rank * world_size?
     # The dispatch/combine op config has num_experts_per_rank.
     
-    topk_idx = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int64, device=buffer.device)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = torch.ones(num_tokens, topk, dtype=torch.float32, device=buffer.device)
 
     print(f"[Rank {rank}] topk_idx  shape: {topk_idx.shape}, dtype: {topk_idx.dtype}")   
