@@ -50,6 +50,9 @@ def run_buffer_test(rank, world_size, group_name="default"):
     
     topk_idx = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int64, device=buffer.device)
     topk_weights = torch.ones(num_tokens, topk, dtype=torch.float32, device=buffer.device)
+
+    print(f"[Rank {rank}] topk_idx  shape: {topk_idx.shape}, dtype: {topk_idx.dtype}")   
+    print(f"[Rank {rank}] topk_idx  value {topk_idx}")
     
     # Dispatch
     print(f"[Rank {rank}] Dispatching...")
