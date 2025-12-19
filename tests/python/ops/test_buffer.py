@@ -31,8 +31,8 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # Create dummy data
 
     
-    # Give each token row a deterministic pattern: (token_index * rank) repeated across the hidden dimension.
-    row_values = torch.arange(num_tokens, dtype=torch.float32, device=buffer.device) * rank
+    # Give each token row a deterministic pattern: token_index range shifted by rank * num_tokens.
+    row_values = torch.arange(num_tokens, dtype=torch.float32, device=buffer.device) + rank * num_tokens
     x = row_values.unsqueeze(1).expand(num_tokens, hidden_dim).to(torch.bfloat16)
     # if(rank == 0):
     print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
