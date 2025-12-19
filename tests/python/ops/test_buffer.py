@@ -92,6 +92,32 @@ def run_buffer_test(rank, world_size, group_name="default"):
     assert combined_tensor.dtype == x.dtype
     dist.barrier()
     # buffer.cleanup()
+
+    # for i in range(all_rank_num_token[self.config.rank]):
+    if rank == 0:
+        for i in range(num_tokens):
+            pes = [
+                (idx // num_experts_per_rank)
+                for idx in topk_idx[i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
+
+            got, expected = combined_tensor[i], (
+            x[i].to(torch.float32) * unique_pes
+            ).to(self.config.data_type)
+
+            result_match = torch.allclose(
+                got.float(), expected.float(), atol=1e-2, rtol=1e-2
+            )
+            if not result_match:
+                print(f"Result mismatch for token {i}:")
+                print(
+                    f"  indices[{i}]: {x[i].cpu().tolist()}"
+                )
+                print(f"  pes: {pes}")
+                print(f"  unique_pes: {unique_pes}")
+                print(f"  got: {got}")
+                print(f"  expected : {expected}")
     
     return True
 
