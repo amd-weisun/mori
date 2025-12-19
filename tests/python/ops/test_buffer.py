@@ -104,7 +104,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
 
             got, expected = combined_tensor[i], (
             x[i].to(torch.float32) * unique_pes
-            ).to(self.config.data_type)
+            ).to(torch.bfloat16)
 
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=1e-2, rtol=1e-2
