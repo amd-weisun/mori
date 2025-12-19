@@ -22,7 +22,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     
     group = dist.group.WORLD
     num_tokens = 16
-    hidden_dim = 16 # 4096 
+    hidden_dim = 8 # 4096 
     topk = 8
     print(f"[Rank {rank}] Creating Buffer (group={group_name})...")
     buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, gpu_per_node = world_size, group_name=group_name)
@@ -60,6 +60,10 @@ def run_buffer_test(rank, world_size, group_name="default"):
 
     print(f"[Rank {rank}] recv_x  shape: {recv_x.shape}, dtype: {recv_x.dtype}")   
     print(f"[Rank {rank}] recv_x  value {recv_x}")
+    print(f"[Rank {rank}] recv_topk_idx  shape: {recv_topk_idx.shape}, dtype: {recv_topk_idx.dtype}")   
+    print(f"[Rank {rank}] recv_topk_idx  value {recv_topk_idx}")
+    print(f"[Rank {rank}] handle  shape: {handle[0].shape}, dtype: {handle[0].dtype}")   
+    print(f"[Rank {rank}] handle  value {handle[0]}")
     
     # Combine
     # For combine, we need to send back something of the same shape as recv_x
