@@ -32,9 +32,9 @@ def run_buffer_test(rank, world_size, group_name="default"):
 
     
     x = torch.full((num_tokens, hidden_dim), 1.0 + rank, dtype=torch.bfloat16, device=buffer.device)
-    if(rank == 0):
-        print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
-        print(f"[Rank {rank}] input tensor x value {x}")
+    # if(rank == 0):
+    print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
+    print(f"[Rank {rank}] input tensor x value {x}")
     
     # Random topk indices
     # Ensure indices are within range [0, num_experts * world_size)
@@ -68,9 +68,9 @@ def run_buffer_test(rank, world_size, group_name="default"):
     combined_tensor = combined_out[0] if isinstance(combined_out, tuple) else combined_out
 
 
-    if(rank == 0):
-        print(f"[Rank {rank}] combine tensor  shape: {combined_tensor.shape}, dtype: {combined_tensor.dtype}")   
-        print(f"[Rank {rank}] combined_tensor  value {combined_tensor}")
+    # if(rank == 0):
+    print(f"[Rank {rank}] combine tensor  shape: {combined_tensor.shape}, dtype: {combined_tensor.dtype}")   
+    print(f"[Rank {rank}] combined_tensor  value {combined_tensor}")
 
 
 
