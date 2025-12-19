@@ -49,7 +49,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # The dispatch/combine op config has num_experts_per_rank.
     
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
-    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    topk_idx = torch.topk(scores, topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = torch.ones(num_tokens, topk, dtype=torch.float32, device=buffer.device)
 
     print(f"[Rank {rank}] topk_idx  shape: {topk_idx.shape}, dtype: {topk_idx.dtype}")   
