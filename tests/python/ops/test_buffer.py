@@ -96,16 +96,18 @@ def run_buffer_test(rank, world_size, group_name="default"):
     # for i in range(all_rank_num_token[self.config.rank]):
     if rank == 0:
         for i in range(num_tokens):
+            print(f"[Rank {rank}] Verifying token {i}...")
             pes = [
                 (idx // num_experts_per_rank)
                 for idx in topk_idx[i].cpu().tolist()
             ]
+            print(f"pes {pes}...")
             unique_pes = len(set(pes))
-
+            print(f"unique_pes = {unique_pes}...")
             got, expected = combined_tensor[i], (
             x[i].to(torch.float32) * unique_pes
             ).to(torch.bfloat16)
-
+            print(f"got = {got}... expected = {expected}...")
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=1e-2, rtol=1e-2
             )
