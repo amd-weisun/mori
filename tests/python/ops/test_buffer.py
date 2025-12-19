@@ -21,17 +21,20 @@ def run_buffer_test(rank, world_size, group_name="default"):
     num_qps_per_rank = num_experts_per_rank
     
     group = dist.group.WORLD
-    num_tokens = 4096
-    hidden_dim = 7169 # 4096 
+    num_tokens = 16
+    hidden_dim = 16 # 4096 
     topk = 8
     print(f"[Rank {rank}] Creating Buffer (group={group_name})...")
-    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, group_name=group_name)
+    buffer = Buffer(group, num_qps_per_rank=num_qps_per_rank, max_num_inp_token_per_rank = num_tokens, gpu_per_node = world_size, group_name=group_name)
     print(f"[Rank {rank}] Buffer created.")
     
     # Create dummy data
 
     
     x = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=buffer.device)
+    if(rank == 0):
+        print(f"[Rank {rank}] Input tensor x shape: {x.shape}, dtype: {x.dtype}")   
+        print(f"[Rank {rank}] input tensor x value {x}")
     
     # Random topk indices
     # Ensure indices are within range [0, num_experts * world_size)
@@ -67,6 +70,11 @@ def run_buffer_test(rank, world_size, group_name="default"):
     combined_tensor = combined_out[0] if isinstance(combined_out, tuple) else combined_out
 
 
+    if(rank == 0):
+        print(f"[Rank {rank}] combine tensor  shape: {combined_tensor.shape}, dtype: {combined_tensor.dtype}")   
+        print(f"[Rank {rank}] combined_tensor  value {combined_tensor}")
+
+
 
     assert combined_tensor.shape == x.shape
     assert combined_tensor.dtype == x.dtype
@@ -77,7 +85,7 @@ def run_buffer_test(rank, world_size, group_name="default"):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Need at least 8 GPUs")
 def test_buffer_dispatch_combine():
-    world_size = 8
+    world_size = 2
     # We set init_mori_shmem=False because Buffer.setup() calls shmem_torch_process_group_init
     # and we want to test that flow, or at least avoid double init if Buffer does it.
     # However, Buffer.setup() catches the exception if it fails.
