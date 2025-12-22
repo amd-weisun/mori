@@ -287,6 +287,19 @@ class Buffer:
         dispatch_scales = _truncate(dispatch_scales)
         dispatch_indices = _truncate(dispatch_indices)
 
+        if num_valid_tokens > 0:
+            src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
+            if src_token_pos.numel() > 0:
+                ordering = torch.argsort(src_token_pos.to(torch.int64), stable=True)
+                if dispatch_output is not None:
+                    dispatch_output = dispatch_output[ordering]
+                if dispatch_weights is not None:
+                    dispatch_weights = dispatch_weights[ordering]
+                if dispatch_scales is not None:
+                    dispatch_scales = dispatch_scales[ordering]
+                if dispatch_indices is not None:
+                    dispatch_indices = dispatch_indices[ordering]
+
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
         recv_topk_idx = dispatch_indices
