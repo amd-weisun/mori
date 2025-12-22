@@ -287,8 +287,7 @@ class Buffer:
         dispatch_scales = _truncate(dispatch_scales)
         dispatch_indices = _truncate(dispatch_indices)
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
-        src_token_pos =  _truncate(src_token_pos)
-        if num_valid_tokens > 0:
+        
         dispatch_output, dispatch_indices, dispatch_weights = \
                 self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
         
