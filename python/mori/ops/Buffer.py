@@ -293,8 +293,8 @@ class Buffer:
                 ordering = torch.argsort(src_token_pos.to(torch.int64), stable=True)
                 if dispatch_output is not None:
                     dispatch_output = dispatch_output[ordering]
-                if dispatch_weights is not None:
-                    dispatch_weights = dispatch_weights[ordering]
+                # if dispatch_weights is not None:
+                #     dispatch_weights = dispatch_weights[ordering]
                 if dispatch_scales is not None:
                     dispatch_scales = dispatch_scales[ordering]
                 if dispatch_indices is not None:
