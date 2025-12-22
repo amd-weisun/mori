@@ -275,8 +275,8 @@ class Buffer:
                 return int(value[0])
             return int(value)
 
-        #num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
-        num_valid_tokens = op.get_cur_rank_num_token()
+        num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
+        #num_valid_tokens = op.get_cur_rank_num_token()
         def _truncate(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if tensor is None:
                 return None
