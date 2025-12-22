@@ -275,8 +275,8 @@ class Buffer:
                 return int(value[0])
             return int(value)
 
-        num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
-
+        #num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
+        num_valid_tokens = op.get_cur_rank_num_token()
         def _truncate(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if tensor is None:
                 return None
@@ -286,6 +286,7 @@ class Buffer:
         dispatch_weights = _truncate(dispatch_weights)
         dispatch_scales = _truncate(dispatch_scales)
         dispatch_indices = _truncate(dispatch_indices)
+        src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
 
         # if num_valid_tokens > 0:
         #     src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
@@ -320,7 +321,7 @@ class Buffer:
                     num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,)
+        new_handle = (dispatch_indices,src_token_pos)
         
         return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle, EventOverlap()
 

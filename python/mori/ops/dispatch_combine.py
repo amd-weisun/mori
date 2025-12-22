@@ -101,6 +101,9 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
         return self._get_registered_combine_input_buffer(self._handle, dtype)
 
+    def get_cur_rank_num_token(self):
+        return self._get_cur_rank_num_token(self._handle)
+
     def dispatch(
         self,
         input: torch.Tensor,
