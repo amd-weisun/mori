@@ -287,8 +287,15 @@ class Buffer:
         dispatch_scales = _truncate(dispatch_scales)
         dispatch_indices = _truncate(dispatch_indices)
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
-        
+        src_token_pos = _truncate(src_token_pos)
 
+        print(f"[Rank {self.rank}] : dispatch_output shape {dispatch_output.shape if dispatch_output is not None else None}, dtype: {dispatch_output.dtype if dispatch_output is not None else None}")
+        print(f"[Rank {self.rank}] : dispatch_weights shape {dispatch_weights.shape if dispatch_weights is not None else None}, dtype: {dispatch_weights.dtype if dispatch_weights is not None else None}")
+        print(f"[Rank {self.rank}] : dispatch_indices shape {dispatch_indices.shape if dispatch_indices is not None else None}, dtype: {dispatch_indices.dtype if dispatch_indices is not None else None}")     
+        print(f"[Rank {self.rank}] : src_token_pos shape {src_token_pos.shape if src_token_pos is not None else None}, dtype: {src_token_pos.dtype if src_token_pos is not None else None}")    
+        print(f"[Rank {self.rank}] : num_valid_tokens = {num_valid_tokens}")
+        dispatch_output, dispatch_indices, dispatch_weights = \
+                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
         
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
@@ -296,8 +303,7 @@ class Buffer:
         recv_topk_weights = dispatch_weights
 
         # reorder to match DeepEp order
-        recv_x, recv_topk_idx, recv_topk_weights = \
-                self._reorder_mori_dispatch_outputs(recv_x, recv_topk_idx, recv_topk_weights, src_token_pos)
+
         # Count how many tokens each local expert actually received using the truncated indices.
         num_local_experts = self.num_qps_per_rank
         num_recv_tokens_per_expert_list = [0] * num_local_experts
