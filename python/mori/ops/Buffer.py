@@ -288,19 +288,10 @@ class Buffer:
         dispatch_indices = _truncate(dispatch_indices)
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
         src_token_pos =  _truncate(src_token_pos)
-        # if num_valid_tokens > 0:
-        #     src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
-        #     if src_token_pos.numel() > 0:
-        #         ordering = torch.argsort(src_token_pos.to(torch.int64), stable=True)
-        #         if dispatch_output is not None:
-        #             dispatch_output = dispatch_output[ordering]
-        #         # if dispatch_weights is not None:
-        #         #     dispatch_weights = dispatch_weights[ordering]
-        #         if dispatch_scales is not None:
-        #             dispatch_scales = dispatch_scales[ordering]
-        #         if dispatch_indices is not None:
-        #             dispatch_indices = dispatch_indices[ordering]
-
+        if num_valid_tokens > 0:
+        dispatch_output, dispatch_indices, dispatch_weights = \
+                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
+        
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
         recv_topk_idx = dispatch_indices
@@ -322,6 +313,8 @@ class Buffer:
         
         # Store dispatch_indices in handle for combine
         new_handle = (dispatch_indices,src_token_pos)
+
+        
         
         return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle, EventOverlap()
 
@@ -362,6 +355,9 @@ class Buffer:
              raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
         
         dispatch_indices = handle[0]
+
+        x , dispatch_indices, topk_weights = \
+             self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
 
         # print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={x.size(0)}")
         # print(f"[inp shape {x.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  dispatch_indices shape={dispatch_indices.shape}, dtype = {dispatch_indices.dtype}")
@@ -433,3 +429,47 @@ class Buffer:
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         raise NotImplementedError("get_next_low_latency_combine_buffer is not supported.")
+
+
+    # helper functions for matching DeepEp API
+    def _reorder_mori_dispatch_outputs(recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+                         token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        reoder the outputs from mori dispatch to match DeepEp order.
+        """    
+        if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
+            if dist.get_rank() == 0:
+                print('[warning] reorder_mori_outputs guard: shape mismatch or empty order.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        if token_order.min() < 0 :
+            if dist.get_rank() == 0:
+                print('[warning] reorder_mori_outputs guard: order contains invalid indices.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        unique_tokens = torch.unique(token_order)
+        if unique_tokens.numel() != token_order.numel():
+            if dist.get_rank() == 0:
+                print('[warning] reorder_mori_outputs guard: order contains repeated tokens.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        perm = torch.argsort(token_order)
+        return recv_x[perm], recv_topk_idx[perm], recv_topk_weights[perm]
+
+
+    def _revert_mori_dispatch_outputs(recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+                            token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
+            if dist.get_rank() == 0:
+                print('[warning] revert_mori_outputs guard: shape mismatch or empty order.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        if token_order.min() < 0 :
+            if dist.get_rank() == 0:
+                print('[warning] revert_mori_outputs guard: order contains invalid indices.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        unique_tokens = torch.unique(token_order)
+        if unique_tokens.numel() != token_order.numel():
+            if dist.get_rank() == 0:
+                print('[warning] revert_mori_outputs guard: order contains repeated tokens.', flush=True)
+            return recv_x, recv_topk_idx, recv_topk_weights
+        perm = torch.argsort(token_order)
+        inverted = torch.empty_like(perm)
+        inverted[perm] = torch.arange(perm.numel(), device=perm.device)
+        return recv_x[inverted], recv_topk_idx[inverted], recv_topk_weights[inverted]
