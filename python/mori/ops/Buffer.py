@@ -288,14 +288,16 @@ class Buffer:
         dispatch_indices = _truncate(dispatch_indices)
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
         
-        dispatch_output, dispatch_indices, dispatch_weights = \
-                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
+
         
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
         recv_topk_idx = dispatch_indices
         recv_topk_weights = dispatch_weights
-        
+
+        # reorder to match DeepEp order
+        recv_x, recv_topk_idx, recv_topk_weights = \
+                self._reorder_mori_dispatch_outputs(recv_x, recv_topk_idx, recv_topk_weights, src_token_pos)
         # Count how many tokens each local expert actually received using the truncated indices.
         num_local_experts = self.num_qps_per_rank
         num_recv_tokens_per_expert_list = [0] * num_local_experts
