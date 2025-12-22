@@ -289,11 +289,6 @@ class Buffer:
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
         src_token_pos = _truncate(src_token_pos)
 
-        print(f"[Rank {self.rank}] : dispatch_output shape {dispatch_output.shape if dispatch_output is not None else None}, dtype: {dispatch_output.dtype if dispatch_output is not None else None}")
-        print(f"[Rank {self.rank}] : dispatch_weights shape {dispatch_weights.shape if dispatch_weights is not None else None}, dtype: {dispatch_weights.dtype if dispatch_weights is not None else None}")
-        print(f"[Rank {self.rank}] : dispatch_indices shape {dispatch_indices.shape if dispatch_indices is not None else None}, dtype: {dispatch_indices.dtype if dispatch_indices is not None else None}")     
-        print(f"[Rank {self.rank}] : src_token_pos shape {src_token_pos.shape if src_token_pos is not None else None}, dtype: {src_token_pos.dtype if src_token_pos is not None else None}")    
-        print(f"[Rank {self.rank}] : num_valid_tokens = {num_valid_tokens}")
         dispatch_output, dispatch_indices, dispatch_weights = \
                 self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
         
@@ -439,7 +434,7 @@ class Buffer:
 
 
     # helper functions for matching DeepEp API
-    def _reorder_mori_dispatch_outputs(recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+    def _reorder_mori_dispatch_outputs(self, recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
                          token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         reoder the outputs from mori dispatch to match DeepEp order.
@@ -461,7 +456,7 @@ class Buffer:
         return recv_x[perm], recv_topk_idx[perm], recv_topk_weights[perm]
 
 
-    def _revert_mori_dispatch_outputs(recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+    def _revert_mori_dispatch_outputs(self, recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
                             token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
             if dist.get_rank() == 0:
