@@ -348,17 +348,9 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        if isinstance(x, tuple):
-            inp, inp_scales = x
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
-        else:
-            inp = x
-            inp_scales = None
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = 0
+        dtype = x.dtype
+        hidden_dim = x.size(1)
+        op = self._get_op(dtype, hidden_dim)
 
         op = self._get_op(dtype, hidden_dim, scale_dim)
         
@@ -489,24 +481,16 @@ class Buffer:
                 x, sorted_indices, expert_counts, recv_count
         )
 
-        if isinstance(x, tuple):
-            inp, inp_scales = x
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
-        else:
-            inp = x
-            inp_scales = None
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = 0
-
+        dtype = rec_output.dtype
+        hidden_dim = rec_output.size(1)
         op = self._get_op(dtype, hidden_dim)
+
+
         topk_idx = topk_idx.to(dtype=torch.int32)
 
         combine_output,combine_output_weight = op.combine(
             rec_output,
-            topk_weights,
+            dispatch_weights,
             # None,
             topk_idx,
             block_num=self.config.block_num,
@@ -519,6 +503,7 @@ class Buffer:
             print(f"[topk_weights] = {topk_weights}")
             print(f"[dispatch_weights] = {dispatch_weights}")
             print(f"[combine_output_weight] = {combine_output_weight}")
+            print(f"[combine_output] = {combine_output}")
 
         return combine_output, EventOverlap(), None
         
