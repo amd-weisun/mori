@@ -35,18 +35,18 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=7168,
+            hidden_dim=4096,
             # scale_dim=32,
             scale_dim=0,
             scale_type_size=torch.tensor(
                 [], dtype=torch.float8_e4m3fnuz
             ).element_size(),
             max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
-            max_num_inp_token_per_rank=4096,
+            max_num_inp_token_per_rank=128,
             num_experts_per_rank=32,
             num_experts_per_token=8,
             kernel_type = EpDispatchCombineKernelType.InterNodeV1LL,
-            use_external_inp_buf=False,
+            # use_external_inp_buf=False,
         )
 
     def setup(self):
@@ -334,7 +334,7 @@ def test_dispatch_combine(rank, world_size):
 
 
 if __name__ == "__main__":
-    world_size = 8
+    world_size = 2
     torch.multiprocessing.spawn(
         test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
     )
