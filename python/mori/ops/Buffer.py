@@ -93,7 +93,7 @@ class Buffer:
                 gpu_per_node=self.gpu_per_node,
                 rdma_block_num=16,
             )
-            self.ops[key] = EpDispatchCombineOp(config)
+            self.ops[key] = EpDispatchCombineOp(self.config)
         return self.ops[key]
 
     def setup(self):
