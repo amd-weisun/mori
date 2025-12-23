@@ -314,7 +314,7 @@ class Buffer:
                     num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,src_token_pos)
+        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens)
 
         
         
@@ -410,13 +410,43 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                             use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         Low latency dispatch.
         Not fully supported with the same API.
         """
-        raise NotImplementedError("low_latency_dispatch is not supported. Use dispatch with low_latency_mode=True.")
+
+        if(use_fp8):
+            raise NotImplementedError("MORI low_latency_dispatch with fp8 input is not supported yet.")
+
+
+        recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
+                self.dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank,
+                             is_token_in_rank, num_tokens_per_expert,
+                             topk_idx, topk_weights, expert_alignment,
+                             config, previous_event, async_finish,
+                             allocate_on_comm_stream)
+        
+
+        recv_count = handle[2] if len(handle) > 2 else recv_x.size(0)
+        if isinstance(recv_x, tuple):
+            dispatch_output = recv_x[0]
+        
+
+        packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
+            dispatch_output,
+            recv_topk_idx,
+            self.config,
+            recv_count,
+        )
+
+        recv_x = (packed_input, None) if use_fp8 else packed_input
+        
+        new_handle = (sorted_indices, expert_counts, recv_count)
+
+        return recv_x, expert_counts, new_handle, EventOverlap(), None
+        
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
@@ -427,7 +457,25 @@ class Buffer:
         Low latency combine.
         Not fully supported with the same API.
         """
-        raise NotImplementedError("low_latency_combine is not supported. Use combine.")
+        sorted_indices = handle[0]
+        expert_counts = handle[1]
+        recv_count = handle[2]
+        # recv_topk_weights = handle[3]
+        rec_output = mori.inverse_transform_dispatch_output_gpu(
+                x, sorted_indices, expert_counts, dispatch_output.size(0)
+        )
+
+        combine_output, _ = op.combine(
+            rec_output,
+            topk_weights,
+            # None,
+            topk_idx,
+            block_num=self.config.block_num,
+            warp_per_block=16,
+        )
+        return combine_output, EventOverlap(), None
+        
+        # raise NotImplementedError("low_latency_combine is not supported. Use combine.")
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         raise NotImplementedError("get_next_low_latency_combine_buffer is not supported.")
