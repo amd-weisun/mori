@@ -27,6 +27,12 @@ import torch
 import torch.distributed as dist
 from mori.ops.dispatch_combine import EpDispatchCombineOp, EpDispatchCombineConfig, EpDispatchCombineKernelType
 
+kernel_type_map = {
+    "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
+    "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+}
+
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=torch.bfloat16):
         self.rank = rank
@@ -45,7 +51,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=16,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            kernel_type = EpDispatchCombineKernelType.InterNode, # EpDispatchCombineKernelType.InterNodeV1LL,
+            kernel_type = EpDispatchCombineKernelType.InterNodeV1LL, # EpDispatchCombineKernelType.InterNodeV1LL,
             gpu_per_node = 2,
             # use_external_inp_buf=False,
         )
