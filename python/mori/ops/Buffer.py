@@ -501,7 +501,7 @@ class Buffer:
             hidden_dim = inp.size(1)
             scale_dim = 0
 
-        op = self._get_op(dtype, hidden_dim, scale_dim)
+        op = self._get_op(dtype, hidden_dim)
         topk_idx = topk_idx.to(dtype=torch.int32)
 
         combine_output,combine_output_weight = op.combine(
