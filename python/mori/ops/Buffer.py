@@ -60,6 +60,9 @@ class Buffer:
         self.group_name = group_name
         self.ops = {}
         self._cleanup_done = False
+        self.config = EpDispatchCombineConfig(rank=self.rank,
+        num_experts_per_rank=self.num_qps_per_rank
+        )
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
@@ -75,7 +78,7 @@ class Buffer:
                  kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
 
             # TODO: These parameters might need to be tuned or exposed
-            config = EpDispatchCombineConfig(
+            self.config = EpDispatchCombineConfig(
                 data_type=dtype,
                 rank=self.rank,
                 world_size=self.group_size,
