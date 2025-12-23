@@ -46,6 +46,7 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=32,
             num_experts_per_token=8,
             kernel_type = EpDispatchCombineKernelType.InterNodeV1LL,
+            gpu_per_node = 2,
             # use_external_inp_buf=False,
         )
 
