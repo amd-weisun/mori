@@ -513,7 +513,7 @@ class Buffer:
             warp_per_block=16,
         )
 
-       if(self.rank == 0):
+        if(self.rank == 0):
             print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
             print(f"[inp shape {rec_output.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  topk_idx shape={topk_idx.shape}, dtype = {topk_idx.dtype}")
             print(f"[topk_weights] = {topk_weights}")
