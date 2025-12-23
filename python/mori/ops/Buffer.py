@@ -351,8 +351,6 @@ class Buffer:
         dtype = x.dtype
         hidden_dim = x.size(1)
         op = self._get_op(dtype, hidden_dim)
-
-        op = self._get_op(dtype, hidden_dim, scale_dim)
         
         # Retrieve indices from handle
         if not handle or len(handle) < 1:
