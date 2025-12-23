@@ -445,9 +445,6 @@ class Buffer:
         
         recv_count = dispatch_recv_num_token[0].item()
         
-        if isinstance(recv_x, tuple):
-            dispatch_output = recv_x[0]
-        
 
         packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
             dispatch_output,
