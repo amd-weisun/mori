@@ -60,9 +60,7 @@ class Buffer:
         self.group_name = group_name
         self.ops = {}
         self._cleanup_done = False
-        self.config = EpDispatchCombineConfig(rank=self.rank,
-        num_experts_per_rank=self.num_qps_per_rank
-        )
+        self.config = None
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
