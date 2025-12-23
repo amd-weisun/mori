@@ -476,7 +476,7 @@ class Buffer:
         recv_count = handle[2]
         # recv_topk_weights = handle[3]
         rec_output = mori.inverse_transform_dispatch_output_gpu(
-                x, sorted_indices, expert_counts, dispatch_output.size(0)
+                x, sorted_indices, expert_counts, recv_count
         )
 
         dtype = rec_output.dtype
