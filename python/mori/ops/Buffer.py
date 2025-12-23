@@ -489,9 +489,19 @@ class Buffer:
                 x, sorted_indices, expert_counts, recv_count
         )
 
-        dtype = rec_output.dtype
-        hidden_dim = rec_output.size(1)
-        op = self._get_op(dtype, hidden_dim)
+        if isinstance(x, tuple):
+            inp, inp_scales = x
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        else:
+            inp = x
+            inp_scales = None
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = 0
+
+        op = self._get_op(dtype, hidden_dim, scale_dim)
         topk_idx = topk_idx.to(dtype=torch.int32)
 
         if(self.rank == 0):
