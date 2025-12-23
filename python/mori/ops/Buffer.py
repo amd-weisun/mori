@@ -81,7 +81,7 @@ class Buffer:
                 world_size=self.group_size,
                 hidden_dim=hidden_dim,
                 scale_dim=scale_dim,
-                scale_type_size=1 if scale_dim > 0 else 0,
+                scale_type_size=4 if scale_dim > 0 else 1,
                 max_token_type_size=4, 
                 max_num_inp_token_per_rank=self.max_num_inp_token_per_rank, # Increased limit
                 num_experts_per_rank=self.num_qps_per_rank, # Default assumption
