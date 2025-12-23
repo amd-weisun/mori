@@ -42,7 +42,7 @@ class EpDispatchCombineTestCase:
                 [], dtype=torch.float8_e4m3fnuz
             ).element_size(),
             max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
-            max_num_inp_token_per_rank=128,
+            max_num_inp_token_per_rank=16,
             num_experts_per_rank=32,
             num_experts_per_token=8,
             kernel_type = EpDispatchCombineKernelType.InterNodeV1LL,
@@ -271,7 +271,7 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
 
-        if self.rank == 0:
+        if self.config.rank == 0:
             print(f"rank {self.rank} combining {num_tokens} tokens")
             print(f"combine_output dtype = {combine_output.dtype}, shape = {combine_output.shape}")
             print(f"combine_output = {combine_output}")
