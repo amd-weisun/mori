@@ -484,9 +484,15 @@ class Buffer:
         hidden_dim = rec_output.size(1)
         op = self._get_op(dtype, hidden_dim)
         topk_idx = topk_idx.to(dtype=torch.int32)
+
+        if(self.rank == 0):
+            print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
+            print(f"[inp shape {rec_output.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  topk_idx shape={topk_idx.shape}, dtype = {topk_idx.dtype}")
+            print(f"[topk_weights] = {topk_weights}")
+            print(f"[dispatch_weights] = {dispatch_weights}")
         combine_output, _ = op.combine(
             rec_output,
-            dispatch_weights,
+            topk_weights,
             # None,
             topk_idx,
             block_num=self.config.block_num,
