@@ -348,10 +348,19 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        
-        dtype = x.dtype
-        hidden_dim = x.size(1)
-        op = self._get_op(dtype, hidden_dim)
+        if isinstance(x, tuple):
+            inp, inp_scales = x
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        else:
+            inp = x
+            inp_scales = None
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = 0
+
+        op = self._get_op(dtype, hidden_dim, scale_dim)
         
         # Retrieve indices from handle
         if not handle or len(handle) < 1:
