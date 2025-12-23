@@ -25,7 +25,7 @@ import time
 
 import torch
 import torch.distributed as dist
-
+from mori.ops.dispatch_combine import EpDispatchCombineOp, EpDispatchCombineConfig, EpDispatchCombineKernelType
 
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=torch.bfloat16):
@@ -45,6 +45,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
+            kernel_type = EpDispatchCombineKernelType.InterNodeV1LL,
             use_external_inp_buf=False,
         )
 
@@ -143,13 +144,21 @@ class EpDispatchCombineTestCase:
         indices = indices.to(self.device).to(torch.int32)
 
         # gen weights
-        weights = torch.rand(
+        # weights = torch.rand(
+        #     num_tokens,
+        #     self.config.num_experts_per_token,
+        #     dtype=torch.float32,
+        #     generator=self.rng,
+        #     device=self.device,
+        # )
+
+        weights = torch.zeros(
             num_tokens,
             self.config.num_experts_per_token,
             dtype=torch.float32,
-            generator=self.rng,
             device=self.device,
         )
+    
         weights_list = self._allgather_with_token_num_padding(
             weights, self.config.max_num_inp_token_per_rank
         )
@@ -260,6 +269,14 @@ class EpDispatchCombineTestCase:
             warp_per_block=8,
         )
         torch.cuda.synchronize()
+
+        if self.rank == 0:
+            print(f"rank {self.rank} combining {num_tokens} tokens")
+            print(f"combine_output dtype = {combine_output.dtype}, shape = {combine_output.shape}")
+            print(f"combine_output = {combine_output}")
+            print(f"combine_output_weight dtype = {combine_output_weight.dtype}, shape = {combine_output_weight.shape}")
+            print(f"combine_output_weight = {combine_output_weight}")
+
 
         for i in range(num_tokens):
             pes = [
