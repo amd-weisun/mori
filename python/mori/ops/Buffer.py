@@ -457,7 +457,7 @@ class Buffer:
 
         recv_x = (packed_input, None) if use_fp8 else packed_input
         
-        new_handle = (sorted_indices, expert_counts, recv_count)
+        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights)
 
         return recv_x, expert_counts, new_handle, EventOverlap(), None
         
@@ -474,6 +474,7 @@ class Buffer:
         sorted_indices = handle[0]
         expert_counts = handle[1]
         recv_count = handle[2]
+        dispatch_weights = handle[3]
         # recv_topk_weights = handle[3]
         rec_output = mori.inverse_transform_dispatch_output_gpu(
                 x, sorted_indices, expert_counts, recv_count
@@ -485,7 +486,7 @@ class Buffer:
         topk_idx = topk_idx.to(dtype=torch.int32)
         combine_output, _ = op.combine(
             rec_output,
-            topk_weights,
+            dispatch_weights,
             # None,
             topk_idx,
             block_num=self.config.block_num,
