@@ -107,11 +107,11 @@ class Buffer:
                 world_size=self.world_size,
             )
 
-        print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
+        # print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
         world_group = torch.distributed.group.WORLD
         assert world_group is not None
 
-        print("process group ok")
+        # print("process group ok")
         # Explicitly set the name if possible, or just register
         try:
             torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
