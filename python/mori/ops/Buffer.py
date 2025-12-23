@@ -102,7 +102,7 @@ class Buffer:
 
         if not dist.is_initialized():
             dist.init_process_group(
-                backend="gloo",
+                backend="nccl",
                 rank=self.rank,
                 world_size=self.world_size,
             )
