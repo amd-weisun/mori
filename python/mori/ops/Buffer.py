@@ -410,7 +410,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False, topk_weights : torch.Tensor = None,) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         Low latency dispatch.
@@ -420,26 +420,42 @@ class Buffer:
         if(use_fp8):
             raise NotImplementedError("MORI low_latency_dispatch with fp8 input is not supported yet.")
 
+        if isinstance(x, tuple):
+            inp, inp_scales = x
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        else:
+            inp = x
+            inp_scales = None
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = 0
 
-        recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
-                self.dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank,
-                             is_token_in_rank, num_tokens_per_expert,
-                             topk_idx, topk_weights, expert_alignment,
-                             config, previous_event, async_finish,
-                             allocate_on_comm_stream)
+        op = self._get_op(dtype, hidden_dim, scale_dim)
+
+        # MORI dispatch expects int32 indices.
+        dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
         
-
-        recv_count = handle[2] if len(handle) > 2 else recv_x.size(0)
+        #DEBUG ONLY
+        # print(f"[Rank {self.rank}] Dispatching with dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, num_tokens={inp.size(0)}")
+        # print(f"[inp shape {inp.shape if not isinstance(x, tuple)  else inp[0].shape}] , topk_weights shape {topk_weights.shape}, dtype = {topk_weights.dtype},  topk_idx shape={dispatch_indices_arg.shape}, dtype = {dispatch_indices_arg.dtype}")
+        dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
+            op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+        
+        recv_count = dispatch_recv_num_token[0].item()
+        
         if isinstance(recv_x, tuple):
             dispatch_output = recv_x[0]
         
 
         packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
             dispatch_output,
-            recv_topk_idx,
+            dispatch_indices,
             self.config,
-            recv_count,
+            recv_count
         )
+
 
         recv_x = (packed_input, None) if use_fp8 else packed_input
         
@@ -464,6 +480,10 @@ class Buffer:
         rec_output = mori.inverse_transform_dispatch_output_gpu(
                 x, sorted_indices, expert_counts, dispatch_output.size(0)
         )
+
+        dtype = rec_output.dtype
+        hidden_dim = rec_output.size(1)
+        op = self._get_op(dtype, hidden_dim)
 
         combine_output, _ = op.combine(
             rec_output,
