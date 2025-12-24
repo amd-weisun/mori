@@ -488,7 +488,7 @@ class Buffer:
 
         if self.rank == 0:
             print(f"[Rank {self.rank}] Low latency combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
-            print(f"rec_output = {rec_output}") ")
+            print(f"rec_output = {rec_output}") 
             print(f"[topk_weights] = {topk_weights}")
 
         combine_output,combine_output_weight = op.combine(
@@ -503,7 +503,7 @@ class Buffer:
         if(self.rank == 0):
             print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
             print(f"[inp shape {rec_output.shape}]" )
-            print(f"rec_output = {rec_output}") ")
+            print(f"rec_output = {rec_output}") 
             print(f"[topk_weights] = {topk_weights}")
             print(f"[dispatch_weights] = {dispatch_weights}")
             print(f"[combine_output_weight] = {combine_output_weight}")
