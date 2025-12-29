@@ -148,6 +148,9 @@ class Buffer:
         #     logger.warning("dist.destroy_process_group failed")
         self._cleanup_done = True
 
+    def reset(self):
+        for op in self.ops.values():
+            op.reset()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -502,6 +505,7 @@ class Buffer:
             topk_idx,
             block_num=self.config.block_num,
             warp_per_block=16,
+            call_reset = True,
         )
 
         # if(self.rank == 0):
