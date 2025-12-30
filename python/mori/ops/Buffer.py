@@ -61,6 +61,7 @@ class Buffer:
         self.ops = {}
         self._cleanup_done = False
         self.config = None
+        self.reorder = False # Whether to reorder outputs to match DeepEp API
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
@@ -204,7 +205,8 @@ class Buffer:
                  topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 reorder : bool = True) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -292,8 +294,10 @@ class Buffer:
         dispatch_indices = _truncate(dispatch_indices)
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
         src_token_pos = _truncate(src_token_pos)
-
-        dispatch_output, dispatch_indices, dispatch_weights = \
+        # reorder to match DeepEp order
+        if reorder:
+            self.reorder = reorder
+            dispatch_output, dispatch_indices, dispatch_weights = \
                 self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
         
         # Construct return values
@@ -301,7 +305,7 @@ class Buffer:
         recv_topk_idx = dispatch_indices
         recv_topk_weights = dispatch_weights
 
-        # reorder to match DeepEp order
+        
 
         # Count how many tokens each local expert actually received using the truncated indices.
         num_local_experts = self.num_qps_per_rank
@@ -360,9 +364,9 @@ class Buffer:
              raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
         
         dispatch_indices = handle[0]
-
-        x , dispatch_indices, topk_weights = \
-             self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
+        if self.reorder:
+            x , dispatch_indices, topk_weights = \
+                self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
 
         # print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={x.size(0)}")
         # print(f"[inp shape {x.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  dispatch_indices shape={dispatch_indices.shape}, dtype = {dispatch_indices.dtype}")
