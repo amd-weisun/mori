@@ -62,7 +62,7 @@ class Buffer:
         self.ops = {}
         self._cleanup_done = False
         self.config = None
-        self.reorder = False # Whether to reorder outputs to match DeepEp API
+        self.reorder = reorder # Whether to reorder outputs to match DeepEp API
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
