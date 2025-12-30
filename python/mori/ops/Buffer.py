@@ -38,7 +38,7 @@ class Buffer:
                  low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: int = 1,
                  num_experts_per_token : int = 8,
                  group_name: str = "default",
-                 reorder: bool = False) -> None:
+                 reorder: bool = True) -> None:
         """
         Initialize the communication buffer.
 
