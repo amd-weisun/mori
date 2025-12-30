@@ -37,7 +37,8 @@ class Buffer:
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: int = 1,
                  num_experts_per_token : int = 8,
-                 group_name: str = "default") -> None:
+                 group_name: str = "default",
+                 reorder: bool = False) -> None:
         """
         Initialize the communication buffer.
 
@@ -205,8 +206,7 @@ class Buffer:
                  topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False,
-                 reorder : bool = True) -> \
+                 allocate_on_comm_stream: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -295,8 +295,7 @@ class Buffer:
         src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
         src_token_pos = _truncate(src_token_pos)
         # reorder to match DeepEp order
-        if reorder:
-            self.reorder = reorder
+        if self.reorder:
             dispatch_output, dispatch_indices, dispatch_weights = \
                 self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
         
