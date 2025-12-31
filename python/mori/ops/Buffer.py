@@ -1,6 +1,7 @@
 import logging
 import mori
 import os
+import socket
 import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
@@ -35,8 +36,8 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: int = 1,
-                 num_experts_per_token : int = 8,
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: Optional[int] = None,
+                 num_experts_per_token : int = 1,
                  group_name: str = "default",
                  reorder: bool = True) -> None:
         """
@@ -53,7 +54,7 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.num_qps_per_rank = num_qps_per_rank
-        self.gpu_per_node = gpu_per_node  # Assuming 8 GPUs per node
+        self.gpu_per_node = gpu_per_node  # Will infer from `group` if not provided
         self.world_size = dist.get_world_size(group=group)
         self.max_num_inp_token_per_rank = max_num_inp_token_per_rank
         self.num_experts_per_token = num_experts_per_token
@@ -98,11 +99,22 @@ class Buffer:
             self.ops[key] = EpDispatchCombineOp(self.config)
         return self.ops[key]
 
-    def setup(self):
-        local_rank = self.rank % self.gpu_per_node
-        torch.cuda.set_device(local_rank)
-        self.device = torch.device("cuda", local_rank)
+    def _infer_gpu_per_node(self) -> int:
+        if not dist.is_initialized():
+            return 1
+        try:
+            if self.group is None or self.world_size <= 0:
+                return 1
+            local_host = socket.gethostname()
+            hostnames = [None] * self.world_size
+            dist.all_gather_object(hostnames, local_host, group=self.group)
+            same_host_count = sum(1 for hostname in hostnames if hostname == local_host)
+            return max(1, same_host_count)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to infer GPUs per node from hostname: %s", exc)
+            return 1
 
+    def setup(self):
         if not dist.is_initialized():
             dist.init_process_group(
                 backend="nccl",
@@ -110,11 +122,21 @@ class Buffer:
                 world_size=self.world_size,
             )
 
-        # print(f"init process group done. world_group type: {type(torch.distributed.group.WORLD)}")
+        if self.gpu_per_node is None:
+            self.gpu_per_node = self._infer_gpu_per_node()
+
+        if self.rank == 0:
+            print('self.gpu_per_node =', self.gpu_per_node, flush=True)
+
+
+        local_rank = self.rank % max(1, self.gpu_per_node)
+        torch.cuda.set_device(local_rank)
+        self.device = torch.device("cuda", local_rank)
+
         world_group = torch.distributed.group.WORLD
         assert world_group is not None
 
-        # print("process group ok")
+
         # Explicitly set the name if possible, or just register
         try:
             torch._C._distributed_c10d._register_process_group(self.group_name, world_group)
@@ -130,8 +152,7 @@ class Buffer:
             raise RuntimeError(
                 f"Unable to initialize MORI shmem for group '{self.group_name}'"
             ) from exc
-
-        print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
+ 
 
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(999)
@@ -245,6 +266,8 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        if topk_idx is None or topk_weights is None:
+             raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
         
         if isinstance(x, tuple):
             inp, inp_scales = x
@@ -258,10 +281,14 @@ class Buffer:
             hidden_dim = inp.size(1)
             scale_dim = 0
 
+        self.num_experts_per_token = topk_idx.size(1)
+        self.max_num_inp_token_per_rank = max(num_tokens_per_rank) if num_tokens_per_rank is not None else inp.size(0)
+
+
+
         op = self._get_op(dtype, hidden_dim, scale_dim)
         
-        if topk_idx is None or topk_weights is None:
-             raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
+        
 
         # MORI dispatch expects int32 indices.
         dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
@@ -438,6 +465,9 @@ class Buffer:
             hidden_dim = inp.size(1)
             scale_dim = 0
 
+        self.num_experts_per_token = topk_idx.size(1)
+        self.max_num_inp_token_per_rank = inp.size(0)
+        
         op = self._get_op(dtype, hidden_dim, scale_dim)
 
         # MORI dispatch expects int32 indices.
