@@ -61,7 +61,6 @@ class Buffer:
         # Cache for MORI ops
         self.group_name = group_name
         self.ops = {}
-        self._cleanup_done = False
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
         self.setup()
@@ -125,8 +124,6 @@ class Buffer:
         if self.gpu_per_node is None:
             self.gpu_per_node = self._infer_gpu_per_node()
 
-        if self.rank == 0:
-            print('self.gpu_per_node =', self.gpu_per_node, flush=True)
 
 
         local_rank = self.rank % max(1, self.gpu_per_node)
@@ -157,19 +154,6 @@ class Buffer:
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(999)
 
-    def cleanup(self):
-        if self._cleanup_done:
-            return
-        try:
-            mori.shmem.shmem_finalize()
-        except Exception:  # pylint: disable=broad-except
-            logger.warning("mori.shmem.shmem_finalize failed")
-        # try:
-        #     if dist.is_initialized():
-        #         dist.destroy_process_group()
-        # except Exception:  # pylint: disable=broad-except
-        #     logger.warning("dist.destroy_process_group failed")
-        self._cleanup_done = True
 
     def reset(self):
         for op in self.ops.values():
