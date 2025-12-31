@@ -283,7 +283,7 @@ class Buffer:
 
         self.num_experts_per_token = topk_idx.size(1)
         max_num_tokens_per_rank = max(num_tokens_per_rank) if num_tokens_per_rank is not None else inp.size(0)
-        self.max_num_inp_token_per_rank = max(num_tokens_per_rank, inp.size(0)) 
+        self.max_num_inp_token_per_rank = max(max_num_tokens_per_rank, inp.size(0)) 
 
 
 
