@@ -335,7 +335,7 @@ class Buffer:
                     num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg, dispatch_indices_clone)
+        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg)
 
         
         
@@ -377,7 +377,7 @@ class Buffer:
              raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
         
         dispatch_indices = handle[0]
-        dispatch_indices_arg = handle[4]
+        dispatch_indices_arg = handle[3]
         if self.reorder:
             x , dispatch_indices, topk_weights = \
                 self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
