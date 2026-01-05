@@ -278,9 +278,6 @@ class Buffer:
         # MORI dispatch expects int32 indices.
         dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
         
-        #DEBUG ONLY
-        # print(f"[Rank {self.rank}] Dispatching with dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, num_tokens={inp.size(0)}")
-        # print(f"[inp shape {inp.shape if not isinstance(x, tuple)  else inp[0].shape}] , topk_weights shape {topk_weights.shape}, dtype = {topk_weights.dtype},  topk_idx shape={dispatch_indices_arg.shape}, dtype = {dispatch_indices_arg.dtype}")
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
@@ -382,10 +379,7 @@ class Buffer:
             x , dispatch_indices, topk_weights = \
                 self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
 
-        # print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={x.size(0)}")
-        # print(f"[inp shape {x.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  dispatch_indices shape={dispatch_indices.shape}, dtype = {dispatch_indices.dtype}")
-        
-        # MORI combine
+
         combined_x = op.combine(x, topk_weights, dispatch_indices_arg)
         
         return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
@@ -460,10 +454,7 @@ class Buffer:
 
         # MORI dispatch expects int32 indices.
         dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
-        
-        #DEBUG ONLY
-        # print(f"[Rank {self.rank}] Dispatching with dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, num_tokens={inp.size(0)}")
-        # print(f"[inp shape {inp.shape if not isinstance(x, tuple)  else inp[0].shape}] , topk_weights shape {topk_weights.shape}, dtype = {topk_weights.dtype},  topk_idx shape={dispatch_indices_arg.shape}, dtype = {dispatch_indices_arg.dtype}")
+  
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
         
@@ -510,14 +501,6 @@ class Buffer:
 
         topk_idx = topk_idx.to(dtype=torch.int32)
 
-        # if self.rank == 0:
-        #     print(f"[Rank {self.rank}] Low latency combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
-        #     print(f"rec_output shape = {rec_output.shape}")    
-        #     print(f"rec_output = {rec_output}") 
-        #     print(f"[topk_weights shape] = {topk_weights.shape}")
-        #     print(f"[topk_weights] = {topk_weights}")
-        #     print(f"[dispatch_weights shape] = {dispatch_weights.shape}")
-        #     print(f"[dispatch_weights] = {dispatch_weights}")
 
         combine_output,combine_output_weight = op.combine(
             rec_output,
@@ -529,18 +512,8 @@ class Buffer:
             call_reset = True,
         )
 
-        # if(self.rank == 0):
-        #     print(f"[Rank {self.rank}] Combining with dtype={dtype}, hidden_dim={hidden_dim}, num_tokens={rec_output.size(0)}")
-        #     print(f"[inp shape {rec_output.shape}]" )
-        #     print(f"rec_output = {rec_output}") 
-        #     print(f"[topk_weights] = {topk_weights}")
-        #     print(f"[dispatch_weights] = {dispatch_weights}")
-        #     print(f"[combine_output_weight] = {combine_output_weight}")
-        #     print(f"[combine_output] = {combine_output}")
-
         return combine_output, EventOverlap(), None
         
-        # raise NotImplementedError("low_latency_combine is not supported. Use combine.")
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         raise NotImplementedError("get_next_low_latency_combine_buffer is not supported.")
