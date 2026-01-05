@@ -284,7 +284,7 @@ class Buffer:
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
-        dispatch_indices_clone = dispatch_indices.clone()
+        dispatch_indices_clone = dispatch_indices
 
         def _normalize_recv_num_token(value):
             if isinstance(value, torch.Tensor):
