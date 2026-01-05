@@ -284,6 +284,8 @@ class Buffer:
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
+        dispatch_indices_clone = dispatch_indices.clone()
+
         def _normalize_recv_num_token(value):
             if isinstance(value, torch.Tensor):
                 if value.numel() == 0:
@@ -333,7 +335,7 @@ class Buffer:
                     num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg)
+        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg, dispatch_indices_clone)
 
         
         
@@ -375,7 +377,7 @@ class Buffer:
              raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
         
         dispatch_indices = handle[0]
-        dispatch_indices_arg = handle[3]
+        dispatch_indices_arg = handle[4]
         if self.reorder:
             x , dispatch_indices, topk_weights = \
                 self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
