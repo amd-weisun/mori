@@ -333,7 +333,7 @@ class Buffer:
                     num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
         
         # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens)
+        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg)
 
         
         
@@ -375,6 +375,7 @@ class Buffer:
              raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
         
         dispatch_indices = handle[0]
+        dispatch_indices_arg = handle[3]
         if self.reorder:
             x , dispatch_indices, topk_weights = \
                 self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
@@ -383,7 +384,7 @@ class Buffer:
         # print(f"[inp shape {x.shape}] , topk_weights shape {topk_weights.shape if topk_weights is not None else None}, dtype = {topk_weights.dtype if topk_weights is not None else None},  dispatch_indices shape={dispatch_indices.shape}, dtype = {dispatch_indices.dtype}")
         
         # MORI combine
-        combined_x = op.combine(x, topk_weights, dispatch_indices)
+        combined_x = op.combine(x, topk_weights, dispatch_indices_arg)
         
         return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
 
