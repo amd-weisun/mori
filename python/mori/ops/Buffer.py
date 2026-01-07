@@ -60,15 +60,13 @@ class Buffer:
         self.num_experts_per_token = num_experts_per_token
         # Cache for MORI ops
         self.group_name = group_name
-        self.ops = {}
+        self.ops = None
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
-        key = (dtype, hidden_dim, scale_dim, self.low_latency_mode)
-        if key not in self.ops:
-            # Determine kernel type
+        if self.ops is None:
             kernel_type = EpDispatchCombineKernelType.IntraNode
             # Simple heuristic for kernel type
             if self.group_size > 8: 
@@ -95,8 +93,9 @@ class Buffer:
                 gpu_per_node=self.gpu_per_node,
                 rdma_block_num=16,
             )
-            self.ops[key] = EpDispatchCombineOp(self.config)
-        return self.ops[key]
+            self.ops = EpDispatchCombineOp(self.config)
+        
+        return self.ops
 
     def _infer_gpu_per_node(self) -> int:
         if not dist.is_initialized():
