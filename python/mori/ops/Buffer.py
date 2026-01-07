@@ -275,8 +275,11 @@ class Buffer:
         if dtype == torch.float8_e4m3fn:
             if self.rank == 0:
                 print("[warning] Converting float8 input to float8uz for MORI dispatch.", flush=True)
+                print(f"[warning] original inp = {inp}.", flush=True)
             inp = inp.to(torch.float8_e4m3fnuz)
             dtype = torch.float8_e4m3fnuz
+            if self.rank == 0:    
+                print(f"[warning] converted inp = {inp}.", flush=True)
         op = self._get_op(dtype, hidden_dim, scale_dim)
         
         
