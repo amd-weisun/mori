@@ -256,6 +256,10 @@ class Buffer:
         if isinstance(x, tuple):
             inp, inp_scales = x
             dtype = inp.dtype
+            # tmp solution: convert float8 to float8uz
+            if dtype == torch.float8_e4m3fn:
+                inp = inp.to(torch.float8_e4m3fnuz)
+                dtype = torch.float8_e4m3fnuz
             hidden_dim = inp.size(1)
             scale_dim = inp_scales.size(1) if inp_scales is not None else 0
         else:
@@ -438,6 +442,10 @@ class Buffer:
         if isinstance(x, tuple):
             inp, inp_scales = x
             dtype = inp.dtype
+            # tmp solution: convert float8 to float8uz
+            if dtype == torch.float8_e4m3fn:
+                inp = inp.to(torch.float8_e4m3fnuz)
+                dtype = torch.float8_e4m3fnuz
             hidden_dim = inp.size(1)
             scale_dim = inp_scales.size(1) if inp_scales is not None else 0
         else:
