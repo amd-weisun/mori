@@ -257,9 +257,7 @@ class Buffer:
             inp, inp_scales = x
             dtype = inp.dtype
             # tmp solution: convert float8 to float8uz
-            if dtype == torch.float8_e4m3fn:
-                inp = inp.to(torch.float8_e4m3fnuz)
-                dtype = torch.float8_e4m3fnuz
+
             hidden_dim = inp.size(1)
             scale_dim = inp_scales.size(1) if inp_scales is not None else 0
         else:
@@ -274,7 +272,11 @@ class Buffer:
         self.max_num_inp_token_per_rank = max(max_num_tokens_per_rank, inp.size(0)) 
 
 
-
+        if dtype == torch.float8_e4m3fn:
+            if self.rank == 0:
+                print("[warning] Converting float8 input to float8uz for MORI dispatch.", flush=True)
+            inp = inp.to(torch.float8_e4m3fnuz)
+            dtype = torch.float8_e4m3fnuz
         op = self._get_op(dtype, hidden_dim, scale_dim)
         
         
