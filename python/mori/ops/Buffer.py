@@ -316,8 +316,8 @@ class Buffer:
         src_token_pos = _truncate(src_token_pos)
         # reorder to match DeepEp order
         if self.reorder:
-            dispatch_output, dispatch_indices, dispatch_weights = \
-                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos)
+            dispatch_output, dispatch_scales, dispatch_indices, dispatch_weights = \
+                self._reorder_mori_dispatch_outputs(dispatch_output,dispatch_scales, dispatch_indices, dispatch_weights, src_token_pos)
         
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
@@ -533,26 +533,27 @@ class Buffer:
 
 
     # helper functions for matching DeepEp API
-    def _reorder_mori_dispatch_outputs(self, recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
-                         token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _reorder_mori_dispatch_outputs(self, recv_x: torch.Tensor, dispatch_scales: Optional[torch.Tensor] = None, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+                         token_order: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         reoder the outputs from mori dispatch to match DeepEp order.
         """    
         if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
             if dist.get_rank() == 0:
                 print('[warning] reorder_mori_outputs guard: shape mismatch or empty order.', flush=True)
-            return recv_x, recv_topk_idx, recv_topk_weights
+            return recv_x,dispatch_scales, recv_topk_idx, recv_topk_weights
         if token_order.min() < 0 :
             if dist.get_rank() == 0:
                 print('[warning] reorder_mori_outputs guard: order contains invalid indices.', flush=True)
-            return recv_x, recv_topk_idx, recv_topk_weights
+            return recv_x,dispatch_scales, recv_topk_idx, recv_topk_weights
         unique_tokens = torch.unique(token_order)
         if unique_tokens.numel() != token_order.numel():
             if dist.get_rank() == 0:
                 print('[warning] reorder_mori_outputs guard: order contains repeated tokens.', flush=True)
-            return recv_x, recv_topk_idx, recv_topk_weights
+            return recv_x, dispatch_scales, recv_topk_idx, recv_topk_weights
+        
         perm = torch.argsort(token_order)
-        return recv_x[perm], recv_topk_idx[perm], recv_topk_weights[perm]
+        return recv_x[perm],dispatch_scales[perm] if dispatch_scales is not None else None, recv_topk_idx[perm], recv_topk_weights[perm]
 
 
     def _revert_mori_dispatch_outputs(self, recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
