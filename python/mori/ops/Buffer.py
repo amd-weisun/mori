@@ -317,7 +317,7 @@ class Buffer:
         # reorder to match DeepEp order
         if self.reorder:
             dispatch_output, dispatch_scales, dispatch_indices, dispatch_weights = \
-                self._reorder_mori_dispatch_outputs(dispatch_output,dispatch_scales, dispatch_indices, dispatch_weights, src_token_pos)
+                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos, dispatch_scales)
         
         # Construct return values
         recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
@@ -533,8 +533,8 @@ class Buffer:
 
 
     # helper functions for matching DeepEp API
-    def _reorder_mori_dispatch_outputs(self, recv_x: torch.Tensor, dispatch_scales: Optional[torch.Tensor] = None, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
-                         token_order: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    def _reorder_mori_dispatch_outputs(self, recv_x: torch.Tensor, recv_topk_idx: torch.Tensor, recv_topk_weights: torch.Tensor,
+                         token_order: torch.Tensor, dispatch_scales: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         reoder the outputs from mori dispatch to match DeepEp order.
         """    
