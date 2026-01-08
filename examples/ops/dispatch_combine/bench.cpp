@@ -132,9 +132,9 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipMemsetAsync(d_packed, 0, packed_elements * sizeof(float), stream));
     CHECK_HIP(hipEventRecord(start, stream));
     mori::moe::LaunchTransformDispatchOutput<float>(
-      d_dispatch, d_packed, d_sorted_tokens, d_sorted_experts, d_slot_indices,
+      d_dispatch, d_packed, nullptr, nullptr, d_sorted_tokens, d_sorted_experts, d_slot_indices,
       stride_src_n, stride_src_h, stride_dst_e, stride_dst_c, stride_dst_h,
-      host_valid_count, config.hidden_dim, stream, d_total_valid_count);
+      host_valid_count, config.hidden_dim, 0, stream, d_total_valid_count);
     CHECK_HIP(hipEventRecord(stop, stream));
     CHECK_HIP(hipEventSynchronize(stop));
     float elapsed = 0.0f;
