@@ -440,15 +440,8 @@ class Buffer:
         Not fully supported with the same API.
         """
 
-        # if(use_fp8):
-        #     raise NotImplementedError("MORI low_latency_dispatch with fp8 input is not supported yet.")
-
-        # if isinstance(x, tuple):
-        #     inp, inp_scales = x
-        #     dtype = inp.dtype
-        #     hidden_dim = inp.size(1)
-        #     scale_dim = inp_scales.size(1) if inp_scales is not None else 0
-        # else:
+        if(async_finish or return_recv_hook):
+            raise NotImplementedError("MORI  async_finish/return_recv_hook is not supported yet.")
 
         
         # if use_fp8 then we need to call quantization
