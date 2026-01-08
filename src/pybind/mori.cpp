@@ -234,13 +234,24 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 void TransformDispatchOutputGPU(
     torch::Tensor dispatch_output, torch::Tensor packed_output,
     torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids,
-    std::optional<torch::Tensor> num_tokens_tensor) {
+    std::optional<torch::Tensor> num_tokens_tensor,
+    std::optional<torch::Tensor> dispatch_scales,
+    std::optional<torch::Tensor> packed_scales) {
     
     int num_tokens = indices.size(0);
     int H = dispatch_output.size(1);
     const int* num_tokens_ptr = nullptr;
     if (num_tokens_tensor.has_value()) {
         num_tokens_ptr = num_tokens_tensor.value().data_ptr<int>();
+    }
+
+    const float* scales_src_ptr = nullptr;
+    float* scales_dst_ptr = nullptr;
+    int scale_dim = 0;
+    if (dispatch_scales.has_value() && packed_scales.has_value()) {
+        scales_src_ptr = dispatch_scales.value().data_ptr<float>();
+        scales_dst_ptr = packed_scales.value().data_ptr<float>();
+        scale_dim = dispatch_scales.value().size(1);
     }
     
     DISPATCH_FLOAT_HALF_BFLOAT16(dispatch_output.scalar_type(), "TransformDispatchOutputGPU", ([&] {
@@ -249,12 +260,13 @@ void TransformDispatchOutputGPU(
         mori::moe::LaunchTransformDispatchOutput<HipT>(
             reinterpret_cast<const HipT*>(dispatch_output.data_ptr<T>()),
             reinterpret_cast<HipT*>(packed_output.data_ptr<T>()),
+            scales_src_ptr, scales_dst_ptr,
             indices.data_ptr<mori::moe::index_t>(),
             expert_ids.data_ptr<mori::moe::index_t>(),
             slot_ids.data_ptr<mori::moe::index_t>(),
             dispatch_output.stride(0), dispatch_output.stride(1),
             packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
-            num_tokens, H,
+            num_tokens, H, scale_dim,
             at::cuda::getCurrentHIPStream(),
             num_tokens_ptr
         );

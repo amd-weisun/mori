@@ -440,24 +440,30 @@ class Buffer:
         Not fully supported with the same API.
         """
 
-        if(use_fp8):
-            raise NotImplementedError("MORI low_latency_dispatch with fp8 input is not supported yet.")
+        # if(use_fp8):
+        #     raise NotImplementedError("MORI low_latency_dispatch with fp8 input is not supported yet.")
 
-        if isinstance(x, tuple):
-            inp, inp_scales = x
+        # if isinstance(x, tuple):
+        #     inp, inp_scales = x
+        #     dtype = inp.dtype
+        #     hidden_dim = inp.size(1)
+        #     scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        # else:
+
+        
+        # if use_fp8 then we need to call quantization
+        # now let's just use CPU version for testing
+        if use_fp8:
+            inp, inp_scales = Buffer._per_token_cast_to_fp8(inp)
             dtype = inp.dtype
-            # tmp solution: convert float8 to float8uz
-            if dtype == torch.float8_e4m3fn:
-                inp = inp.to(torch.float8_e4m3fnuz)
-                dtype = torch.float8_e4m3fnuz
-            hidden_dim = inp.size(1)
-            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+            scale_dim = inp_scales.size(1) 
         else:
             inp = x
             inp_scales = None
             dtype = inp.dtype
             hidden_dim = inp.size(1)
             scale_dim = 0
+        
 
         self.num_experts_per_token = topk_idx.size(1)
         self.max_num_inp_token_per_rank = inp.size(0)
@@ -473,17 +479,18 @@ class Buffer:
         recv_count = dispatch_recv_num_token[0].item()
         
 
-        packed_input, sorted_indices, expert_counts = mori.transform_dispatch_output_gpu(
+        packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
             dispatch_output,
             dispatch_indices,
             self.config,
-            recv_count
+            recv_count,
+            dispatch_scales
         )
 
 
-        recv_x = (packed_input, None) if use_fp8 else packed_input
+        recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
         
-        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights)
+        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights, packed_scales)
 
         return recv_x, expert_counts, new_handle, EventOverlap(), None
         
@@ -501,6 +508,7 @@ class Buffer:
         expert_counts = handle[1]
         recv_count = handle[2]
         dispatch_weights = handle[3]
+        dispatch_scales = handle[4]
         # recv_topk_weights = handle[3]
         rec_output = mori.inverse_transform_dispatch_output_gpu(
                 x, sorted_indices, expert_counts, recv_count
@@ -574,3 +582,19 @@ class Buffer:
         inverted = torch.empty_like(perm)
         inverted[perm] = torch.arange(perm.numel(), device=perm.device)
         return recv_x[inverted], recv_topk_idx[inverted], recv_topk_weights[inverted]
+
+    
+    @staticmethod
+    def _per_token_cast_to_fp8(x: torch.Tensor):
+        assert x.dim() == 2 and x.size(1) % 128 == 0
+        m, n = x.shape
+        x_view = x.view(m, -1, 128)
+        x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+        max_range = min(torch.finfo(torch.float8_e4m3fn).max, torch.finfo(torch.float8_e4m3fnuz).max) 
+        return (x_view * (max_range / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / max_range).view(m, -1)
+
+    @staticmethod
+    def _per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
+        x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
+        x_scales = x_scales.view(x_fp8.size(0), -1, 1)
+        return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)

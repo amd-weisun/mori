@@ -15,7 +15,7 @@ def _prepare_inverse_metadata(expert_counts, device):
     
     return slot_indices, expert_ids
 
-def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count):
+def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, recv_count, dispatch_scales=None):
     """
     GPU-accelerated version of transform_dispatch_output using C++ kernels.
     """
@@ -41,6 +41,12 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
     packed_output = torch.zeros((E, N_capacity, H), dtype=dispatch_output.dtype, device=dispatch_output.device)
     valid_tokens = dispatch_output[:recv_count]
     
+    packed_scales = None
+    if dispatch_scales is not None:
+        scale_dim = dispatch_scales.size(1)
+        packed_scales = torch.zeros((E, N_capacity, scale_dim), dtype=dispatch_scales.dtype, device=dispatch_scales.device)
+        dispatch_scales = dispatch_scales[:recv_count]
+
     # Call the C++ binding
     # We pass total_valid_count to allow the kernel to exit early if needed,
     # although the kernel launch grid is based on max possible tokens.
@@ -51,11 +57,13 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
         sorted_token_indices, 
         sorted_expert_ids, 
         slot_indices,
-        total_valid_count
+        total_valid_count,
+        dispatch_scales,
+        packed_scales
     )
     
     valid_count = total_valid_count.item()
-    return packed_output, sorted_token_indices[:valid_count], expert_counts
+    return packed_output, sorted_token_indices[:valid_count], expert_counts, packed_scales
 
 def inverse_transform_dispatch_output_gpu(packed_output, original_indices, expert_counts, original_N):
     """

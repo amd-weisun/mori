@@ -35,10 +35,11 @@ __device__ inline void AtomicAdd<__hip_bfloat16>(__hip_bfloat16* address, __hip_
 template <typename T>
 __global__ void TransformDispatchOutputKernel(
     const T* src, T* dst,
+    const float* scales_src, float* scales_dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, const int* num_tokens_ptr) {
+    int num_tokens, int H, int scale_dim, const int* num_tokens_ptr) {
     
     int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
     int laneId = threadIdx.x % warpSize;
@@ -68,6 +69,16 @@ __global__ void TransformDispatchOutputKernel(
     } else {
         for (int i = laneId; i < H; i += warpSize) {
             dst_row[i * stride_dst_h] = src_row[i * stride_src_h];
+        }
+    }
+
+    if (scales_src && scales_dst && scale_dim > 0) {
+        int64_t capacity = stride_dst_e / stride_dst_c;
+        const float* src_scale_ptr = scales_src + src_idx * scale_dim;
+        float* dst_scale_ptr = scales_dst + (expert_id * capacity + slot_id) * scale_dim;
+        
+        for (int i = laneId; i < scale_dim; i += warpSize) {
+            dst_scale_ptr[i] = src_scale_ptr[i];
         }
     }
 }
@@ -149,10 +160,11 @@ __global__ void InverseTransformDispatchOutputKernel(
 template <typename T>
 void LaunchTransformDispatchOutput(
     const T* src, T* dst,
+    const float* scales_src, float* scales_dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream,
+    int num_tokens, int H, int scale_dim, hipStream_t stream,
     const int* num_tokens_ptr) {
     
     int block_size = 256;
@@ -161,10 +173,10 @@ void LaunchTransformDispatchOutput(
     int num_blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
     
     TransformDispatchOutputKernel<T><<<num_blocks, block_size, 0, stream>>>(
-        src, dst, indices, expert_ids, slot_ids,
+        src, dst, scales_src, scales_dst, indices, expert_ids, slot_ids,
         stride_src_n, stride_src_h,
         stride_dst_e, stride_dst_c, stride_dst_h,
-        num_tokens, H, num_tokens_ptr
+        num_tokens, H, scale_dim, num_tokens_ptr
     );
 }
 
@@ -191,24 +203,27 @@ void LaunchInverseTransformDispatchOutput(
 // Explicit Instantiation
 template void LaunchTransformDispatchOutput<__half>(
     const __half* src, __half* dst,
+    const float* scales_src, float* scales_dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
+    int num_tokens, int H, int scale_dim, hipStream_t stream, const int* num_tokens_ptr);
 
 template void LaunchTransformDispatchOutput<__hip_bfloat16>(
     const __hip_bfloat16* src, __hip_bfloat16* dst,
+    const float* scales_src, float* scales_dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
+    int num_tokens, int H, int scale_dim, hipStream_t stream, const int* num_tokens_ptr);
 
 template void LaunchTransformDispatchOutput<float>(
     const float* src, float* dst,
+    const float* scales_src, float* scales_dst,
     const index_t* indices, const index_t* expert_ids, const index_t* slot_ids,
     int64_t stride_src_n, int64_t stride_src_h,
     int64_t stride_dst_e, int64_t stride_dst_c, int64_t stride_dst_h,
-    int num_tokens, int H, hipStream_t stream, const int* num_tokens_ptr);
+    int num_tokens, int H, int scale_dim, hipStream_t stream, const int* num_tokens_ptr);
 
 template void LaunchInverseTransformDispatchOutput<float>(
     const float* src, float* dst,
