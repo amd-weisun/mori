@@ -39,7 +39,10 @@ class Buffer:
                  low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: Optional[int] = None,
                  num_experts_per_token : int = 1,
                  group_name: str = "default",
-                 reorder: bool = True) -> None:
+                 reorder: bool = True,
+                 block_num: int = 32,
+                 warp_num_per_block: int = 16,
+                 rdma_block_num: int = 16) -> None:
         """
         Initialize the communication buffer.
 
@@ -60,6 +63,9 @@ class Buffer:
         self.num_experts_per_token = num_experts_per_token
         # Cache for MORI ops
         self.group_name = group_name
+        self.block_num = block_num
+        self.rdma_block_num = rdma_block_num
+        self.warp_num_per_block = warp_num_per_block
         self.ops = None
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
@@ -87,11 +93,11 @@ class Buffer:
                 max_num_inp_token_per_rank=self.max_num_inp_token_per_rank, # Increased limit
                 num_experts_per_rank=self.num_qps_per_rank, # Default assumption
                 num_experts_per_token=self.num_experts_per_token, # topK
-                warp_num_per_block=16,
-                block_num=32,
+                warp_num_per_block=self.warp_num_per_block,
+                block_num=self.block_num,
                 kernel_type=kernel_type,
                 gpu_per_node=self.gpu_per_node,
-                rdma_block_num=16,
+                rdma_block_num=self.rdma_block_num,
             )
             self.ops = EpDispatchCombineOp(self.config)
         
