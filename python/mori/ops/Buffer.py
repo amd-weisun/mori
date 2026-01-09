@@ -33,6 +33,13 @@ class Buffer:
     """
 
     num_sms: int = 20
+    _printed_warnings = set()
+
+    @classmethod
+    def _log_warning_once(cls, msg: str):
+        if msg not in cls._printed_warnings:
+            print(msg, flush=True)
+            cls._printed_warnings.add(msg)
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
@@ -279,8 +286,7 @@ class Buffer:
 
         if dtype == torch.float8_e4m3fn:
             if self.rank == 0:
-                print("[warning] Converting float8_e4m3fn input to float8_e4m3fnuz for MORI dispatch, workaround for debugging on MI300X.", flush=True)
-                # print(f"[warning] original inp = {inp}.", flush=True)
+                Buffer._log_warning_once("[warning] Converting float8_e4m3fn input to float8_e4m3fnuz for MORI dispatch, workaround for debugging on MI300X.")
             inp = inp.to(torch.float8_e4m3fnuz)
             dtype = torch.float8_e4m3fnuz
             # if self.rank == 0:    
@@ -546,16 +552,16 @@ class Buffer:
         """    
         if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
             if dist.get_rank() == 0:
-                print('[warning] reorder_mori_outputs guard: shape mismatch or empty order.', flush=True)
+                Buffer._log_warning_once('[warning] reorder_mori_outputs guard: shape mismatch or empty order.')
             return recv_x,dispatch_scales, recv_topk_idx, recv_topk_weights
         if token_order.min() < 0 :
             if dist.get_rank() == 0:
-                print('[warning] reorder_mori_outputs guard: order contains invalid indices.', flush=True)
+                Buffer._log_warning_once('[warning] reorder_mori_outputs guard: order contains invalid indices.')
             return recv_x,dispatch_scales, recv_topk_idx, recv_topk_weights
         unique_tokens = torch.unique(token_order)
         if unique_tokens.numel() != token_order.numel():
             if dist.get_rank() == 0:
-                print('[warning] reorder_mori_outputs guard: order contains repeated tokens.', flush=True)
+                Buffer._log_warning_once('[warning] reorder_mori_outputs guard: order contains repeated tokens.')
             return recv_x, dispatch_scales, recv_topk_idx, recv_topk_weights
         
         perm = torch.argsort(token_order)
@@ -566,16 +572,16 @@ class Buffer:
                             token_order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if token_order.numel() == 0 or recv_x.size(0) != token_order.numel():
             if dist.get_rank() == 0:
-                print('[warning] revert_mori_outputs guard: shape mismatch or empty order.', flush=True)
+                Buffer._log_warning_once('[warning] revert_mori_outputs guard: shape mismatch or empty order.')
             return recv_x, recv_topk_idx, recv_topk_weights
         if token_order.min() < 0 :
             if dist.get_rank() == 0:
-                print('[warning] revert_mori_outputs guard: order contains invalid indices.', flush=True)
+                Buffer._log_warning_once('[warning] revert_mori_outputs guard: order contains invalid indices.')
             return recv_x, recv_topk_idx, recv_topk_weights
         unique_tokens = torch.unique(token_order)
         if unique_tokens.numel() != token_order.numel():
             if dist.get_rank() == 0:
-                print('[warning] revert_mori_outputs guard: order contains repeated tokens.', flush=True)
+                Buffer._log_warning_once('[warning] revert_mori_outputs guard: order contains repeated tokens.')
             return recv_x, recv_topk_idx, recv_topk_weights
         perm = torch.argsort(token_order)
         inverted = torch.empty_like(perm)
