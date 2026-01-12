@@ -46,6 +46,7 @@ class Buffer:
                  low_latency_mode: bool = False, num_qps_per_rank: int = 1, max_num_inp_token_per_rank : int = 128, gpu_per_node: Optional[int] = None,
                  num_experts_per_token : int = 1,
                  group_name: str = "default",
+                 use_gpu_ll_layout_transform : bool = True,
                  reorder: bool = True,
                  block_num: int = 32,
                  warp_num_per_block: int = 16,
@@ -74,6 +75,7 @@ class Buffer:
         self.rdma_block_num = rdma_block_num
         self.warp_num_per_block = warp_num_per_block
         self.ops = None
+        self.use_gpu_ll_layout_transform = use_gpu_ll_layout_transform
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
         self.setup()
@@ -445,7 +447,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False, topk_weights : torch.Tensor = None, use_gpu = True) -> \
+                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False, topk_weights : torch.Tensor = None) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         Low latency dispatch.
@@ -483,7 +485,7 @@ class Buffer:
         
         recv_count = dispatch_recv_num_token[0].item()
         
-        if use_gpu:
+        if self.use_gpu_ll_layout_transform:
             packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
                 dispatch_output,
                 dispatch_indices,
@@ -511,7 +513,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, zero_copy: bool = False, async_finish: bool = False,
-                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None, use_gpu = True) -> \
+                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         Low latency combine.
@@ -523,7 +525,7 @@ class Buffer:
         dispatch_weights = handle[3]
         dispatch_scales = handle[4]
         # recv_topk_weights = handle[3]
-        if use_gpu:
+        if self.use_gpu_ll_layout_transform:
             rec_output = mori.inverse_transform_dispatch_output_gpu(
                     x, sorted_indices, expert_counts, recv_count
             )
