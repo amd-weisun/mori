@@ -445,7 +445,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False, topk_weights : torch.Tensor = None,) -> \
+                             use_fp8: bool = False, async_finish: bool = False, return_recv_hook: bool = False, topk_weights : torch.Tensor = None, use_gpu = True) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         Low latency dispatch.
@@ -483,14 +483,22 @@ class Buffer:
         
         recv_count = dispatch_recv_num_token[0].item()
         
-
-        packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
-            dispatch_output,
-            dispatch_indices,
-            self.config,
-            recv_count,
-            dispatch_scales
-        )
+        if use_gpu:
+            packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
+                dispatch_output,
+                dispatch_indices,
+                self.config,
+                recv_count,
+                dispatch_scales
+            )
+        else:
+            packed_input, sorted_indices, expert_counts, packed_scales = Buffer._transform_dispatch_output(
+                dispatch_output,
+                dispatch_indices,
+                self.config,
+                recv_count,
+                dispatch_scales
+            )
 
 
         recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
@@ -503,7 +511,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, zero_copy: bool = False, async_finish: bool = False,
-                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
+                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None, use_gpu = True) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         Low latency combine.
@@ -515,9 +523,14 @@ class Buffer:
         dispatch_weights = handle[3]
         dispatch_scales = handle[4]
         # recv_topk_weights = handle[3]
-        rec_output = mori.inverse_transform_dispatch_output_gpu(
+        if use_gpu:
+            rec_output = mori.inverse_transform_dispatch_output_gpu(
+                    x, sorted_indices, expert_counts, recv_count
+            )
+        else:
+            rec_output = Buffer._inverse_transform_dispatch_output_gpu(
                 x, sorted_indices, expert_counts, recv_count
-        )
+            )
 
         dtype = rec_output.dtype
         hidden_dim = rec_output.size(1)
@@ -603,3 +616,117 @@ class Buffer:
         x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
         x_scales = x_scales.view(x_fp8.size(0), -1, 1)
         return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
+
+
+    
+    @staticmethod
+    def _transform_dispatch_output(dispatch_output, dispatch_indices, config, recv_count, dispatch_scales=None):
+        """
+        Transforms dispatch output to a packed layout [Experts, N, hidden_dim]
+        where tokens are packed contiguously for each expert.
+        
+        Args:
+            dispatch_output: [N, H] tensor of received tokens
+            dispatch_indices: [N, K] tensor of expert indices for each token
+            config: EpDispatchCombineConfig object
+            recv_count: Scalar, number of valid tokens received
+            dispatch_scales: Optional [N, scale_dim] tensor of per-token scales
+        """
+        # 1. Slice valid data
+        valid_tokens = dispatch_output[:recv_count]   # [M, H]
+        valid_indices = dispatch_indices[:recv_count] # [M, K]
+        N_capacity = dispatch_output.size(0)
+        _, H = valid_tokens.shape
+        _, K = valid_indices.shape
+        if dispatch_scales is not None:
+            valid_scales = dispatch_scales[:recv_count]
+            scale_dim = valid_scales.size(1)
+        else:
+            valid_scales = None
+            scale_dim = 0
+        E = config.num_experts_per_rank
+        
+        # 2. Find which tokens go to which local expert
+        flat_indices = valid_indices.reshape(-1) # [M*K]
+        is_local = (flat_indices // E) == config.rank
+        active_flat_indices = torch.nonzero(is_local, as_tuple=False).squeeze(-1)
+        
+        if active_flat_indices.numel() == 0:
+            packed_output = dispatch_output.new_zeros((E, N_capacity, H))
+            sorted_token_indices = torch.empty((0,), device=dispatch_output.device, dtype=torch.int32)
+            expert_counts = torch.zeros((E,), device=dispatch_output.device, dtype=torch.int32)
+            packed_scales = (
+                dispatch_scales.new_zeros((E, N_capacity, scale_dim))
+                if scale_dim > 0 and dispatch_scales is not None
+                else None
+            )
+            return packed_output, sorted_token_indices, expert_counts, packed_scales
+
+        token_indices = (active_flat_indices // K).to(torch.long)
+        local_expert_ids = (flat_indices.index_select(0, active_flat_indices).remainder(E)).to(torch.long)
+        
+        # 3. Sort by expert ID
+        sort_order = torch.argsort(local_expert_ids, stable=True)
+        sorted_token_indices_long = token_indices.index_select(0, sort_order)
+        sorted_expert_ids = local_expert_ids.index_select(0, sort_order)
+        
+        # 4. Calculate counts and pack
+        expert_counts_long = torch.bincount(sorted_expert_ids, minlength=E)
+        
+        # Generate slot indices: [0, 1, ... c0-1, 0, 1, ... c1-1, ...]
+        slot_indices_list = [
+            torch.arange(int(count.item()), device=dispatch_output.device, dtype=torch.long)
+            for count in expert_counts_long
+        ]
+        slot_indices = torch.cat(slot_indices_list) if slot_indices_list else torch.empty((0,), device=dispatch_output.device, dtype=torch.long)
+        
+        packed_output = dispatch_output.new_zeros((E, N_capacity, H))
+        packed_output[sorted_expert_ids, slot_indices] = valid_tokens.index_select(0, sorted_token_indices_long)
+
+        packed_scales = None
+        if scale_dim > 0 and valid_scales is not None:
+            packed_scales = valid_scales.new_zeros((E, N_capacity, scale_dim))
+            packed_scales[sorted_expert_ids, slot_indices] = valid_scales.index_select(0, sorted_token_indices_long)
+        
+        return (
+            packed_output,
+            sorted_token_indices_long.to(torch.int32),
+            expert_counts_long.to(torch.int32),
+            packed_scales,
+        )
+
+    @staticmethod
+    def _inverse_transform_dispatch_output(packed_output, original_indices, expert_counts, original_N):
+        """
+        Reconstructs dispatch_output from packed_output [E, N, H].
+        
+        Args:
+            packed_output: [E, N, H] tensor (result of GEMM)
+            original_indices: [M] tensor mapping rows back to dispatch_output indices
+            expert_counts: [E] tensor of token counts per expert
+            original_N: Original number of tokens (N)
+            
+        Returns:
+            rec_output: [N, H]
+        """
+        E, _, H = packed_output.shape
+        device = packed_output.device
+        counts_long = expert_counts.to(torch.long)
+        
+        # Generate read indices matching the write order
+        slot_indices_list = [
+            torch.arange(int(count.item()), device=device, dtype=torch.long)
+            for count in counts_long
+        ]
+        slot_indices = torch.cat(slot_indices_list) if slot_indices_list else torch.empty((0,), device=device, dtype=torch.long)
+        
+        expert_ids = torch.repeat_interleave(torch.arange(E, device=device, dtype=torch.long), counts_long)
+        
+        # Extract valid tokens
+        flat_values = packed_output[expert_ids, slot_indices]
+        
+        # Scatter add back
+        rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
+        rec_output.index_add_(0, original_indices.to(torch.long), flat_values)
+        
+        return rec_output
