@@ -530,7 +530,7 @@ class Buffer:
                     x, sorted_indices, expert_counts, recv_count
             )
         else:
-            rec_output = Buffer._inverse_transform_dispatch_output_gpu(
+            rec_output = Buffer._inverse_transform_dispatch_output(
                 x, sorted_indices, expert_counts, recv_count
             )
 
