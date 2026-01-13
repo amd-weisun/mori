@@ -84,11 +84,10 @@ class Buffer:
         if self.ops is None:
             kernel_type = EpDispatchCombineKernelType.IntraNode
             # Simple heuristic for kernel type
-            if self.group_size > 8: 
+            if (self.group_size / self.gpu_per_node)  > 1: 
                  kernel_type = EpDispatchCombineKernelType.InterNodeV1
-            
-            if self.low_latency_mode:
-                 kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
+                if self.low_latency_mode:
+                    kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
 
             # TODO: These parameters might need to be tuned or exposed
             self.config = EpDispatchCombineConfig(
