@@ -34,12 +34,34 @@ class Buffer:
 
     num_sms: int = 20
     _printed_warnings = set()
-
+    kernel_type_map = {
+        "intra": EpDispatchCombineKernelType.IntraNode,
+        "v0": EpDispatchCombineKernelType.InterNode,
+        "v1": EpDispatchCombineKernelType.InterNodeV1,
+        "v1_ll": EpDispatchCombineKernelType.InterNodeV1LL,
+    }
     @classmethod
     def _log_warning_once(cls, msg: str):
         if msg not in cls._printed_warnings:
             print(msg, flush=True)
             cls._printed_warnings.add(msg)
+
+    @classmethod
+    def _normalize_kernel_type(cls, kernel_type: Optional[Union[str, EpDispatchCombineKernelType]]) -> Optional[EpDispatchCombineKernelType]:
+        if kernel_type is None:
+            return None
+        if isinstance(kernel_type, EpDispatchCombineKernelType):
+            return kernel_type
+        if not isinstance(kernel_type, str):
+            raise TypeError(
+                "kernel_type must be a string identifier or EpDispatchCombineKernelType, "
+                f"received {type(kernel_type)}"
+            )
+        key = kernel_type.lower()
+        if key not in cls.kernel_type_map:
+            valid_opts = ", ".join(cls.kernel_type_map)
+            raise ValueError(f"Unknown kernel_type '{kernel_type}'. Valid options: {valid_opts}")
+        return cls.kernel_type_map[key]
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
@@ -50,7 +72,8 @@ class Buffer:
                  reorder: bool = True,
                  block_num: int = 32,
                  warp_num_per_block: int = 16,
-                 rdma_block_num: int = 16) -> None:
+                 rdma_block_num: int = 16,
+                 kernel_type: Optional[Union[str, EpDispatchCombineKernelType]] = None) -> None:
         """
         Initialize the communication buffer.
 
@@ -78,16 +101,20 @@ class Buffer:
         self.use_gpu_ll_layout_transform = use_gpu_ll_layout_transform
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
+        self.kernel_type_override = self._normalize_kernel_type(kernel_type)
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
         if self.ops is None:
-            kernel_type = EpDispatchCombineKernelType.IntraNode
-            # Simple heuristic for kernel type
-            if self.gpu_per_node and (self.group_size / self.gpu_per_node) > 1:
-                kernel_type = EpDispatchCombineKernelType.InterNodeV1
-                if self.low_latency_mode:
-                    kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
+            if self.kernel_type_override is not None:
+                kernel_type = self.kernel_type_override
+            else:
+                kernel_type = EpDispatchCombineKernelType.IntraNode
+                # Simple heuristic for kernel type
+                if self.gpu_per_node and (self.group_size / self.gpu_per_node) > 1:
+                    kernel_type = EpDispatchCombineKernelType.InterNodeV1
+                    if self.low_latency_mode:
+                        kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
 
             # TODO: These parameters might need to be tuned or exposed
             self.config = EpDispatchCombineConfig(
