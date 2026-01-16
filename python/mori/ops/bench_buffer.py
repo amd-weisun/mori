@@ -7,7 +7,7 @@ Run with torchrun, for example:
 import argparse
 import os
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch.multiprocessing as mp
 import torch
 import torch.distributed as dist
@@ -25,7 +25,7 @@ DTYPE_MAP = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Buffer dispatch/combine variants and helpers")
     parser.add_argument("--num-processes", type=int, default=8)
-    parser.add_argument("--num-tokens", type=int, default=128)
+    parser.add_argument("--num-tokens", type=int, default=4096, help="Tokens for standard pipeline")
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
@@ -34,7 +34,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dtype", choices=list(DTYPE_MAP.keys()), default="bf16")
-    parser.add_argument("--total-experts", type=int, default=32)
+    parser.add_argument("--total-experts", type=int, default=256, help="Experts for standard pipeline")
+    parser.add_argument(
+        "--low-latency-num-tokens",
+        type=int,
+        default=128,
+        help="Tokens for low-latency pipeline",
+    )
+    parser.add_argument(
+        "--low-latency-total-experts",
+        type=int,
+        default=288,
+        help="Experts for low-latency pipeline",
+    )
     parser.add_argument("--disable-reorder", action="store_true")
     parser.add_argument("--disable-gpu-ll-layout-transform", action="store_true")
     parser.add_argument("--skip-low-latency", action="store_true")
@@ -92,12 +104,24 @@ def aggregate_stage_totals(stage_results: List[Tuple[str, float]], groups: Dict[
     return aggregated
 
 
-def gather_and_print(results: List[Tuple[str, float]]) -> None:
+def gather_and_print(results: List[Tuple[str, float]], args: argparse.Namespace) -> None:
     world = dist.get_world_size()
     collected: List[Optional[List[Tuple[str, float]]]] = [None for _ in range(world)]
     dist.all_gather_object(collected, results)
     if dist.get_rank() != 0:
         return
+
+    print("\n=== Benchmark Settings ===")
+    print(
+        f"Processes={args.num_processes} } dtype={args.dtype} topk={args.topk} iters={args.iters} warmup={args.warmup_iters}"
+    )
+    print(
+        f"Standard: tokens={args.num_tokens} total_experts={args.total_experts}"
+    )
+    if not args.skip_low_latency:
+        print(
+            f"Low-latency: tokens={args.low_latency_num_tokens} total_experts={args.low_latency_total_experts}"
+        )
 
     summary: Dict[str, List[float]] = {}
     for rank_results in collected:
@@ -234,6 +258,44 @@ def capture_op_dispatch(buffer: Buffer, inp: torch.Tensor, topk_weights: torch.T
     }
 
 
+def init_buffer_env(
+    *,
+    label: str,
+    num_tokens: int,
+    total_experts: int,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    rank: int,
+    world: int,
+) -> Dict[str, Any]:
+    if total_experts < world:
+        raise ValueError(f"{label} total_experts must be at least world size so each rank hosts >= 1 expert")
+    if total_experts % world != 0:
+        raise ValueError(f"{label} total_experts must be divisible by world size to derive experts per rank")
+
+    experts_per_rank = total_experts // world
+    buffer = Buffer(
+        group=dist.group.WORLD,
+        num_qps_per_rank=experts_per_rank,
+        max_num_inp_token_per_rank=num_tokens,
+        num_experts_per_token=args.topk,
+        reorder=not args.disable_reorder,
+        use_gpu_ll_layout_transform=not args.disable_gpu_ll_layout_transform,
+    )
+    device = buffer.device
+    tokens = torch.randn(num_tokens, args.hidden_dim, device=device, dtype=dtype)
+    topk_idx = make_topk_indices(num_tokens, args.topk, experts_per_rank, total_experts, rank, device)
+    topk_weights = torch.rand(num_tokens, args.topk, device=device, dtype=torch.float32)
+    dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
+    return {
+        "buffer": buffer,
+        "tokens": tokens,
+        "topk_idx": topk_idx,
+        "topk_weights": topk_weights,
+        "dispatch_indices_arg": dispatch_indices_arg,
+    }
+
+
 def run(rank: int, args: argparse.Namespace) -> None:
     ensure_cuda()
     world_size = args.num_processes
@@ -251,29 +313,21 @@ def run(rank: int, args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
 
-    if args.total_experts < world:
-        raise ValueError("total_experts must be at least world size so each rank hosts >= 1 expert")
-    if args.total_experts % world != 0:
-        raise ValueError("total_experts must be divisible by world size to derive experts per rank")
-    experts_per_rank = args.total_experts // world
-
     dtype = DTYPE_MAP[args.dtype]
-    max_tokens = args.num_tokens
-    buffer = Buffer(
-        group=dist.group.WORLD,
-        num_qps_per_rank=experts_per_rank,
-        max_num_inp_token_per_rank=max_tokens,
-        num_experts_per_token=args.topk,
-        reorder=not args.disable_reorder,
-        use_gpu_ll_layout_transform=not args.disable_gpu_ll_layout_transform,
+    normal_env = init_buffer_env(
+        label="standard",
+        num_tokens=args.num_tokens,
+        total_experts=args.total_experts,
+        args=args,
+        dtype=dtype,
+        rank=rank,
+        world=world,
     )
-    device = buffer.device
-    total_experts = args.total_experts
-
-    tokens = torch.randn(args.num_tokens, args.hidden_dim, device=device, dtype=dtype)
-    topk_idx = make_topk_indices(args.num_tokens, args.topk, experts_per_rank, total_experts, rank, device)
-    topk_weights = torch.rand(args.num_tokens, args.topk, device=device, dtype=torch.float32)
-    dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
+    buffer = normal_env["buffer"]
+    tokens = normal_env["tokens"]
+    topk_idx = normal_env["topk_idx"]
+    topk_weights = normal_env["topk_weights"]
+    dispatch_indices_arg = normal_env["dispatch_indices_arg"]
 
     dist.barrier()
 
@@ -430,25 +484,39 @@ def run(rank: int, args: argparse.Namespace) -> None:
     )
 
     if not args.skip_low_latency:
+        ll_env = init_buffer_env(
+            label="low-latency",
+            num_tokens=args.low_latency_num_tokens,
+            total_experts=args.low_latency_total_experts,
+            args=args,
+            dtype=dtype,
+            rank=rank,
+            world=world,
+        )
+        ll_buffer = ll_env["buffer"]
+        ll_tokens = ll_env["tokens"]
+        ll_topk_idx = ll_env["topk_idx"]
+        ll_topk_weights = ll_env["topk_weights"]
+
         ll_use_fp8 = False
 
         def low_latency_pipeline_iteration() -> List[Tuple[str, float]]:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            dispatch_arg = Buffer._per_token_cast_to_fp8(tokens) if ll_use_fp8 else tokens
-            op, inp, inp_scales, dispatch_indices_arg = buffer._preprocess_dispatch(
+            dispatch_arg = Buffer._per_token_cast_to_fp8(ll_tokens) if ll_use_fp8 else ll_tokens
+            op, inp, inp_scales, dispatch_indices_arg = ll_buffer._preprocess_dispatch(
                 dispatch_arg,
-                topk_idx,
-                topk_weights,
+                ll_topk_idx,
+                ll_topk_weights,
                 None,
             )
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             dispatch_output, dispatch_weights_local, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
-                op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+                op.dispatch(inp, ll_topk_weights, inp_scales, dispatch_indices_arg)
             torch.cuda.synchronize()
             t2 = time.perf_counter()
-            ll_recv_x, _, ll_handle = buffer._postprocess_low_latency_dispatch(
+            ll_recv_x, _, ll_handle = ll_buffer._postprocess_low_latency_dispatch(
                 dispatch_output,
                 dispatch_indices,
                 dispatch_scales,
@@ -465,17 +533,17 @@ def run(rank: int, args: argparse.Namespace) -> None:
 
             torch.cuda.synchronize()
             t4 = time.perf_counter()
-            rec_output, dispatch_weights_local, dispatch_indices_arg = buffer._preprocess_low_latency_combine(
+            rec_output, dispatch_weights_local, dispatch_indices_arg = ll_buffer._preprocess_low_latency_combine(
                 ll_tensor,
                 ll_handle,
             )
             torch.cuda.synchronize()
             t5 = time.perf_counter()
-            buffer.ops.combine(
+            ll_buffer.ops.combine(
                 rec_output,
                 dispatch_weights_local,
                 dispatch_indices_arg,
-                block_num=buffer.config.block_num,
+                block_num=ll_buffer.config.block_num,
                 warp_per_block=16,
             )
             torch.cuda.synchronize()
@@ -517,7 +585,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
     local_results.extend(ll_totals)
     local_results.extend(breakdown_results)
 
-    gather_and_print(local_results)
+    gather_and_print(local_results, args)
     dist.barrier()
     dist.destroy_process_group()
 
