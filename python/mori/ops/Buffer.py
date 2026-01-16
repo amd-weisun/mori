@@ -4,7 +4,6 @@ import os
 import socket
 import torch
 import torch.distributed as dist
-from time import perf_counter
 from typing import Callable, List, Tuple, Optional, Union
 
 from mori import shmem
@@ -41,12 +40,6 @@ class Buffer:
         "v1": EpDispatchCombineKernelType.InterNodeV1,
         "v1_ll": EpDispatchCombineKernelType.InterNodeV1LL,
     }
-    _PROFILED_SECTIONS = (
-        "dispatch",
-        "combine",
-        "low_latency_dispatch",
-        "low_latency_combine",
-    )
     @classmethod
     def _log_warning_once(cls, msg: str):
         if msg not in cls._printed_warnings:
@@ -80,8 +73,7 @@ class Buffer:
                  block_num: int = 32,
                  warp_num_per_block: int = 16,
                  rdma_block_num: int = 16,
-                 kernel_type: Optional[Union[str, EpDispatchCombineKernelType]] = None,
-                 enable_profiling: bool = False) -> None:
+                 kernel_type: Optional[Union[str, EpDispatchCombineKernelType]] = None) -> None:
         """
         Initialize the communication buffer.
 
@@ -110,8 +102,6 @@ class Buffer:
         self.config = None
         self.reorder = reorder # Whether to reorder outputs to match DeepEp API
         self.kernel_type_override = self._normalize_kernel_type(kernel_type)
-        self.enable_profiling = enable_profiling
-        self._init_profiling_state()
         self.setup()
 
     def _get_op(self, dtype: torch.dtype, hidden_dim: int, scale_dim: int = 0) -> EpDispatchCombineOp:
@@ -209,10 +199,6 @@ class Buffer:
         for op in self.ops.values():
             op.reset()
 
-    def reset_profiling_data(self) -> None:
-        """Clear accumulated profiling statistics."""
-        self._init_profiling_state()
-
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
         Buffer.num_sms = new_num_sms
@@ -239,18 +225,6 @@ class Buffer:
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
         return Config(Buffer.num_sms)
-
-    def get_profiling_breakdown_dispatch(self) -> dict:
-        return self._get_profile_snapshot("dispatch")
-
-    def get_profiling_breakdown_combine(self) -> dict:
-        return self._get_profile_snapshot("combine")
-
-    def get_profiling_breakdown_low_latency_dispatch(self) -> dict:
-        return self._get_profile_snapshot("low_latency_dispatch")
-
-    def get_profiling_breakdown_low_latency_combine(self) -> dict:
-        return self._get_profile_snapshot("low_latency_combine")
 
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
                             previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
@@ -316,8 +290,6 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        profile_ctx = self._profile_start("dispatch")
-
         if topk_idx is None or topk_weights is None:
              raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
         
@@ -354,10 +326,8 @@ class Buffer:
         # MORI dispatch expects int32 indices.
         dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
 
-        self._profile_mark_core_start(profile_ctx, self.device)
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
-        self._profile_mark_post_start(profile_ctx)
 
         dispatch_indices_clone = dispatch_indices
 
@@ -414,7 +384,6 @@ class Buffer:
 
         
         
-        self._profile_finish(profile_ctx)
         return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle, EventOverlap()
 
     def combine(self, x: torch.Tensor, handle: Tuple,
@@ -444,8 +413,6 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        profile_ctx = self._profile_start("combine")
-
         # dtype = x.dtype
         # hidden_dim = x.size(1)
         op = self.ops
@@ -461,11 +428,7 @@ class Buffer:
                 self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
 
 
-        self._profile_mark_core_start(profile_ctx, self.device)
         combined_x = op.combine(x, topk_weights, dispatch_indices_arg)
-        self._profile_mark_post_start(profile_ctx)
-        
-        self._profile_finish(profile_ctx)
         return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
 
     # noinspection PyTypeChecker
@@ -516,8 +479,6 @@ class Buffer:
         Not fully supported with the same API.
         """
 
-        profile_ctx = self._profile_start("low_latency_dispatch")
-
         if(async_finish or return_recv_hook):
             raise NotImplementedError("MORI  async_finish/return_recv_hook is not supported yet.")
 
@@ -544,10 +505,8 @@ class Buffer:
         # MORI dispatch expects int32 indices.
         dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
   
-        self._profile_mark_core_start(profile_ctx, self.device)
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
-        self._profile_mark_post_start(profile_ctx)
         
         recv_count = dispatch_recv_num_token[0].item()
         
@@ -573,7 +532,6 @@ class Buffer:
         
         new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights, packed_scales, dispatch_indices_arg)
 
-        self._profile_finish(profile_ctx)
         return recv_x, expert_counts, new_handle, EventOverlap(), None
         
 
@@ -586,8 +544,6 @@ class Buffer:
         Low latency combine.
         Not fully supported with the same API.
         """
-        profile_ctx = self._profile_start("low_latency_combine")
-
         sorted_indices = handle[0]
         expert_counts = handle[1]
         recv_count = handle[2]
@@ -608,7 +564,6 @@ class Buffer:
 
 
 
-        self._profile_mark_core_start(profile_ctx, self.device)
         combine_output,combine_output_weight = op.combine(
             rec_output,
             dispatch_weights,
@@ -617,9 +572,6 @@ class Buffer:
             block_num=self.config.block_num,
             warp_per_block=16,
         )
-        self._profile_mark_post_start(profile_ctx)
-
-        self._profile_finish(profile_ctx)
         return combine_output, EventOverlap(), None
         
 
@@ -800,62 +752,3 @@ class Buffer:
         rec_output.index_add_(0, original_indices.to(torch.long), flat_values)
         
         return rec_output
-
-    def _init_profiling_state(self) -> None:
-        self._profiling_data = {
-            section: self._make_profile_bucket()
-            for section in self._PROFILED_SECTIONS
-        }
-
-    @staticmethod
-    def _make_profile_bucket() -> dict:
-        return {"pre": 0.0, "core": 0.0, "post": 0.0, "calls": 0}
-
-    def _profile_start(self, section: str) -> Optional[dict]:
-        if not self.enable_profiling:
-            return None
-        return {"section": section, "pre_start": perf_counter()}
-
-    def _profile_mark_core_start(self, ctx: Optional[dict], device: Optional[torch.device] = None) -> None:
-        if ctx is None:
-            return
-        ctx["core_start"] = perf_counter()
-        ctx["pre"] = ctx["core_start"] - ctx["pre_start"]
-
-    @staticmethod
-    def _profile_mark_post_start(ctx: Optional[dict]) -> None:
-        if ctx is None:
-            return
-        ctx["post_start"] = perf_counter()
-        ctx["core"] = ctx["post_start"] - ctx["core_start"]
-
-    def _profile_finish(self, ctx: Optional[dict]) -> None:
-        if ctx is None:
-            return
-        post_end = perf_counter()
-        ctx["post"] = post_end - ctx["post_start"]
-        bucket = self._profiling_data[ctx["section"]]
-        bucket["pre"] += ctx.get("pre", 0.0)
-        bucket["core"] += ctx.get("core", 0.0)
-        bucket["post"] += ctx.get("post", 0.0)
-        bucket["calls"] += 1
-
-    def _get_profile_snapshot(self, section: str) -> dict:
-        data = self._profiling_data.get(section, self._make_profile_bucket())
-        calls = data.get("calls", 0)
-        totals_sec = {
-            "pre": data.get("pre", 0.0),
-            "core": data.get("core", 0.0),
-            "post": data.get("post", 0.0),
-        }
-        total = {phase: value * 1000.0 for phase, value in totals_sec.items()}
-        average = {
-            phase: ((value / calls) * 1000.0 if calls else 0.0)
-            for phase, value in totals_sec.items()
-        }
-        return {
-            "enabled": self.enable_profiling,
-            "calls": calls,
-            "total": total,
-            "average": average,
-        }
