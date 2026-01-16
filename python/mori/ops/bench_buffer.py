@@ -24,6 +24,7 @@ DTYPE_MAP = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Buffer dispatch/combine variants and helpers")
+    parser.add_argument("--num-processes", type=int, default=8)
     parser.add_argument("--num-tokens", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
@@ -439,8 +440,11 @@ def run() -> None:
 
 
 def main() -> None:
-    with torch.inference_mode():
-        run()
+    args = parse_args()
+    num_processes = args.num_processes
+    print('-------------------------------------------------------------------------', flush=True)
+    mp.spawn(run, args=(), nprocs=num_processes)
+    print('*************************************************************************', flush=True)
 
 
 if __name__ == "__main__":
