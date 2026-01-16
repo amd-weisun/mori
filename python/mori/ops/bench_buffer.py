@@ -25,7 +25,7 @@ DTYPE_MAP = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Buffer dispatch/combine variants and helpers")
     parser.add_argument("--num-processes", type=int, default=8)
-    parser.add_argument("--num-tokens", type=int, default=4096, help="Tokens for standard pipeline")
+    parser.add_argument("--num-tokens", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
@@ -34,23 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dtype", choices=list(DTYPE_MAP.keys()), default="bf16")
-    parser.add_argument("--total-experts", type=int, default=256, help="Experts for standard pipeline")
-    parser.add_argument(
-        "--low-latency-num-tokens",
-        type=int,
-        default=128,
-        help="Tokens for low-latency pipeline",
-    )
-    parser.add_argument(
-        "--low-latency-total-experts",
-        type=int,
-        default=288,
-        help="Experts for low-latency pipeline",
-    )
-    parser.add_argument("--test-low-latency", action="store_true", help="Run only the low-latency pipeline")
+    parser.add_argument("--total-experts", type=int, default=288)
     parser.add_argument("--disable-reorder", action="store_true")
     parser.add_argument("--disable-gpu-ll-layout-transform", action="store_true")
-    parser.add_argument("--skip-low-latency", action="store_true", help="(Deprecated) no-op placeholder")
+    parser.add_argument("--skip-low-latency", action="store_true")
     return parser.parse_args()
 
 
@@ -174,26 +161,25 @@ def gather_and_print(results: List[Tuple[str, float]]) -> None:
             printed_header = True
         print_metric(label, stats)
 
-    if get_stats("dispatch.total") or get_stats("combine.total"):
-        print("\n=== Standard Dispatch/Combine ===")
-        print_stage_group(
-            "Dispatch",
-            {
-                "total": "dispatch.total",
-                "pre": "dispatch.preprocess",
-                "ops": "dispatch.ops",
-                "post": "dispatch.postprocess",
-            },
-        )
-        print_stage_group(
-            "Combine",
-            {
-                "total": "combine.total",
-                "pre": "combine.preprocess",
-                "ops": "combine.ops",
-                "post": "combine.postprocess",
-            },
-        )
+    print("\n=== Standard Dispatch/Combine ===")
+    print_stage_group(
+        "Dispatch",
+        {
+            "total": "dispatch.total",
+            "pre": "dispatch.preprocess",
+            "ops": "dispatch.ops",
+            "post": "dispatch.postprocess",
+        },
+    )
+    print_stage_group(
+        "Combine",
+        {
+            "total": "combine.total",
+            "pre": "combine.preprocess",
+            "ops": "combine.ops",
+            "post": "combine.postprocess",
+        },
+    )
 
     if get_stats("low_latency_dispatch.total") or get_stats("low_latency_combine.total"):
         print("\n=== Low-Latency Dispatch/Combine ===")
@@ -265,18 +251,14 @@ def run(rank: int, args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
 
-    use_low_latency = args.test_low_latency
-    active_num_tokens = args.low_latency_num_tokens if use_low_latency else args.num_tokens
-    active_total_experts = args.low_latency_total_experts if use_low_latency else args.total_experts
-
-    if active_total_experts < world:
+    if args.total_experts < world:
         raise ValueError("total_experts must be at least world size so each rank hosts >= 1 expert")
-    if active_total_experts % world != 0:
+    if args.total_experts % world != 0:
         raise ValueError("total_experts must be divisible by world size to derive experts per rank")
-    experts_per_rank = active_total_experts // world
+    experts_per_rank = args.total_experts // world
 
     dtype = DTYPE_MAP[args.dtype]
-    max_tokens = active_num_tokens
+    max_tokens = args.num_tokens
     buffer = Buffer(
         group=dist.group.WORLD,
         num_qps_per_rank=experts_per_rank,
@@ -286,11 +268,11 @@ def run(rank: int, args: argparse.Namespace) -> None:
         use_gpu_ll_layout_transform=not args.disable_gpu_ll_layout_transform,
     )
     device = buffer.device
-    total_experts = active_total_experts
+    total_experts = args.total_experts
 
-    tokens = torch.randn(active_num_tokens, args.hidden_dim, device=device, dtype=dtype)
-    topk_idx = make_topk_indices(active_num_tokens, args.topk, experts_per_rank, total_experts, rank, device)
-    topk_weights = torch.rand(active_num_tokens, args.topk, device=device, dtype=torch.float32)
+    tokens = torch.randn(args.num_tokens, args.hidden_dim, device=device, dtype=dtype)
+    topk_idx = make_topk_indices(args.num_tokens, args.topk, experts_per_rank, total_experts, rank, device)
+    topk_weights = torch.rand(args.num_tokens, args.topk, device=device, dtype=torch.float32)
     dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
 
     dist.barrier()
@@ -429,28 +411,25 @@ def run(rank: int, args: argparse.Namespace) -> None:
         ]
 
     breakdown_results: List[Tuple[str, float]] = []
-    standard_totals: List[Tuple[str, float]] = []
-    if not use_low_latency:
-        standard_breakdown = measure_breakdown(standard_pipeline_iteration, args.iters, args.warmup_iters)
-        breakdown_results.extend(standard_breakdown)
-        standard_totals = aggregate_stage_totals(
-            standard_breakdown,
-            {
-                "dispatch.total": [
-                    "dispatch.preprocess",
-                    "dispatch.ops",
-                    "dispatch.postprocess",
-                ],
-                "combine.total": [
-                    "combine.preprocess",
-                    "combine.ops",
-                    "combine.postprocess",
-                ],
-            },
-        )
+    standard_breakdown = measure_breakdown(standard_pipeline_iteration, args.iters, args.warmup_iters)
+    breakdown_results.extend(standard_breakdown)
+    standard_totals = aggregate_stage_totals(
+        standard_breakdown,
+        {
+            "dispatch.total": [
+                "dispatch.preprocess",
+                "dispatch.ops",
+                "dispatch.postprocess",
+            ],
+            "combine.total": [
+                "combine.preprocess",
+                "combine.ops",
+                "combine.postprocess",
+            ],
+        },
+    )
 
-    ll_totals: List[Tuple[str, float]] = []
-    if use_low_latency:
+    if not args.skip_low_latency:
         ll_use_fp8 = False
 
         def low_latency_pipeline_iteration() -> List[Tuple[str, float]]:
@@ -528,6 +507,8 @@ def run(rank: int, args: argparse.Namespace) -> None:
                 ],
             },
         )
+    else:
+        ll_totals = []
 
     local_results: List[Tuple[str, float]] = []
     for name, fn in benchmarks:
