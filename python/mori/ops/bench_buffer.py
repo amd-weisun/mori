@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dtype", choices=list(DTYPE_MAP.keys()), default="bf16")
     parser.add_argument("--total-experts", type=int, default=32)
@@ -132,13 +133,19 @@ def capture_op_dispatch(buffer: Buffer, inp: torch.Tensor, topk_weights: torch.T
     }
 
 
-def run() -> None:
-    args = parse_args()
+def run(rank: int, args: argparse.Namespace) -> None:
     ensure_cuda()
-    dist.init_process_group(backend=args.backend)
-    rank = dist.get_rank()
+    world_size = args.num_processes
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(args.master_port))
+    dist.init_process_group(
+        backend=args.backend,
+        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        rank=rank,
+        world_size=world_size,
+    )
     world = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+    local_rank = rank % max(1, torch.cuda.device_count())
     torch.cuda.set_device(local_rank)
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
@@ -443,7 +450,7 @@ def main() -> None:
     args = parse_args()
     num_processes = args.num_processes
     print('-------------------------------------------------------------------------', flush=True)
-    mp.spawn(run, args=(), nprocs=num_processes)
+    mp.spawn(run, args=(args,), nprocs=num_processes, join=True)
     print('*************************************************************************', flush=True)
 
 
