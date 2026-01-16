@@ -809,7 +809,7 @@ class Buffer:
 
     @staticmethod
     def _make_profile_bucket() -> dict:
-        return {"pre": 0.0, "core": 0.0, "post": 0.0, "gpu_core": 0.0, "calls": 0}
+        return {"pre": 0.0, "core": 0.0, "post": 0.0, "calls": 0}
 
     def _profile_start(self, section: str) -> Optional[dict]:
         if not self.enable_profiling:
@@ -822,33 +822,12 @@ class Buffer:
         ctx["core_start"] = perf_counter()
         ctx["pre"] = ctx["core_start"] - ctx["pre_start"]
 
-        if device is None or not torch.cuda.is_available():
-            return
-        try:
-            stream = torch.cuda.current_stream(device=device)
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record(stream)
-            ctx["cuda"] = {
-                "stream": stream,
-                "start": start_event,
-                "end": end_event,
-            }
-        except RuntimeError:
-            ctx.pop("cuda", None)
-
     @staticmethod
     def _profile_mark_post_start(ctx: Optional[dict]) -> None:
         if ctx is None:
             return
         ctx["post_start"] = perf_counter()
         ctx["core"] = ctx["post_start"] - ctx["core_start"]
-        cuda_ctx = ctx.get("cuda")
-        if cuda_ctx is not None:
-            try:
-                cuda_ctx["end"].record(cuda_ctx["stream"])
-            except RuntimeError:
-                ctx.pop("cuda", None)
 
     def _profile_finish(self, ctx: Optional[dict]) -> None:
         if ctx is None:
@@ -859,13 +838,6 @@ class Buffer:
         bucket["pre"] += ctx.get("pre", 0.0)
         bucket["core"] += ctx.get("core", 0.0)
         bucket["post"] += ctx.get("post", 0.0)
-        cuda_ctx = ctx.get("cuda")
-        if cuda_ctx is not None:
-            try:
-                cuda_ctx["end"].synchronize()
-                bucket["gpu_core"] += cuda_ctx["start"].elapsed_time(cuda_ctx["end"]) / 1000.0
-            except RuntimeError:
-                pass
         bucket["calls"] += 1
 
     def _get_profile_snapshot(self, section: str) -> dict:
@@ -875,7 +847,6 @@ class Buffer:
             "pre": data.get("pre", 0.0),
             "core": data.get("core", 0.0),
             "post": data.get("post", 0.0),
-            "gpu_core": data.get("gpu_core", 0.0),
         }
         total = {phase: value * 1000.0 for phase, value in totals_sec.items()}
         average = {
