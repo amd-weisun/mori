@@ -290,100 +290,28 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        if topk_idx is None or topk_weights is None:
-             raise NotImplementedError("dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights.")
-        
-        if isinstance(x, tuple):
-            inp, inp_scales = x
-            dtype = inp.dtype
-            # tmp solution: convert float8 to float8uz
-
-            hidden_dim = inp.size(1)
-            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
-        else:
-            inp = x
-            inp_scales = None
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = 0
-
-        self.num_experts_per_token = topk_idx.size(1)
-        max_num_tokens_per_rank = max(num_tokens_per_rank) if num_tokens_per_rank is not None else inp.size(0)
-        self.max_num_inp_token_per_rank = max(max_num_tokens_per_rank, inp.size(0)) 
-
-
-        if dtype == torch.float8_e4m3fn:
-            if self.rank == 0:
-                Buffer._log_warning_once("[warning] Converting float8_e4m3fn input to float8_e4m3fnuz for MORI dispatch, workaround for debugging on MI300X.")
-            inp = inp.to(torch.float8_e4m3fnuz)
-            dtype = torch.float8_e4m3fnuz
-            # if self.rank == 0:    
-            #     print(f"[warning] converted inp = {inp}.", flush=True)
-        op = self._get_op(dtype, hidden_dim, scale_dim)
-        
-        
-
-        # MORI dispatch expects int32 indices.
-        dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
+        op, inp, inp_scales, dispatch_indices_arg = self._preprocess_dispatch(
+            x,
+            topk_idx,
+            topk_weights,
+            num_tokens_per_rank,
+        )
 
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
 
-        dispatch_indices_clone = dispatch_indices
+        recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle = \
+            self._postprocess_dispatch(
+                op,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+                inp_scales,
+                dispatch_indices_arg,
+            )
 
-        def _normalize_recv_num_token(value):
-            if isinstance(value, torch.Tensor):
-                if value.numel() == 0:
-                    return 0
-                return int(value.view(-1)[0].item())
-            if isinstance(value, (list, tuple)) and value:
-                return int(value[0])
-            return int(value)
-
-        num_valid_tokens = max(0, _normalize_recv_num_token(dispatch_recv_num_token))
-        #num_valid_tokens = op.get_cur_rank_num_token()
-        def _truncate(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if tensor is None:
-                return None
-            return tensor[:num_valid_tokens]
-
-        dispatch_output = _truncate(dispatch_output)
-        dispatch_weights = _truncate(dispatch_weights)
-        dispatch_scales = _truncate(dispatch_scales)
-        dispatch_indices = _truncate(dispatch_indices)
-        src_token_pos = op.get_dispatch_src_token_pos()[:num_valid_tokens]
-        src_token_pos = _truncate(src_token_pos)
-        # reorder to match DeepEp order
-        if self.reorder:
-            dispatch_output, dispatch_scales, dispatch_indices, dispatch_weights = \
-                self._reorder_mori_dispatch_outputs(dispatch_output, dispatch_indices, dispatch_weights, src_token_pos, dispatch_scales)
-        
-        # Construct return values
-        recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
-        recv_topk_idx = dispatch_indices
-        recv_topk_weights = dispatch_weights
-
-        
-
-        # Count how many tokens each local expert actually received using the truncated indices.
-        num_local_experts = self.num_qps_per_rank
-        num_recv_tokens_per_expert_list = [0] * num_local_experts
-        if dispatch_indices is not None and dispatch_indices.numel() > 0:
-            flat_indices = dispatch_indices.reshape(-1)
-            local_offset = self.rank * self.num_qps_per_rank
-            local_indices = flat_indices - local_offset
-            mask = (local_indices >= 0) & (local_indices < num_local_experts)
-            if mask.any():
-                local_indices = local_indices[mask]
-                counts = torch.bincount(local_indices, minlength=num_local_experts)
-                if counts.numel() > 0:
-                    num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
-        
-        # Store dispatch_indices in handle for combine
-        new_handle = (dispatch_indices,src_token_pos, num_valid_tokens, dispatch_indices_arg)
-
-        
-        
         return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle, EventOverlap()
 
     def combine(self, x: torch.Tensor, handle: Tuple,
@@ -413,23 +341,18 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        # dtype = x.dtype
-        # hidden_dim = x.size(1)
         op = self.ops
-        
-        # Retrieve indices from handle
-        if not handle or len(handle) < 1:
-             raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
-        
-        dispatch_indices = handle[0]
-        dispatch_indices_arg = handle[3]
-        if self.reorder:
-            x , dispatch_indices, topk_weights = \
-                self._revert_mori_dispatch_outputs(x, dispatch_indices, topk_weights, handle[1])
 
+        combine_input, dispatch_indices_arg, combine_weights = self._preprocess_combine(
+            x,
+            handle,
+            topk_weights,
+        )
 
-        combined_x = op.combine(x, topk_weights, dispatch_indices_arg)
-        return combined_x[0] if isinstance(combined_x, tuple) else combined_x, combined_x[1] if isinstance(combined_x, tuple) else None, EventOverlap()
+        combined_x = op.combine(combine_input, combine_weights, dispatch_indices_arg)
+        recv_x, recv_topk_weights = self._postprocess_combine(combined_x)
+
+        return recv_x, recv_topk_weights, EventOverlap()
 
     # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -483,54 +406,27 @@ class Buffer:
             raise NotImplementedError("MORI  async_finish/return_recv_hook is not supported yet.")
 
         
-        # if use_fp8 then we need to call quantization
-        # now let's just use CPU version for testing
-        if use_fp8:
-            inp, inp_scales = Buffer._per_token_cast_to_fp8(inp)
-            dtype = inp.dtype
-            scale_dim = inp_scales.size(1) 
-        else:
-            inp = x
-            inp_scales = None
-            dtype = inp.dtype
-            hidden_dim = inp.size(1)
-            scale_dim = 0
-        
+        dispatch_input = Buffer._per_token_cast_to_fp8(x) if use_fp8 else x
 
-        self.num_experts_per_token = topk_idx.size(1)
-        self.max_num_inp_token_per_rank = inp.size(0)
-        
-        op = self._get_op(dtype, hidden_dim, scale_dim)
+        op, inp, inp_scales, dispatch_indices_arg = self._preprocess_dispatch(
+            dispatch_input,
+            topk_idx,
+            topk_weights,
+            None,
+        )
 
-        # MORI dispatch expects int32 indices.
-        dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
-  
         dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
-        
-        recv_count = dispatch_recv_num_token[0].item()
-        
-        # if self.use_gpu_ll_layout_transform:
-        packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
+
+        recv_x, expert_counts, new_handle = self._postprocess_low_latency_dispatch(
             dispatch_output,
             dispatch_indices,
-            self.config,
-            recv_count,
-            dispatch_scales
+            dispatch_scales,
+            dispatch_recv_num_token,
+            dispatch_weights,
+            dispatch_indices_arg,
+            use_fp8,
         )
-        # else:
-        #     packed_input, sorted_indices, expert_counts, packed_scales = Buffer._transform_dispatch_output(
-        #         dispatch_output,
-        #         dispatch_indices,
-        #         self.config,
-        #         recv_count,
-        #         dispatch_scales
-        #     )
-
-
-        recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
-        
-        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights, packed_scales, dispatch_indices_arg)
 
         return recv_x, expert_counts, new_handle, EventOverlap(), None
         
@@ -544,31 +440,17 @@ class Buffer:
         Low latency combine.
         Not fully supported with the same API.
         """
-        sorted_indices = handle[0]
-        expert_counts = handle[1]
-        recv_count = handle[2]
-        dispatch_weights = handle[3]
-        dispatch_scales = handle[4]
-        topk_idx = handle[5]
-        # recv_topk_weights = handle[3]
-        # if self.use_gpu_ll_layout_transform:
-        rec_output = mori.inverse_transform_dispatch_output_gpu(
-                x, sorted_indices, expert_counts, recv_count
+        rec_output, dispatch_weights, dispatch_indices_arg = self._preprocess_low_latency_combine(
+            x,
+            handle,
         )
-        # else:
-        #     rec_output = Buffer._inverse_transform_dispatch_output(
-        #         x, sorted_indices, expert_counts, recv_count
-        #     )
 
         op = self.ops
 
-
-
-        combine_output,combine_output_weight = op.combine(
+        combine_output, combine_output_weight = op.combine(
             rec_output,
             dispatch_weights,
-            # None,
-            topk_idx,
+            dispatch_indices_arg,
             block_num=self.config.block_num,
             warp_per_block=16,
         )
@@ -577,6 +459,209 @@ class Buffer:
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         raise NotImplementedError("get_next_low_latency_combine_buffer is not supported.")
+
+
+    # === Profiling-friendly helper blocks ===
+    def _preprocess_dispatch(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_idx: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
+        num_tokens_per_rank: Optional[torch.Tensor],
+    ) -> Tuple[EpDispatchCombineOp, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if topk_idx is None or topk_weights is None:
+            raise NotImplementedError(
+                "dispatch with handle (cached layout) is not fully supported yet. Please provide topk_idx and topk_weights."
+            )
+
+        if isinstance(x, tuple):
+            inp, inp_scales = x
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = inp_scales.size(1) if inp_scales is not None else 0
+        else:
+            inp = x
+            inp_scales = None
+            dtype = inp.dtype
+            hidden_dim = inp.size(1)
+            scale_dim = 0
+
+        self.num_experts_per_token = topk_idx.size(1)
+        max_num_tokens_per_rank = (
+            max(num_tokens_per_rank) if num_tokens_per_rank is not None else inp.size(0)
+        )
+        self.max_num_inp_token_per_rank = max(max_num_tokens_per_rank, inp.size(0))
+
+        if dtype == torch.float8_e4m3fn:
+            if self.rank == 0:
+                Buffer._log_warning_once(
+                    "[warning] Converting float8_e4m3fn input to float8_e4m3fnuz for MORI dispatch, workaround for debugging on MI300X."
+                )
+            inp = inp.to(torch.float8_e4m3fnuz)
+            dtype = torch.float8_e4m3fnuz
+
+        op = self._get_op(dtype, hidden_dim, scale_dim)
+        dispatch_indices_arg = topk_idx.to(dtype=torch.int32)
+
+        return op, inp, inp_scales, dispatch_indices_arg
+
+    def _postprocess_dispatch(
+        self,
+        op: EpDispatchCombineOp,
+        dispatch_output: Optional[torch.Tensor],
+        dispatch_weights: Optional[torch.Tensor],
+        dispatch_scales: Optional[torch.Tensor],
+        dispatch_indices: Optional[torch.Tensor],
+        dispatch_recv_num_token,
+        inp_scales: Optional[torch.Tensor],
+        dispatch_indices_arg: torch.Tensor,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor], List[int], Tuple]:
+        num_valid_tokens = max(0, self._normalize_recv_num_token(dispatch_recv_num_token))
+
+        def _truncate(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor[:num_valid_tokens]
+
+        dispatch_output = _truncate(dispatch_output)
+        dispatch_weights = _truncate(dispatch_weights)
+        dispatch_scales = _truncate(dispatch_scales)
+        dispatch_indices = _truncate(dispatch_indices)
+        src_token_pos = _truncate(op.get_dispatch_src_token_pos())
+
+        if self.reorder:
+            dispatch_output, dispatch_scales, dispatch_indices, dispatch_weights = self._reorder_mori_dispatch_outputs(
+                dispatch_output,
+                dispatch_indices,
+                dispatch_weights,
+                src_token_pos,
+                dispatch_scales,
+            )
+
+        recv_x = (dispatch_output, dispatch_scales) if inp_scales is not None else dispatch_output
+        recv_topk_idx = dispatch_indices
+        recv_topk_weights = dispatch_weights
+
+        num_local_experts = self.num_qps_per_rank
+        num_recv_tokens_per_expert_list = [0] * num_local_experts
+        if dispatch_indices is not None and dispatch_indices.numel() > 0:
+            flat_indices = dispatch_indices.reshape(-1)
+            local_offset = self.rank * self.num_qps_per_rank
+            local_indices = flat_indices - local_offset
+            mask = (local_indices >= 0) & (local_indices < num_local_experts)
+            if mask.any():
+                local_indices = local_indices[mask]
+                counts = torch.bincount(local_indices, minlength=num_local_experts)
+                if counts.numel() > 0:
+                    num_recv_tokens_per_expert_list = counts.to(torch.int).tolist()
+
+        new_handle = (recv_topk_idx, src_token_pos, num_valid_tokens, dispatch_indices_arg)
+        return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle
+
+    def _preprocess_combine(
+        self,
+        x: torch.Tensor,
+        handle: Tuple,
+        topk_weights: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if not handle or len(handle) < 4:
+            raise ValueError("Invalid handle passed to combine. Expected handle from dispatch containing indices.")
+
+        dispatch_indices = handle[0]
+        token_order = handle[1]
+        dispatch_indices_arg = handle[3]
+
+        if self.reorder:
+            x, dispatch_indices, topk_weights = self._revert_mori_dispatch_outputs(
+                x,
+                dispatch_indices,
+                topk_weights,
+                token_order,
+            )
+
+        return x, dispatch_indices_arg, topk_weights
+
+    @staticmethod
+    def _postprocess_combine(
+        combined_x: Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(combined_x, tuple):
+            return combined_x[0], combined_x[1]
+        return combined_x, None
+
+    def _postprocess_low_latency_dispatch(
+        self,
+        dispatch_output: torch.Tensor,
+        dispatch_indices: torch.Tensor,
+        dispatch_scales: Optional[torch.Tensor],
+        dispatch_recv_num_token,
+        dispatch_weights: Optional[torch.Tensor],
+        dispatch_indices_arg: torch.Tensor,
+        use_fp8: bool,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, Tuple]:
+        recv_count = max(0, self._normalize_recv_num_token(dispatch_recv_num_token))
+
+        if self.use_gpu_ll_layout_transform:
+            transformer = mori.transform_dispatch_output_gpu
+        else:
+            transformer = Buffer._transform_dispatch_output
+
+        packed_input, sorted_indices, expert_counts, packed_scales = transformer(
+            dispatch_output,
+            dispatch_indices,
+            self.config,
+            recv_count,
+            dispatch_scales,
+        )
+
+        recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
+        new_handle = (
+            sorted_indices,
+            expert_counts,
+            recv_count,
+            dispatch_weights,
+            packed_scales,
+            dispatch_indices_arg,
+        )
+
+        return recv_x, expert_counts, new_handle
+
+    def _preprocess_low_latency_combine(
+        self,
+        x: torch.Tensor,
+        handle: Tuple,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if not handle or len(handle) < 6:
+            raise ValueError("Invalid handle passed to low-latency combine. Expected output from low_latency_dispatch.")
+
+        sorted_indices, expert_counts, recv_count, dispatch_weights, _, dispatch_indices_arg = handle
+
+        if self.use_gpu_ll_layout_transform:
+            rec_output = mori.inverse_transform_dispatch_output_gpu(
+                x,
+                sorted_indices,
+                expert_counts,
+                recv_count,
+            )
+        else:
+            rec_output = Buffer._inverse_transform_dispatch_output(
+                x,
+                sorted_indices,
+                expert_counts,
+                recv_count,
+            )
+
+        return rec_output, dispatch_weights, dispatch_indices_arg
+
+    @staticmethod
+    def _normalize_recv_num_token(value) -> int:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0
+            return int(value.view(-1)[0].item())
+        if isinstance(value, (list, tuple)) and value:
+            return int(value[0])
+        return int(value)
 
 
     # helper functions for matching DeepEp API
