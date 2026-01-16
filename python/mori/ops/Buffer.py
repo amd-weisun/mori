@@ -875,13 +875,17 @@ class Buffer:
     def _get_profile_snapshot(self, section: str) -> dict:
         data = self._profiling_data.get(section, self._make_profile_bucket())
         calls = data.get("calls", 0)
-        total = {
+        totals_sec = {
             "pre": data.get("pre", 0.0),
             "core": data.get("core", 0.0),
             "post": data.get("post", 0.0),
             "gpu_core": data.get("gpu_core", 0.0),
         }
-        average = {phase: (value / calls if calls else 0.0) for phase, value in total.items()}
+        total = {phase: value * 1000.0 for phase, value in totals_sec.items()}
+        average = {
+            phase: ((value / calls) * 1000.0 if calls else 0.0)
+            for phase, value in totals_sec.items()
+        }
         return {
             "enabled": self.enable_profiling,
             "calls": calls,
