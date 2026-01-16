@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup-iters", type=int, default=5)
-    parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--backend", type=str, default="gloo")
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dtype", choices=list(DTYPE_MAP.keys()), default="bf16")
@@ -136,11 +136,12 @@ def capture_op_dispatch(buffer: Buffer, inp: torch.Tensor, topk_weights: torch.T
 def run(rank: int, args: argparse.Namespace) -> None:
     ensure_cuda()
     world_size = args.num_processes
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(args.master_port))
+    # os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    # os.environ.setdefault("MASTER_PORT", str(args.master_port))
+
     dist.init_process_group(
         backend=args.backend,
-        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        # init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
         rank=rank,
         world_size=world_size,
     )
