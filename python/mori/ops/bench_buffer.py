@@ -113,7 +113,7 @@ def gather_and_print(results: List[Tuple[str, float]], args: argparse.Namespace)
 
     print("\n=== Benchmark Settings ===")
     print(
-        f"Processes={args.num_processes} } dtype={args.dtype} topk={args.topk} iters={args.iters} warmup={args.warmup_iters}"
+        f"Processes={args.num_processes}  dtype={args.dtype} topk={args.topk} iters={args.iters} warmup={args.warmup_iters}"
     )
     print(
         f"Standard: tokens={args.num_tokens} total_experts={args.total_experts}"
