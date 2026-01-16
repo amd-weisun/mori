@@ -84,6 +84,14 @@ def measure_breakdown(iter_fn: Callable[[], List[Tuple[str, float]]], iters: int
     return [(name, totals[name] * 1000.0 / total_iters) for name in order]
 
 
+def aggregate_stage_totals(stage_results: List[Tuple[str, float]], groups: Dict[str, List[str]]) -> List[Tuple[str, float]]:
+    aggregated: List[Tuple[str, float]] = []
+    stage_dict = dict(stage_results)
+    for group, names in groups.items():
+        aggregated.append((group, sum(stage_dict.get(name, 0.0) for name in names)))
+    return aggregated
+
+
 def gather_and_print(results: List[Tuple[str, float]]) -> None:
     world = dist.get_world_size()
     collected: List[Optional[List[Tuple[str, float]]]] = [None for _ in range(world)]
@@ -136,12 +144,11 @@ def capture_op_dispatch(buffer: Buffer, inp: torch.Tensor, topk_weights: torch.T
 def run(rank: int, args: argparse.Namespace) -> None:
     ensure_cuda()
     world_size = args.num_processes
-    # os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    # os.environ.setdefault("MASTER_PORT", str(args.master_port))
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(args.master_port))
 
     dist.init_process_group(
         backend=args.backend,
-        # init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
         rank=rank,
         world_size=world_size,
     )
@@ -177,31 +184,6 @@ def run(rank: int, args: argparse.Namespace) -> None:
 
     dist.barrier()
 
-    recv_x, recv_idx, recv_weights, _, dispatch_handle, _ = buffer.dispatch(
-        tokens,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
-    )
-    combine_input = torch.randn_like(recv_x)
-    combine_weights = recv_weights.clone() if isinstance(recv_weights, torch.Tensor) else None
-
-    if args.skip_low_latency:
-        ll_recv_tensor = torch.empty(0, device=device, dtype=dtype)
-        ll_handle = None
-    else:
-        ll_recv_x, _, ll_handle, _, _ = buffer.low_latency_dispatch(
-            tokens,
-            topk_idx,
-            max_tokens,
-            total_experts,
-            use_fp8=False,
-            topk_weights=topk_weights,
-        )
-        ll_recv_tensor = ll_recv_x if isinstance(ll_recv_x, torch.Tensor) else ll_recv_x[0]
-        if ll_recv_tensor.numel() == 0:
-            raise RuntimeError("Low latency dispatch produced zero tokens; adjust gating inputs")
-    ll_compute_input = torch.randn_like(ll_recv_tensor) if ll_recv_tensor.numel() else None
-
     manual = capture_op_dispatch(buffer, tokens, topk_weights, dispatch_indices_arg)
     if manual["recv_count"] == 0:
         raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
@@ -227,44 +209,6 @@ def run(rank: int, args: argparse.Namespace) -> None:
     dist.barrier()
 
     benchmarks: List[Tuple[str, Callable[[], None]]] = []
-
-    benchmarks.append(
-        (
-            "dispatch",
-            lambda: buffer.dispatch(tokens, topk_idx=topk_idx, topk_weights=topk_weights),
-        )
-    )
-    benchmarks.append(
-        (
-            "combine",
-            lambda: buffer.combine(combine_input, dispatch_handle, topk_weights=combine_weights),
-        )
-    )
-    if not args.skip_low_latency:
-        benchmarks.append(
-            (
-                "low_latency_dispatch",
-                lambda: buffer.low_latency_dispatch(
-                    tokens,
-                    topk_idx,
-                    max_tokens,
-                    total_experts,
-                    use_fp8=False,
-                    topk_weights=topk_weights,
-                ),
-            )
-        )
-        benchmarks.append(
-            (
-                "low_latency_combine",
-                lambda: buffer.low_latency_combine(
-                    ll_compute_input,
-                    topk_idx,
-                    topk_weights,
-                    ll_handle,
-                ),
-            )
-        )
 
     benchmarks.append(
         (
@@ -313,7 +257,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
         )
     )
 
-    def dispatch_iteration() -> List[Tuple[str, float]]:
+    def standard_pipeline_iteration() -> List[Tuple[str, float]]:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         op, inp, inp_scales, dispatch_indices_arg = buffer._preprocess_dispatch(
@@ -328,7 +272,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
             op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        buffer._postprocess_dispatch(
+        recv_x, _, recv_topk_weights, _, dispatch_handle = buffer._postprocess_dispatch(
             op,
             dispatch_output,
             dispatch_weights_local,
@@ -340,42 +284,62 @@ def run(rank: int, args: argparse.Namespace) -> None:
         )
         torch.cuda.synchronize()
         t3 = time.perf_counter()
+
+        combine_src = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+        if combine_src.numel() == 0:
+            raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
+        torch.cuda.synchronize()
+        t4 = time.perf_counter()
+        combine_in, combine_dispatch_indices_arg, combine_weights_local = buffer._preprocess_combine(
+            combine_src,
+            dispatch_handle,
+            recv_topk_weights,
+        )
+        torch.cuda.synchronize()
+        t5 = time.perf_counter()
+        combined_x_stage = buffer.ops.combine(
+            combine_in,
+            combine_weights_local,
+            combine_dispatch_indices_arg,
+        )
+        torch.cuda.synchronize()
+        t6 = time.perf_counter()
+        buffer._postprocess_combine(combined_x_stage)
+        torch.cuda.synchronize()
+        t7 = time.perf_counter()
+
         return [
             ("dispatch.preprocess", t1 - t0),
             ("dispatch.ops", t2 - t1),
             ("dispatch.postprocess", t3 - t2),
-        ]
-
-    def combine_iteration() -> List[Tuple[str, float]]:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        combine_in, dispatch_indices_arg, combine_weights_local = buffer._preprocess_combine(
-            combine_input,
-            dispatch_handle,
-            combine_weights,
-        )
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        combined_x_stage = buffer.ops.combine(combine_in, combine_weights_local, dispatch_indices_arg)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        buffer._postprocess_combine(combined_x_stage)
-        torch.cuda.synchronize()
-        t3 = time.perf_counter()
-        return [
-            ("combine.preprocess", t1 - t0),
-            ("combine.ops", t2 - t1),
-            ("combine.postprocess", t3 - t2),
+            ("combine.preprocess", t5 - t4),
+            ("combine.ops", t6 - t5),
+            ("combine.postprocess", t7 - t6),
         ]
 
     breakdown_results: List[Tuple[str, float]] = []
-    breakdown_results.extend(measure_breakdown(dispatch_iteration, args.iters, args.warmup_iters))
-    breakdown_results.extend(measure_breakdown(combine_iteration, args.iters, args.warmup_iters))
+    standard_breakdown = measure_breakdown(standard_pipeline_iteration, args.iters, args.warmup_iters)
+    breakdown_results.extend(standard_breakdown)
+    standard_totals = aggregate_stage_totals(
+        standard_breakdown,
+        {
+            "dispatch.total": [
+                "dispatch.preprocess",
+                "dispatch.ops",
+                "dispatch.postprocess",
+            ],
+            "combine.total": [
+                "combine.preprocess",
+                "combine.ops",
+                "combine.postprocess",
+            ],
+        },
+    )
 
     if not args.skip_low_latency:
         ll_use_fp8 = False
 
-        def low_latency_dispatch_iteration() -> List[Tuple[str, float]]:
+        def low_latency_pipeline_iteration() -> List[Tuple[str, float]]:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             dispatch_arg = Buffer._per_token_cast_to_fp8(tokens) if ll_use_fp8 else tokens
@@ -391,7 +355,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
                 op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
             torch.cuda.synchronize()
             t2 = time.perf_counter()
-            buffer._postprocess_low_latency_dispatch(
+            ll_recv_x, _, ll_handle = buffer._postprocess_low_latency_dispatch(
                 dispatch_output,
                 dispatch_indices,
                 dispatch_scales,
@@ -402,21 +366,18 @@ def run(rank: int, args: argparse.Namespace) -> None:
             )
             torch.cuda.synchronize()
             t3 = time.perf_counter()
-            return [
-                ("low_latency_dispatch.preprocess", t1 - t0),
-                ("low_latency_dispatch.ops", t2 - t1),
-                ("low_latency_dispatch.postprocess", t3 - t2),
-            ]
+            ll_tensor = ll_recv_x if isinstance(ll_recv_x, torch.Tensor) else ll_recv_x[0]
+            if ll_tensor.numel() == 0:
+                raise RuntimeError("Low-latency dispatch produced zero tokens; adjust gating inputs")
 
-        def low_latency_combine_iteration() -> List[Tuple[str, float]]:
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            t4 = time.perf_counter()
             rec_output, dispatch_weights_local, dispatch_indices_arg = buffer._preprocess_low_latency_combine(
-                ll_compute_input,
+                ll_tensor,
                 ll_handle,
             )
             torch.cuda.synchronize()
-            t1 = time.perf_counter()
+            t5 = time.perf_counter()
             buffer.ops.combine(
                 rec_output,
                 dispatch_weights_local,
@@ -425,21 +386,42 @@ def run(rank: int, args: argparse.Namespace) -> None:
                 warp_per_block=16,
             )
             torch.cuda.synchronize()
-            t2 = time.perf_counter()
-            t3 = t2
+            t6 = time.perf_counter()
+            t7 = t6
             return [
-                ("low_latency_combine.preprocess", t1 - t0),
-                ("low_latency_combine.ops", t2 - t1),
-                ("low_latency_combine.postprocess", t3 - t2),
+                ("low_latency_dispatch.preprocess", t1 - t0),
+                ("low_latency_dispatch.ops", t2 - t1),
+                ("low_latency_dispatch.postprocess", t3 - t2),
+                ("low_latency_combine.preprocess", t5 - t4),
+                ("low_latency_combine.ops", t6 - t5),
+                ("low_latency_combine.postprocess", t7 - t6),
             ]
 
-        breakdown_results.extend(measure_breakdown(low_latency_dispatch_iteration, args.iters, args.warmup_iters))
-        if ll_compute_input is not None:
-            breakdown_results.extend(measure_breakdown(low_latency_combine_iteration, args.iters, args.warmup_iters))
+        ll_breakdown = measure_breakdown(low_latency_pipeline_iteration, args.iters, args.warmup_iters)
+        breakdown_results.extend(ll_breakdown)
+        ll_totals = aggregate_stage_totals(
+            ll_breakdown,
+            {
+                "low_latency_dispatch.total": [
+                    "low_latency_dispatch.preprocess",
+                    "low_latency_dispatch.ops",
+                    "low_latency_dispatch.postprocess",
+                ],
+                "low_latency_combine.total": [
+                    "low_latency_combine.preprocess",
+                    "low_latency_combine.ops",
+                    "low_latency_combine.postprocess",
+                ],
+            },
+        )
+    else:
+        ll_totals = []
 
     local_results: List[Tuple[str, float]] = []
     for name, fn in benchmarks:
         local_results.append(benchmark_op(name, fn, args.iters, args.warmup_iters))
+    local_results.extend(standard_totals)
+    local_results.extend(ll_totals)
     local_results.extend(breakdown_results)
 
     gather_and_print(local_results)
