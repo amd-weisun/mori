@@ -446,9 +446,9 @@ class Buffer:
         """
         profile_ctx = self._profile_start("combine")
 
-        dtype = x.dtype
-        hidden_dim = x.size(1)
-        op = self._get_op(dtype, hidden_dim)
+        # dtype = x.dtype
+        # hidden_dim = x.size(1)
+        op = self.ops
         
         # Retrieve indices from handle
         if not handle or len(handle) < 1:
@@ -551,27 +551,27 @@ class Buffer:
         
         recv_count = dispatch_recv_num_token[0].item()
         
-        if self.use_gpu_ll_layout_transform:
-            packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
-                dispatch_output,
-                dispatch_indices,
-                self.config,
-                recv_count,
-                dispatch_scales
-            )
-        else:
-            packed_input, sorted_indices, expert_counts, packed_scales = Buffer._transform_dispatch_output(
-                dispatch_output,
-                dispatch_indices,
-                self.config,
-                recv_count,
-                dispatch_scales
-            )
+        # if self.use_gpu_ll_layout_transform:
+        packed_input, sorted_indices, expert_counts, packed_scales = mori.transform_dispatch_output_gpu(
+            dispatch_output,
+            dispatch_indices,
+            self.config,
+            recv_count,
+            dispatch_scales
+        )
+        # else:
+        #     packed_input, sorted_indices, expert_counts, packed_scales = Buffer._transform_dispatch_output(
+        #         dispatch_output,
+        #         dispatch_indices,
+        #         self.config,
+        #         recv_count,
+        #         dispatch_scales
+        #     )
 
 
         recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
         
-        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights, packed_scales)
+        new_handle = (sorted_indices, expert_counts, recv_count, dispatch_weights, packed_scales, dispatch_indices_arg)
 
         self._profile_finish(profile_ctx)
         return recv_x, expert_counts, new_handle, EventOverlap(), None
@@ -593,22 +593,19 @@ class Buffer:
         recv_count = handle[2]
         dispatch_weights = handle[3]
         dispatch_scales = handle[4]
+        topk_idx = handle[5]
         # recv_topk_weights = handle[3]
-        if self.use_gpu_ll_layout_transform:
-            rec_output = mori.inverse_transform_dispatch_output_gpu(
-                    x, sorted_indices, expert_counts, recv_count
-            )
-        else:
-            rec_output = Buffer._inverse_transform_dispatch_output(
+        # if self.use_gpu_ll_layout_transform:
+        rec_output = mori.inverse_transform_dispatch_output_gpu(
                 x, sorted_indices, expert_counts, recv_count
-            )
+        )
+        # else:
+        #     rec_output = Buffer._inverse_transform_dispatch_output(
+        #         x, sorted_indices, expert_counts, recv_count
+        #     )
 
-        dtype = rec_output.dtype
-        hidden_dim = rec_output.size(1)
-        op = self._get_op(dtype, hidden_dim)
+        op = self.ops
 
-
-        topk_idx = topk_idx.to(dtype=torch.int32)
 
 
         self._profile_mark_core_start(profile_ctx, self.device)
@@ -619,7 +616,6 @@ class Buffer:
             topk_idx,
             block_num=self.config.block_num,
             warp_per_block=16,
-            call_reset = True,
         )
         self._profile_mark_post_start(profile_ctx)
 
