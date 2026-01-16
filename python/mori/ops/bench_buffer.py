@@ -98,16 +98,109 @@ def gather_and_print(results: List[Tuple[str, float]]) -> None:
     dist.all_gather_object(collected, results)
     if dist.get_rank() != 0:
         return
+
     summary: Dict[str, List[float]] = {}
     for rank_results in collected:
         if not rank_results:
             continue
         for name, latency in rank_results:
             summary.setdefault(name, []).append(latency)
-    print("\n=== Buffer Benchmark (ms) ===")
-    for name, values in summary.items():
+
+    def get_stats(name: str) -> Optional[Dict[str, float]]:
+        values = summary.get(name)
+        if not values:
+            return None
         avg = sum(values) / len(values)
-        print(f"{name:45s} avg={avg:8.3f} min={min(values):8.3f} max={max(values):8.3f}")
+        return {
+            "avg": avg,
+            "min": min(values),
+            "max": max(values),
+        }
+
+    def print_metric(label: str, stats: Dict[str, float]) -> None:
+        print(
+            f"{label:45s} avg={stats['avg']:8.3f} min={stats['min']:8.3f} max={stats['max']:8.3f}"
+        )
+
+    def print_stage_group(title: str, keys: Dict[str, str]) -> None:
+        total_stats = get_stats(keys["total"])
+        if not total_stats:
+            return
+        total_avg = total_stats["avg"]
+        print(f"\n--- {title} ---")
+        for phase_key, phase_label in (
+            ("pre", "Preprocess"),
+            ("ops", "Ops"),
+            ("post", "Postprocess"),
+        ):
+            phase_stats = get_stats(keys[phase_key])
+            if not phase_stats:
+                continue
+            pct = (phase_stats["avg"] / total_avg * 100.0) if total_avg else 0.0
+            print(
+                f"  {phase_label:12s}: {phase_stats['avg']:6.3f} ms ({pct:5.1f}%)"
+            )
+        print(
+            f"  Total        : {total_stats['avg']:6.3f} ms (min={total_stats['min']:6.3f} max={total_stats['max']:6.3f})"
+        )
+
+    helper_metrics = [
+        ("transform_dispatch_output_gpu", "transform_dispatch_output_gpu"),
+        ("_reorder_mori_dispatch_outputs", "_reorder_mori_dispatch_outputs"),
+        ("_revert_mori_dispatch_outputs", "_revert_mori_dispatch_outputs"),
+        ("inverse_transform_dispatch_output_gpu", "inverse_transform_dispatch_output_gpu"),
+    ]
+
+    printed_header = False
+    for key, label in helper_metrics:
+        stats = get_stats(key)
+        if not stats:
+            continue
+        if not printed_header:
+            print("\n=== Helper Ops (ms) ===")
+            printed_header = True
+        print_metric(label, stats)
+
+    print("\n=== Standard Dispatch/Combine ===")
+    print_stage_group(
+        "Dispatch",
+        {
+            "total": "dispatch.total",
+            "pre": "dispatch.preprocess",
+            "ops": "dispatch.ops",
+            "post": "dispatch.postprocess",
+        },
+    )
+    print_stage_group(
+        "Combine",
+        {
+            "total": "combine.total",
+            "pre": "combine.preprocess",
+            "ops": "combine.ops",
+            "post": "combine.postprocess",
+        },
+    )
+
+    if get_stats("low_latency_dispatch.total") or get_stats("low_latency_combine.total"):
+        print("\n=== Low-Latency Dispatch/Combine ===")
+        print_stage_group(
+            "LL Dispatch",
+            {
+                "total": "low_latency_dispatch.total",
+                "pre": "low_latency_dispatch.preprocess",
+                "ops": "low_latency_dispatch.ops",
+                "post": "low_latency_dispatch.postprocess",
+            },
+        )
+        print_stage_group(
+            "LL Combine",
+            {
+                "total": "low_latency_combine.total",
+                "pre": "low_latency_combine.preprocess",
+                "ops": "low_latency_combine.ops",
+                "post": "low_latency_combine.postprocess",
+            },
+        )
 
 
 def make_topk_indices(num_tokens: int, topk: int, experts_per_rank: int, total_experts: int, rank: int, device: torch.device) -> torch.Tensor:
