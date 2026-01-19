@@ -8,8 +8,8 @@
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/core/core.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
-#include "mori/ops/dispatch_combine/intranode.hpp"
-#include "mori/ops/dispatch_combine/internode_v1.hpp"
+#include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/internode_v1.hpp"
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 
@@ -69,7 +69,7 @@ __device__ inline void PackLocalToken(EpDispatchCombineArgs<T>& args, int tokenI
 }
 
 // Pack local pairs into fused layout (expert-major order)
-INSTANTIATE(float)
+template <typename T>
 __device__ inline void PackLocalPairs(EpDispatchCombineArgs<T>& args, int totalRecvTokenNum) {
   const EpDispatchCombineConfig& config = args.config;
   int laneId = threadIdx.x & (warpSize - 1);
@@ -207,20 +207,6 @@ INSTANTIATE(__hip_fp8_e4m3)
 #endif
 
 #undef INSTANTIATE
-
-}  // namespace moe
-}  // namespace mori
-INSTANTIATE(hip_bfloat16)
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-INSTANTIATE(__hip_fp8_e4m3_fnuz)
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-INSTANTIATE(__hip_fp8_e4m3)
-#endif
-
-#undef INSTANTIATE
-
-}  // namespace ll_fused
 
 }  // namespace moe
 }  // namespace mori

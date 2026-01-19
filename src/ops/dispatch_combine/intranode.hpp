@@ -30,6 +30,13 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
+// Low-latency fused kernel forward declarations (implemented in ll_fused_kernels.cpp)
+template <typename T>
+__global__ void EpDispatchIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpCombineIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -70,15 +77,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 template <typename T>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
-template <typename T>
-__global__ void EpDispatchIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
-
-
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
-template <typename T>
-__global__ void EpCombineIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
-
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = thdId / warpSize;
   int warpNum = blockDim.x / warpSize;
