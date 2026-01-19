@@ -39,6 +39,21 @@ using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
 
+namespace {
+
+template <typename T>
+constexpr bool IsFp8Type() {
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) return true;
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3>) return true;
+#endif
+  return false;
+}
+
+}  // namespace
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
@@ -303,18 +318,6 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
        config.numExpertPerRank) *
       sizeof(index_t);
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
-  struct IsFp8Type {
-    template <typename T>
-    static constexpr bool Value() {
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-      if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) return true;
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-      if constexpr (std::is_same_v<T, __hip_fp8_e4m3>) return true;
-#endif
-      return false;
-    }
-  };
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -328,7 +331,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         } else if (kernelType == KernelType::InterNodeV1LL) {
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LLFused) {
-          if constexpr (IsFp8Type::Value<DataT>()) {
+          if constexpr (IsFp8Type<DataT>()) {
             EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
           } else {
             EpDispatchInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
@@ -336,7 +339,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNodeLLFused) {
-          if constexpr (IsFp8Type::Value<DataT>()) {
+          if constexpr (IsFp8Type<DataT>()) {
             EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
           } else {
             EpDispatchIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
@@ -354,7 +357,6 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -371,7 +373,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LLFused) {
           assert(config.useExternalInpBuffer);
-          if constexpr (IsFp8Type::Value<DataT>()) {
+          if constexpr (IsFp8Type<DataT>()) {
             EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
           } else {
             HIP_RUNTIME_CHECK(hipMemsetAsync(
@@ -384,7 +386,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNodeLLFused) {
-          if constexpr (IsFp8Type::Value<DataT>()) {
+          if constexpr (IsFp8Type<DataT>()) {
             EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
           } else {
             HIP_RUNTIME_CHECK(hipMemsetAsync(
