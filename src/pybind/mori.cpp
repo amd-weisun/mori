@@ -140,12 +140,10 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                torch::TensorOptions()
                  .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                  .device(torch::kCUDA));
-    return pybind11::make_tuple(out,
-                  outWeights.has_value() ? pybind11::cast(*outWeights)
-                               : pybind11::none(),
-                  outScales.has_value() ? pybind11::cast(*outScales)
-                              : pybind11::none(),
-                  outIndices, totalRecvTokenNum, pybind11::none());
+    auto weights_obj = weightPtr ? pybind11::cast(outWeights) : pybind11::none();
+    auto scales_obj = outScales.has_value() ? pybind11::cast(*outScales) : pybind11::none();
+    return pybind11::make_tuple(out, weights_obj, scales_obj, outIndices, totalRecvTokenNum,
+                  pybind11::none());
 }
 
 // TODO: translate data type
