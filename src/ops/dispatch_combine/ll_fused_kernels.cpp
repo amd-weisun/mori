@@ -101,6 +101,7 @@ __device__ inline void PackLocalPairs(EpDispatchCombineArgs<T>& args, int totalR
   int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
   int warpNum = (blockDim.x * gridDim.x) / warpSize;
   int capacity = config.maxNumInpTokenPerRank;
+  int maxPairs = config.numExpertPerRank * capacity;
 
   for (int tokenId = warpId; tokenId < totalRecvTokenNum; tokenId += warpNum) {
     for (int e = laneId; e < config.numExpertPerToken; e += warpSize) {
@@ -112,6 +113,11 @@ __device__ inline void PackLocalPairs(EpDispatchCombineArgs<T>& args, int totalR
           args.lowLatencyExpertCountMemObj->template GetAs<index_t*>() + expertId, 1);
       if (slotId >= capacity) continue;
       int pairIdx = atomicAdd(args.lowLatencyPairCountMemObj->template GetAs<index_t*>(), 1);
+      if (pairIdx >= maxPairs) {
+        // Cap the counter to avoid out-of-bounds consumers
+        atomicExch(args.lowLatencyPairCountMemObj->template GetAs<index_t*>(), maxPairs);
+        continue;
+      }
       PackLocalToken(args, tokenId, e, slotId, pairIdx, capacity);
     }
   }
