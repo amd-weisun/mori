@@ -357,6 +357,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
