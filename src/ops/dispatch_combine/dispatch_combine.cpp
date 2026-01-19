@@ -317,6 +317,20 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
+
+    auto zeroLowLatencyMetadata = [&](const auto& args) {
+    size_t expertCountBytes = static_cast<size_t>(config.numExpertPerRank) * sizeof(index_t);
+    size_t sortedIdxBytes = static_cast<size_t>(config.numExpertPerRank) *
+                config.maxNumInpTokenPerRank * sizeof(index_t);
+    HIP_RUNTIME_CHECK(
+      hipMemsetAsync(args.lowLatencyExpertCountMemObj->localPtr, 0, expertCountBytes, stream));
+    HIP_RUNTIME_CHECK(
+      hipMemsetAsync(args.lowLatencyPairCountMemObj->localPtr, 0, sizeof(index_t), stream));
+    // Use 0xFF to set sentinel -1 for sorted token indices
+    HIP_RUNTIME_CHECK(
+      hipMemsetAsync(args.lowLatencySortedTokenIdxMemObj->localPtr, 0xFF, sortedIdxBytes, stream));
+    };
+
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
       [&](auto&& args) {
@@ -334,6 +348,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           if constexpr (IsFp8Type<DataT>()) {
             EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
           } else {
+            zeroLowLatencyMetadata(args);
             EpDispatchInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else if (kernelType == KernelType::IntraNode) {
@@ -342,6 +357,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           if constexpr (IsFp8Type<DataT>()) {
             EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
           } else {
+            zeroLowLatencyMetadata(args);
             EpDispatchIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else {
