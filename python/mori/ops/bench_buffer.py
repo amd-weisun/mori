@@ -281,78 +281,8 @@ def run(rank: int, args: argparse.Namespace) -> None:
 
     dist.barrier()
 
-    manual = capture_op_dispatch(buffer, tokens, topk_weights, dispatch_indices_arg)
-    if manual["recv_count"] == 0:
-        raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
-    transform_cache = mori.transform_dispatch_output_gpu(
-        manual["full_output"],
-        manual["full_indices"],
-        buffer.config,
-        manual["recv_count"],
-        manual["full_scales"],
-    )
-    reorder_out = buffer._reorder_mori_dispatch_outputs(
-        manual["truncated_output"],
-        manual["truncated_indices"],
-        manual["truncated_weights"],
-        manual["src_pos"],
-        manual["truncated_scales"],
-    )
-    if reorder_out is None:
-        raise RuntimeError("Reorder guard triggered; adjust token/expert settings")
-    reordered_x, _, reordered_idx, reordered_weights = reorder_out
-
     torch.cuda.synchronize()
     dist.barrier()
-
-    benchmarks: List[Tuple[str, Callable[[], None]]] = []
-
-    benchmarks.append(
-        (
-            "transform_dispatch_output_gpu",
-            lambda: mori.transform_dispatch_output_gpu(
-                manual["full_output"],
-                manual["full_indices"],
-                buffer.config,
-                manual["recv_count"],
-                manual["full_scales"],
-            ),
-        )
-    )
-    benchmarks.append(
-        (
-            "_reorder_mori_dispatch_outputs",
-            lambda: buffer._reorder_mori_dispatch_outputs(
-                manual["truncated_output"],
-                manual["truncated_indices"],
-                manual["truncated_weights"],
-                manual["src_pos"],
-                manual["truncated_scales"],
-            ),
-        )
-    )
-    benchmarks.append(
-        (
-            "_revert_mori_dispatch_outputs",
-            lambda: buffer._revert_mori_dispatch_outputs(
-                reordered_x,
-                reordered_idx,
-                reordered_weights,
-                manual["src_pos"],
-            ),
-        )
-    )
-    benchmarks.append(
-        (
-            "inverse_transform_dispatch_output_gpu",
-            lambda: mori.inverse_transform_dispatch_output_gpu(
-                transform_cache[0],
-                transform_cache[1],
-                transform_cache[2],
-                manual["recv_count"],
-            ),
-        )
-    )
     if not args.low_latency:
 
         def standard_pipeline_iteration() -> List[Tuple[str, float]]:
@@ -518,9 +448,85 @@ def run(rank: int, args: argparse.Namespace) -> None:
     else:
         ll_totals = []
 
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    helper_results: List[Tuple[str, float]] = []
+    manual = capture_op_dispatch(buffer, tokens, topk_weights, dispatch_indices_arg)
+    if manual["recv_count"] == 0:
+        raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
+    transform_cache = mori.transform_dispatch_output_gpu(
+        manual["full_output"],
+        manual["full_indices"],
+        buffer.config,
+        manual["recv_count"],
+        manual["full_scales"],
+    )
+    reorder_out = buffer._reorder_mori_dispatch_outputs(
+        manual["truncated_output"],
+        manual["truncated_indices"],
+        manual["truncated_weights"],
+        manual["src_pos"],
+        manual["truncated_scales"],
+    )
+    if reorder_out is None:
+        raise RuntimeError("Reorder guard triggered; adjust token/expert settings")
+    reordered_x, _, reordered_idx, reordered_weights = reorder_out
+
+    helper_benchmarks: List[Tuple[str, Callable[[], None]]] = [
+        (
+            "transform_dispatch_output_gpu",
+            lambda: mori.transform_dispatch_output_gpu(
+                manual["full_output"],
+                manual["full_indices"],
+                buffer.config,
+                manual["recv_count"],
+                manual["full_scales"],
+            ),
+        ),
+        (
+            "_reorder_mori_dispatch_outputs",
+            lambda: buffer._reorder_mori_dispatch_outputs(
+                manual["truncated_output"],
+                manual["truncated_indices"],
+                manual["truncated_weights"],
+                manual["src_pos"],
+                manual["truncated_scales"],
+            ),
+        ),
+        (
+            "_revert_mori_dispatch_outputs",
+            lambda: buffer._revert_mori_dispatch_outputs(
+                reordered_x,
+                reordered_idx,
+                reordered_weights,
+                manual["src_pos"],
+            ),
+        ),
+        (
+            "inverse_transform_dispatch_output_gpu",
+            lambda: mori.inverse_transform_dispatch_output_gpu(
+                transform_cache[0],
+                transform_cache[1],
+                transform_cache[2],
+                manual["recv_count"],
+            ),
+        ),
+    ]
+
+    for name, fn in helper_benchmarks:
+        helper_results.append(benchmark_op(name, fn, args.iters, args.warmup_iters))
+
+    del manual
+    del transform_cache
+    del reorder_out
+    del reordered_x
+    del reordered_idx
+    del reordered_weights
+    torch.cuda.empty_cache()
+
     local_results: List[Tuple[str, float]] = []
-    for name, fn in benchmarks:
-        local_results.append(benchmark_op(name, fn, args.iters, args.warmup_iters))
+    local_results.extend(helper_results)
     local_results.extend(standard_totals)
     local_results.extend(ll_totals)
     local_results.extend(breakdown_results)
