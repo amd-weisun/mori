@@ -30,6 +30,112 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
+// Shared body so fused kernels can reuse dispatch logic without launching another kernel
+template <typename T>
+__device__ inline void EpDispatchIntraNodeKernelBody(EpDispatchCombineArgs<T>& args) {
+  const EpDispatchCombineConfig& config = args.config;
+  int thdId = threadIdx.x;
+  int thdNum = blockDim.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  int myPe = config.rank;
+  int npes = config.worldSize;
+
+  size_t maxNumTokensToSend = config.MaxNumTokensToSend();
+
+  if (args.tokenIndices && args.inpTokenBuf) {
+    // Phase1: send token
+    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
+         i += globalWarpNum) {
+      index_t srcTokId = i / config.numExpertPerToken;
+      index_t destExpert = args.tokenIndices[i];
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t destTokId = 0;
+
+      // Deduplicate
+      assert(config.numExpertPerToken < warpSize);
+      int condition = 0;
+      if (laneId < (i % config.numExpertPerToken)) {
+        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
+                               config.numExpertPerRank);
+      }
+      if (__any(condition)) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
+        continue;
+      }
+
+      if (laneId == 0) {
+        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        atomicAdd(args.destPeTokenCounter + destPe, 1);
+        args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+            myPe * config.maxNumInpTokenPerRank + srcTokId;
+      }
+      destTokId = __shfl(destTokId, 0);
+
+      if (laneId < config.numExpertPerToken) {
+        if (args.weightsBuf) {
+          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+              destPe)[destTokId * config.numExpertPerToken + laneId] =
+              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+        }
+        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+            destPe)[destTokId * config.numExpertPerToken + laneId] =
+            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+      }
+
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+        index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
+        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+        core::WarpCopy(
+            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+      }
+
+      index_t srcTokOffset = srcTokId * config.hiddenDim;
+      index_t destTokOffset = destTokId * config.hiddenDim;
+      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+                     args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+    }
+  }
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+
+  // Send token num & token to expert mapping to other ranks
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      args.dispatchGridBarrier[0] = 0;
+
+      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+    }
+  }
+
+  // Phase 2: recv token
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      index_t* signal = recvTokenNums + destPe;
+      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      core::AtomicStoreRelaxedSystem(signal, 0);
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+
+      args.destPeTokenCounter[destPe] = 0;
+    }
+
+    if (laneId == 0) {
+      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+    }
+  }
+}
+
 // Low-latency fused kernel forward declarations (implemented in ll_fused_kernels.cpp)
 template <typename T>
 __global__ void EpDispatchIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
@@ -76,121 +182,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-
-  size_t maxNumTokensToSend = config.MaxNumTokensToSend();
-
-  if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp compute token offset on destinition PE
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-         i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t destTokId = 0;
-
-      // Deduplicate
-      assert(config.numExpertPerToken < warpSize);
-      int condition = 0;
-      if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                               config.numExpertPerRank);
-      }
-      if (__any(condition)) {
-        // Indicate that this token is already sent to the destination PE by setting an overflow
-        // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
-        continue;
-      }
-
-      if (laneId == 0) {
-        // decide token id in dest pe
-        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
-
-        // TODO: use a switch to control the writing of this buffer, should only turn on for testing
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-            myPe * config.maxNumInpTokenPerRank + srcTokId;
-      }
-      destTokId = __shfl(destTokId, 0);
-
-      // Write weights and indices
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-        }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-      }
-
-      // Write scales
-      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
-        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
-        core::WarpCopy(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-      }
-
-      index_t srcTokOffset = srcTokId * config.hiddenDim;
-      index_t destTokOffset = destTokId * config.hiddenDim;
-      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, config.hiddenDim);
-    }
-  }
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-
-  // Send token num & token to expert mapping to other ranks
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-      args.dispatchGridBarrier[0] = 0;
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-    }
-  }
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
-      // reset local counter
-      args.destPeTokenCounter[destPe] = 0;
-      // args.dispatchGridBarrier[destPe] = 0;
-    }
-
-    // reset counter
-    if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    }
-  }
+  EpDispatchIntraNodeKernelBody(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

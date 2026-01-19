@@ -456,7 +456,7 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T>
-__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+__device__ inline void EpDispatchInterNodeV1KernelLowLatencyBody(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   if (blockId < config.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, false>(args);
@@ -465,6 +465,11 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
     v1::DispatchIntraNode(args);
   }
   v1::DispatchSync(args);
+}
+
+template <typename T>
+__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1KernelLowLatencyBody(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -767,6 +772,12 @@ template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
 #endif
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
+
+// Explicit instantiation for low-latency body used by fused kernels
+template __device__ void EpDispatchInterNodeV1KernelLowLatencyBody<float>(
+  EpDispatchCombineArgs<float>& args);
+template __device__ void EpDispatchInterNodeV1KernelLowLatencyBody<hip_bfloat16>(
+  EpDispatchCombineArgs<hip_bfloat16>& args);
 
 template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);

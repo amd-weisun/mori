@@ -18,6 +18,21 @@ namespace moe {
 
 using namespace mori::core;
 
+// Lightweight AtomicAdd helpers for fused combine
+template <typename T>
+__device__ inline void AtomicAdd(T* address, T val) {
+  atomicAdd(address, val);
+}
+
+template <>
+__device__ inline void AtomicAdd<__hip_bfloat16>(__hip_bfloat16* address, __hip_bfloat16 val) {
+#if defined(__HIP_PLATFORM_AMD__)
+  unsafeAtomicAdd(address, val);
+#else
+  atomicAdd(address, val);
+#endif
+}
+
 // Zero expert counts and pair counter
 template <typename T>
 __device__ inline void ZeroFusedMetadata(EpDispatchCombineArgs<T>& args) {
@@ -96,7 +111,7 @@ __device__ inline void PackLocalPairs(EpDispatchCombineArgs<T>& args, int totalR
 
 template <typename T>
 __global__ void EpDispatchIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeKernel(args);
+  EpDispatchIntraNodeKernelBody(args);
   __syncthreads();
   if (blockIdx.x == 0) ZeroFusedMetadata(args);
   __syncthreads();
@@ -145,7 +160,7 @@ __global__ void EpCombineIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args) {
 
 template <typename T>
 __global__ void EpDispatchInterNodeV1KernelLLFused(EpDispatchCombineArgs<T> args) {
-  EpDispatchInterNodeV1KernelLowLatency(args);
+  EpDispatchInterNodeV1KernelLowLatencyBody(args);
   __syncthreads();
   if (blockIdx.x == 0) ZeroFusedMetadata(args);
   __syncthreads();
@@ -199,12 +214,6 @@ __global__ void EpCombineInterNodeV1KernelLLFused(EpDispatchCombineArgs<T> args)
 
 INSTANTIATE(float)
 INSTANTIATE(hip_bfloat16)
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-INSTANTIATE(__hip_fp8_e4m3_fnuz)
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-INSTANTIATE(__hip_fp8_e4m3)
-#endif
 
 #undef INSTANTIATE
 
