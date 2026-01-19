@@ -730,16 +730,20 @@ class Buffer:
         # Use the same mask to gather the source values and the corresponding token ids
         flat_tensor = packed_tensor.reshape(experts * capacity, hidden_dim).index_select(0, linear_indices)
 
-        # sorted_indices contains token ids for each slot; mask/select the valid ones and trim to recv_count
+        # sorted_indices contains token ids for each slot; mask/select the valid ones
         sorted_matrix = sorted_indices.view(experts, capacity)
         valid_sorted = sorted_matrix[mask]
 
-        # Clamp to the available data to avoid mismatch
-        available = min(flat_tensor.size(0), valid_sorted.numel(), recv_count)
+        # Guard against invalid token ids and oversized targets
+        max_len = recv_count
+        valid_mask = (valid_sorted >= 0) & (valid_sorted < max_len)
+        valid_sorted = valid_sorted[valid_mask]
+
+        available = min(flat_tensor.size(0), valid_sorted.numel())
         flat_tensor = flat_tensor[:available]
         valid_sorted = valid_sorted[:available]
 
-        rec_output = packed_tensor.new_empty((available, hidden_dim))
+        rec_output = packed_tensor.new_empty((max_len, hidden_dim))
         rec_output.index_copy_(
             0,
             valid_sorted.to(torch.long).to(device=device, non_blocking=False, copy=False),
