@@ -33,6 +33,16 @@ __device__ inline void AtomicAdd<__hip_bfloat16>(__hip_bfloat16* address, __hip_
 #endif
 }
 
+// Ensure hip_bfloat16 alias resolves to a specialization
+template <>
+__device__ inline void AtomicAdd<hip_bfloat16>(hip_bfloat16* address, hip_bfloat16 val) {
+#if defined(__HIP_PLATFORM_AMD__)
+  unsafeAtomicAdd(reinterpret_cast<__hip_bfloat16*>(address), static_cast<__hip_bfloat16>(val));
+#else
+  atomicAdd(reinterpret_cast<__hip_bfloat16*>(address), static_cast<__hip_bfloat16>(val));
+#endif
+}
+
 // Zero expert counts and pair counter
 template <typename T>
 __device__ inline void ZeroFusedMetadata(EpDispatchCombineArgs<T>& args) {
