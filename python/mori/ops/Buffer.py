@@ -36,9 +36,11 @@ class Buffer:
     _printed_warnings = set()
     kernel_type_map = {
         "intra": EpDispatchCombineKernelType.IntraNode,
+        "intra_ll_fused": EpDispatchCombineKernelType.IntraNodeLLFused,
         "v0": EpDispatchCombineKernelType.InterNode,
         "v1": EpDispatchCombineKernelType.InterNodeV1,
         "v1_ll": EpDispatchCombineKernelType.InterNodeV1LL,
+        "v1_ll_fused": EpDispatchCombineKernelType.InterNodeV1LLFused,
     }
     @classmethod
     def _log_warning_once(cls, msg: str):
@@ -114,7 +116,10 @@ class Buffer:
                 if self.gpu_per_node and (self.group_size / self.gpu_per_node) > 1:
                     kernel_type = EpDispatchCombineKernelType.InterNodeV1
                     if self.low_latency_mode:
-                        kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
+                        kernel_type = EpDispatchCombineKernelType.InterNodeV1LLFused
+                else:
+                    if self.low_latency_mode:
+                        kernel_type = EpDispatchCombineKernelType.IntraNodeLLFused
 
             # TODO: These parameters might need to be tuned or exposed
             self.config = EpDispatchCombineConfig(
@@ -297,8 +302,13 @@ class Buffer:
             num_tokens_per_rank,
         )
 
-        dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
-            op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+        dispatch_results = op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+
+        if len(dispatch_results) == 6:  # fused path
+            dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token, dispatch_expert_counts = dispatch_results
+        else:
+            dispatch_output, dispatch_weights, dispatch_scales, dispatch_indices, dispatch_recv_num_token = dispatch_results
+            dispatch_expert_counts = None
 
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, new_handle = \
             self._postprocess_dispatch(
@@ -426,6 +436,7 @@ class Buffer:
             dispatch_weights,
             dispatch_indices_arg,
             use_fp8,
+            dispatch_expert_counts,
         )
 
         return recv_x, expert_counts, new_handle, EventOverlap(), None
@@ -440,6 +451,22 @@ class Buffer:
         Low latency combine.
         Not fully supported with the same API.
         """
+        fused = self.config.kernel_type in (
+            EpDispatchCombineKernelType.IntraNodeLLFused,
+            EpDispatchCombineKernelType.InterNodeV1LLFused,
+        )
+
+        if fused:
+            op = self.ops
+            combine_output, combine_output_weight = op.combine(
+                x,
+                None,
+                topk_idx.to(dtype=torch.int32),
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
+            return combine_output, EventOverlap(), None
+
         rec_output, dispatch_weights, dispatch_indices_arg = self._preprocess_low_latency_combine(
             x,
             handle,
@@ -598,7 +625,29 @@ class Buffer:
         dispatch_weights: Optional[torch.Tensor],
         dispatch_indices_arg: torch.Tensor,
         use_fp8: bool,
+        dispatch_expert_counts: Optional[torch.Tensor],
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, Tuple]:
+        fused = self.config.kernel_type in (
+            EpDispatchCombineKernelType.IntraNodeLLFused,
+            EpDispatchCombineKernelType.InterNodeV1LLFused,
+        )
+
+        if fused:
+            recv_count = max(0, self._normalize_recv_num_token(dispatch_recv_num_token))
+            packed_input = dispatch_output
+            packed_scales = dispatch_scales
+            expert_counts = dispatch_expert_counts if dispatch_expert_counts is not None else torch.empty(0, device=packed_input.device, dtype=torch.int32)
+            recv_x = (packed_input, packed_scales) if use_fp8 else packed_input
+            new_handle = (
+                dispatch_indices,  # sorted token idx buffer
+                expert_counts,
+                recv_count,
+                dispatch_weights,
+                packed_scales,
+                dispatch_indices_arg,
+            )
+            return recv_x, expert_counts, new_handle
+
         recv_count = max(0, self._normalize_recv_num_token(dispatch_recv_num_token))
 
         if self.use_gpu_ll_layout_transform:

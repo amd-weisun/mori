@@ -39,6 +39,8 @@ enum KernelType {
   InterNode = 1,
   InterNodeV1 = 2,
   InterNodeV1LL = 3,
+  IntraNodeLLFused = 4,
+  InterNodeV1LLFused = 5,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -184,6 +186,14 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
+  // Low-latency fused layout buffers (symmetric, remote-writable)
+  mori::application::SymmMemObjPtr lowLatencyPackedTokMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPackedScaleMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPackedWeightMemObj;
+  mori::application::SymmMemObjPtr lowLatencySortedTokenIdxMemObj;
+  mori::application::SymmMemObjPtr lowLatencyExpertCountMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPairCountMemObj;
+
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
@@ -270,6 +280,12 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPackedTokMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPackedScaleMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPackedWeightMemObj;
+  mori::application::SymmMemObjPtr lowLatencySortedTokenIdxMemObj;
+  mori::application::SymmMemObjPtr lowLatencyExpertCountMemObj;
+  mori::application::SymmMemObjPtr lowLatencyPairCountMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
@@ -333,6 +349,12 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
   args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
+  args.lowLatencyPackedTokMemObj = handle.lowLatencyPackedTokMemObj;
+  args.lowLatencyPackedScaleMemObj = handle.lowLatencyPackedScaleMemObj;
+  args.lowLatencyPackedWeightMemObj = handle.lowLatencyPackedWeightMemObj;
+  args.lowLatencySortedTokenIdxMemObj = handle.lowLatencySortedTokenIdxMemObj;
+  args.lowLatencyExpertCountMemObj = handle.lowLatencyExpertCountMemObj;
+  args.lowLatencyPairCountMemObj = handle.lowLatencyPairCountMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
   args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;

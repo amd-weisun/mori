@@ -70,9 +70,14 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 template <typename T>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
+template <typename T>
+__global__ void EpDispatchIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
+
 
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
+template <typename T>
+__global__ void EpCombineIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args);
 
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = thdId / warpSize;

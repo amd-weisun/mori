@@ -96,6 +96,36 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
+
+    size_t llPackedTokenBytes = static_cast<size_t>(config.numExpertPerRank) *
+                  config.maxNumInpTokenPerRank * config.hiddenDim *
+                  config.maxTokenTypeSize;
+    lowLatencyPackedTokMemObj =
+      ShmemMallocAndReturnMemObjPtr(llPackedTokenBytes, hipDeviceMallocUncached);
+
+    if ((config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+    size_t llPackedScaleBytes = static_cast<size_t>(config.numExpertPerRank) *
+                  config.maxNumInpTokenPerRank * config.scaleDim *
+                  config.scaleTypeSize;
+    lowLatencyPackedScaleMemObj =
+      ShmemMallocAndReturnMemObjPtr(llPackedScaleBytes, hipDeviceMallocUncached);
+    }
+
+    size_t llPackedWeightBytes =
+      static_cast<size_t>(config.numExpertPerRank) * config.maxNumInpTokenPerRank * sizeof(float);
+    lowLatencyPackedWeightMemObj =
+      ShmemMallocAndReturnMemObjPtr(llPackedWeightBytes, hipDeviceMallocUncached);
+
+    size_t llSortedIdxBytes = static_cast<size_t>(config.numExpertPerRank) *
+                config.maxNumInpTokenPerRank * sizeof(index_t);
+    lowLatencySortedTokenIdxMemObj =
+      ShmemMallocAndReturnMemObjPtr(llSortedIdxBytes, hipDeviceMallocUncached);
+
+    size_t llExpertCountBytes = static_cast<size_t>(config.numExpertPerRank) * sizeof(index_t);
+    lowLatencyExpertCountMemObj =
+      ShmemMallocAndReturnMemObjPtr(llExpertCountBytes, hipDeviceMallocUncached);
+
+    lowLatencyPairCountMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
@@ -111,6 +141,12 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
   ShmemFree(shmemOutIndicesMemObj->localPtr);
+  ShmemFree(lowLatencyPackedTokMemObj->localPtr);
+  if (lowLatencyPackedScaleMemObj.IsValid()) ShmemFree(lowLatencyPackedScaleMemObj->localPtr);
+  ShmemFree(lowLatencyPackedWeightMemObj->localPtr);
+  ShmemFree(lowLatencySortedTokenIdxMemObj->localPtr);
+  ShmemFree(lowLatencyExpertCountMemObj->localPtr);
+  ShmemFree(lowLatencyPairCountMemObj->localPtr);
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
@@ -279,8 +315,12 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeV1LLFused) {
+          EpDispatchInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNodeLLFused) {
+          EpDispatchIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
         }
@@ -309,8 +349,23 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
                    (kernelType == KernelType::InterNodeV1LL)) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeV1LLFused) {
+          assert(config.useExternalInpBuffer);
+          HIP_RUNTIME_CHECK(hipMemsetAsync(
+              args.shmemCombineOutTokMemObj->localPtr, 0,
+              static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
+                  config.maxTokenTypeSize,
+              stream));
+          EpCombineInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNodeLLFused) {
+          HIP_RUNTIME_CHECK(hipMemsetAsync(
+              args.shmemCombineOutTokMemObj->localPtr, 0,
+              static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
+                  config.maxTokenTypeSize,
+              stream));
+          EpCombineIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
         }

@@ -70,37 +70,75 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
 
-  torch::Tensor out =
-      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+    bool fused = (kernelType == mori::moe::KernelType::InterNodeV1LLFused) ||
+           (kernelType == mori::moe::KernelType::IntraNodeLLFused);
 
-  torch::Tensor outWeights = torch::from_blob(
+    if (fused) {
+    auto packed = torch::from_blob(
+      handle.lowLatencyPackedTokMemObj->Get(),
+      {handle.config.numExpertPerRank, handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+      torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+
+    auto packedWeights = torch::from_blob(
+      handle.lowLatencyPackedWeightMemObj->Get(),
+      {handle.config.numExpertPerRank, handle.config.maxNumInpTokenPerRank},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
+
+    std::optional<torch::Tensor> packedScales{std::nullopt};
+    if (scales.has_value() && handle.config.scaleDim > 0) {
+      packedScales = torch::from_blob(
+        handle.lowLatencyPackedScaleMemObj->Get(),
+        {handle.config.numExpertPerRank, handle.config.maxNumInpTokenPerRank, handle.config.scaleDim},
+        torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+    }
+
+    auto sortedIdx = torch::from_blob(
+      handle.lowLatencySortedTokenIdxMemObj->Get(),
+      {handle.config.numExpertPerRank * handle.config.maxNumInpTokenPerRank},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
+
+    auto expertCounts = torch::from_blob(
+      handle.lowLatencyExpertCountMemObj->Get(), {handle.config.numExpertPerRank},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
+
+    auto pairCount = torch::from_blob(
+      handle.lowLatencyPairCountMemObj->Get(), {1},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
+
+    return {packed, packedWeights, packedScales, sortedIdx, pairCount, expertCounts};
+    }
+
+    torch::Tensor out =
+      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
+               {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+               torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+
+    torch::Tensor outWeights = torch::from_blob(
       handle.shmemDispatchOutWeightsMemObj->Get(),
       {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
-  std::optional<torch::Tensor> outScales{std::nullopt};
-  if (scales.has_value() && handle.config.scaleDim > 0) {
+    std::optional<torch::Tensor> outScales{std::nullopt};
+    if (scales.has_value() && handle.config.scaleDim > 0) {
     outScales =
-        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
-                         {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
-                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
-  }
+      torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+               {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
+               torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+    }
 
-  torch::Tensor outIndices =
+    torch::Tensor outIndices =
       torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
+               {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
+               torch::TensorOptions()
+                 .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                 .device(torch::kCUDA));
 
-  torch::Tensor totalRecvTokenNum =
+    torch::Tensor totalRecvTokenNum =
       torch::from_blob(handle.totalRecvTokenNum, {1},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
-  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+               torch::TensorOptions()
+                 .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                 .device(torch::kCUDA));
+    return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
 // TODO: translate data type
@@ -364,6 +402,8 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
+      .value("IntraNodeLLFused", mori::moe::KernelType::IntraNodeLLFused)
+      .value("InterNodeV1LLFused", mori::moe::KernelType::InterNodeV1LLFused)
       .export_values();
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
