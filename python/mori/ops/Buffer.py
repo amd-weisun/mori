@@ -637,7 +637,7 @@ class Buffer:
         sorted_indices, expert_counts, recv_count, dispatch_weights, _, dispatch_indices_arg = handle
 
         if self.use_gpu_ll_layout_transform:
-            rec_output = mori.inverse_transform_dispatch_output_gpu(
+            rec_output = self._reconstruct_low_latency_tokens(
                 x,
                 sorted_indices,
                 expert_counts,
@@ -652,6 +652,40 @@ class Buffer:
             )
 
         return rec_output, dispatch_weights, dispatch_indices_arg
+
+    @staticmethod
+    def _reconstruct_low_latency_tokens(
+        packed_tensor: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        expert_counts: torch.Tensor,
+        recv_count: int,
+    ) -> torch.Tensor:
+        """Rebuilds the original token order from the packed expert layout using index operations."""
+        hidden_dim = packed_tensor.size(-1)
+        if recv_count <= 0:
+            return packed_tensor.new_empty((0, hidden_dim))
+
+        experts, capacity, _ = packed_tensor.shape
+        device = packed_tensor.device
+
+        counts = expert_counts.to(dtype=torch.long, device=device)
+        if counts.numel() != experts:
+            raise ValueError("expert_counts must provide a count per local expert for low-latency combine")
+        counts = torch.clamp(counts, min=0, max=capacity)
+
+        slots = torch.arange(capacity, device=device, dtype=torch.long)
+        expert_ids = torch.arange(experts, device=device, dtype=torch.long).unsqueeze(1)
+        slot_grid = slots.unsqueeze(0).expand(experts, capacity)
+        mask = slots.unsqueeze(0) < counts.unsqueeze(1)
+        linear_indices = (expert_ids * capacity + slot_grid)[mask]
+        if linear_indices.numel() < recv_count:
+            raise ValueError("Low-latency metadata describes fewer tokens than reported recv_count")
+        linear_indices = linear_indices[:recv_count]
+
+        flat_tensor = packed_tensor.reshape(experts * capacity, hidden_dim).index_select(0, linear_indices)
+        rec_output = packed_tensor.new_empty((recv_count, hidden_dim))
+        rec_output.index_copy_(0, sorted_indices.to(torch.long, device=device), flat_tensor)
+        return rec_output
 
     @staticmethod
     def _normalize_recv_num_token(value) -> int:
