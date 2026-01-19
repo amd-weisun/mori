@@ -91,12 +91,19 @@ def aggregate_stage_totals(stage_results: List[Tuple[str, float]], groups: Dict[
     return aggregated
 
 
-def gather_and_print(results: List[Tuple[str, float]]) -> None:
+def gather_and_print(results: List[Tuple[str, float]], args: argparse.Namespace) -> None:
     world = dist.get_world_size()
     collected: List[Optional[List[Tuple[str, float]]]] = [None for _ in range(world)]
     dist.all_gather_object(collected, results)
     if dist.get_rank() != 0:
         return
+
+    print("\n=== Benchmark Settings ===")
+    print(
+        f"num_tokens={args.num_tokens} hidden_dim={args.hidden_dim} total_experts={args.total_experts} "
+        f"topk={args.topk} dtype={args.dtype} iters={args.iters} warmup={args.warmup_iters} "
+        f"use low_latency={args.low_latency}"
+    )
 
     summary: Dict[str, List[float]] = {}
     for rank_results in collected:
@@ -531,7 +538,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
     local_results.extend(ll_totals)
     local_results.extend(breakdown_results)
 
-    gather_and_print(local_results)
+    gather_and_print(local_results, args)
     dist.barrier()
     dist.destroy_process_group()
 
