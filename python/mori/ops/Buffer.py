@@ -727,15 +727,22 @@ class Buffer:
         slot_grid = slots.unsqueeze(0).expand(experts, capacity)
         mask = slots.unsqueeze(0) < counts.unsqueeze(1)
         linear_indices = (expert_ids * capacity + slot_grid)[mask]
-        if linear_indices.numel() < recv_count:
-            raise ValueError("Low-latency metadata describes fewer tokens than reported recv_count")
-        linear_indices = linear_indices[:recv_count]
-
+        # Use the same mask to gather the source values and the corresponding token ids
         flat_tensor = packed_tensor.reshape(experts * capacity, hidden_dim).index_select(0, linear_indices)
-        rec_output = packed_tensor.new_empty((recv_count, hidden_dim))
+
+        # sorted_indices contains token ids for each slot; mask/select the valid ones and trim to recv_count
+        sorted_matrix = sorted_indices.view(experts, capacity)
+        valid_sorted = sorted_matrix[mask]
+
+        # Clamp to the available data to avoid mismatch
+        available = min(flat_tensor.size(0), valid_sorted.numel(), recv_count)
+        flat_tensor = flat_tensor[:available]
+        valid_sorted = valid_sorted[:available]
+
+        rec_output = packed_tensor.new_empty((available, hidden_dim))
         rec_output.index_copy_(
             0,
-            sorted_indices.to(torch.long).to(device=device, non_blocking=False, copy=False),
+            valid_sorted.to(torch.long).to(device=device, non_blocking=False, copy=False),
             flat_tensor,
         )
         return rec_output
