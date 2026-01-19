@@ -733,7 +733,11 @@ class Buffer:
 
         flat_tensor = packed_tensor.reshape(experts * capacity, hidden_dim).index_select(0, linear_indices)
         rec_output = packed_tensor.new_empty((recv_count, hidden_dim))
-        rec_output.index_copy_(0, sorted_indices.to(torch.long, device=device), flat_tensor)
+        rec_output.index_copy_(
+            0,
+            sorted_indices.to(dtype=torch.long, device=device, non_blocking=False, copy=False),
+            flat_tensor,
+        )
         return rec_output
 
     @staticmethod
