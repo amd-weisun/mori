@@ -78,6 +78,15 @@ __device__ inline void EpDispatchIntraNodeKernelBody(EpDispatchCombineArgs<T>& a
       }
       destTokId = __shfl(destTokId, 0);
 
+      // Guard against overflow beyond provisioned capacity
+      if (destTokId >= config.maxNumInpTokenPerRank) {
+        if (laneId == 0) {
+          // Mark as invalid so downstream packing skips it
+          args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
+        }
+        continue;
+      }
+
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
           args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
