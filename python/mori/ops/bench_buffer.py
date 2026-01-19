@@ -390,8 +390,22 @@ def run(rank: int, args: argparse.Namespace) -> None:
             )
             torch.cuda.synchronize()
             t1 = time.perf_counter()
-            dispatch_output, dispatch_weights_local, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
-                op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+            dispatch_results = op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+            if len(dispatch_results) == 6:
+                # fused path: packed tensors + metadata
+                (dispatch_output,
+                 dispatch_weights_local,
+                 dispatch_scales,
+                 dispatch_indices,
+                 dispatch_recv_num_token,
+                 dispatch_expert_counts) = dispatch_results
+            else:
+                (dispatch_output,
+                 dispatch_weights_local,
+                 dispatch_scales,
+                 dispatch_indices,
+                 dispatch_recv_num_token) = dispatch_results
+                dispatch_expert_counts = None
             torch.cuda.synchronize()
             t2 = time.perf_counter()
             ll_recv_x, _, ll_handle = buffer._postprocess_low_latency_dispatch(
@@ -402,6 +416,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
                 dispatch_weights_local,
                 dispatch_indices_arg,
                 ll_use_fp8,
+                dispatch_expert_counts,
             )
             torch.cuda.synchronize()
             t3 = time.perf_counter()
