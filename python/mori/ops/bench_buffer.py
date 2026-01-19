@@ -17,7 +17,6 @@ from mori.ops.Buffer import Buffer
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
-    "fp16": torch.float16,
     "fp32": torch.float32,
 }
 
@@ -25,7 +24,7 @@ DTYPE_MAP = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Buffer dispatch/combine variants and helpers")
     parser.add_argument("--num-processes", type=int, default=8)
-    parser.add_argument("--num-tokens", type=int, default=128)
+    parser.add_argument("--num-tokens", type=int, default=4096)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
@@ -34,10 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dtype", choices=list(DTYPE_MAP.keys()), default="bf16")
-    parser.add_argument("--total-experts", type=int, default=288)
+    parser.add_argument("--total-experts", type=int, default=256)
     parser.add_argument("--disable-reorder", action="store_true")
     parser.add_argument("--disable-gpu-ll-layout-transform", action="store_true")
-    parser.add_argument("--skip-low-latency", action="store_true")
+    parser.add_argument("--low-latency", Default = False, action="store_true")
     return parser.parse_args()
 
 
@@ -160,26 +159,27 @@ def gather_and_print(results: List[Tuple[str, float]]) -> None:
             print("\n=== Helper Ops (ms) ===")
             printed_header = True
         print_metric(label, stats)
-
-    print("\n=== Standard Dispatch/Combine ===")
-    print_stage_group(
-        "Dispatch",
-        {
-            "total": "dispatch.total",
-            "pre": "dispatch.preprocess",
-            "ops": "dispatch.ops",
-            "post": "dispatch.postprocess",
-        },
-    )
-    print_stage_group(
-        "Combine",
-        {
-            "total": "combine.total",
-            "pre": "combine.preprocess",
-            "ops": "combine.ops",
-            "post": "combine.postprocess",
-        },
-    )
+        
+    if get_stats("dispatch.total") or get_stats("combine.total"):
+        print("\n=== Standard Dispatch/Combine ===")
+        print_stage_group(
+            "Dispatch",
+            {
+                "total": "dispatch.total",
+                "pre": "dispatch.preprocess",
+                "ops": "dispatch.ops",
+                "post": "dispatch.postprocess",
+            },
+        )
+        print_stage_group(
+            "Combine",
+            {
+                "total": "combine.total",
+                "pre": "combine.preprocess",
+                "ops": "combine.ops",
+                "post": "combine.postprocess",
+            },
+        )
 
     if get_stats("low_latency_dispatch.total") or get_stats("low_latency_combine.total"):
         print("\n=== Low-Latency Dispatch/Combine ===")
@@ -250,6 +250,10 @@ def run(rank: int, args: argparse.Namespace) -> None:
     torch.cuda.set_device(local_rank)
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
+    if args.low_latency:
+        args.num_tokens = 128
+        args.total_experts = 288
+
 
     if args.total_experts < world:
         raise ValueError("total_experts must be at least world size so each rank hosts >= 1 expert")
@@ -349,87 +353,91 @@ def run(rank: int, args: argparse.Namespace) -> None:
             ),
         )
     )
+    if not args.low_latency:
 
-    def standard_pipeline_iteration() -> List[Tuple[str, float]]:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        op, inp, inp_scales, dispatch_indices_arg = buffer._preprocess_dispatch(
-            tokens,
-            topk_idx,
-            topk_weights,
-            None,
+        def standard_pipeline_iteration() -> List[Tuple[str, float]]:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            op, inp, inp_scales, dispatch_indices_arg = buffer._preprocess_dispatch(
+                tokens,
+                topk_idx,
+                topk_weights,
+                None,
+            )
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            dispatch_output, dispatch_weights_local, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
+                op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            recv_x, _, recv_topk_weights, _, dispatch_handle = buffer._postprocess_dispatch(
+                op,
+                dispatch_output,
+                dispatch_weights_local,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+                inp_scales,
+                dispatch_indices_arg,
+            )
+            torch.cuda.synchronize()
+            t3 = time.perf_counter()
+
+            combine_src = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+            if combine_src.numel() == 0:
+                raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
+            torch.cuda.synchronize()
+            t4 = time.perf_counter()
+            combine_in, combine_dispatch_indices_arg, combine_weights_local = buffer._preprocess_combine(
+                combine_src,
+                dispatch_handle,
+                recv_topk_weights,
+            )
+            torch.cuda.synchronize()
+            t5 = time.perf_counter()
+            combined_x_stage = buffer.ops.combine(
+                combine_in,
+                combine_weights_local,
+                combine_dispatch_indices_arg,
+            )
+            torch.cuda.synchronize()
+            t6 = time.perf_counter()
+            buffer._postprocess_combine(combined_x_stage)
+            torch.cuda.synchronize()
+            t7 = time.perf_counter()
+
+            return [
+                ("dispatch.preprocess", t1 - t0),
+                ("dispatch.ops", t2 - t1),
+                ("dispatch.postprocess", t3 - t2),
+                ("combine.preprocess", t5 - t4),
+                ("combine.ops", t6 - t5),
+                ("combine.postprocess", t7 - t6),
+            ]
+
+        breakdown_results: List[Tuple[str, float]] = []
+        standard_breakdown = measure_breakdown(standard_pipeline_iteration, args.iters, args.warmup_iters)
+        breakdown_results.extend(standard_breakdown)
+        standard_totals = aggregate_stage_totals(
+            standard_breakdown,
+            {
+                "dispatch.total": [
+                    "dispatch.preprocess",
+                    "dispatch.ops",
+                    "dispatch.postprocess",
+                ],
+                "combine.total": [
+                    "combine.preprocess",
+                    "combine.ops",
+                    "combine.postprocess",
+                ],
+            },
         )
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        dispatch_output, dispatch_weights_local, dispatch_scales, dispatch_indices, dispatch_recv_num_token = \
-            op.dispatch(inp, topk_weights, inp_scales, dispatch_indices_arg)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        recv_x, _, recv_topk_weights, _, dispatch_handle = buffer._postprocess_dispatch(
-            op,
-            dispatch_output,
-            dispatch_weights_local,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-            inp_scales,
-            dispatch_indices_arg,
-        )
-        torch.cuda.synchronize()
-        t3 = time.perf_counter()
+    else:
+        breakdown_results = []
+        standard_totals = []
 
-        combine_src = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-        if combine_src.numel() == 0:
-            raise RuntimeError("Dispatch produced zero tokens on this rank; adjust token/expert parameters")
-        torch.cuda.synchronize()
-        t4 = time.perf_counter()
-        combine_in, combine_dispatch_indices_arg, combine_weights_local = buffer._preprocess_combine(
-            combine_src,
-            dispatch_handle,
-            recv_topk_weights,
-        )
-        torch.cuda.synchronize()
-        t5 = time.perf_counter()
-        combined_x_stage = buffer.ops.combine(
-            combine_in,
-            combine_weights_local,
-            combine_dispatch_indices_arg,
-        )
-        torch.cuda.synchronize()
-        t6 = time.perf_counter()
-        buffer._postprocess_combine(combined_x_stage)
-        torch.cuda.synchronize()
-        t7 = time.perf_counter()
-
-        return [
-            ("dispatch.preprocess", t1 - t0),
-            ("dispatch.ops", t2 - t1),
-            ("dispatch.postprocess", t3 - t2),
-            ("combine.preprocess", t5 - t4),
-            ("combine.ops", t6 - t5),
-            ("combine.postprocess", t7 - t6),
-        ]
-
-    breakdown_results: List[Tuple[str, float]] = []
-    standard_breakdown = measure_breakdown(standard_pipeline_iteration, args.iters, args.warmup_iters)
-    breakdown_results.extend(standard_breakdown)
-    standard_totals = aggregate_stage_totals(
-        standard_breakdown,
-        {
-            "dispatch.total": [
-                "dispatch.preprocess",
-                "dispatch.ops",
-                "dispatch.postprocess",
-            ],
-            "combine.total": [
-                "combine.preprocess",
-                "combine.ops",
-                "combine.postprocess",
-            ],
-        },
-    )
-
-    if not args.skip_low_latency:
+    if args.low_latency:
         ll_use_fp8 = False
 
         def low_latency_pipeline_iteration() -> List[Tuple[str, float]]:
