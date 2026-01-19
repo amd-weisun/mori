@@ -139,6 +139,8 @@ template <typename T>
 __global__ void EpCombineIntraNodeKernelLLFused(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int pairCount = args.lowLatencyPairCountMemObj->template GetAs<index_t*>()[0];
+  int maxPairs = config.numExpertPerRank * config.maxNumInpTokenPerRank;
+  pairCount = min(pairCount, maxPairs);
   int capacity = config.maxNumInpTokenPerRank;
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
@@ -188,6 +190,8 @@ template <typename T>
 __global__ void EpCombineInterNodeV1KernelLLFused(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int pairCount = args.lowLatencyPairCountMemObj->template GetAs<index_t*>()[0];
+  int maxPairs = config.numExpertPerRank * config.maxNumInpTokenPerRank;
+  pairCount = min(pairCount, maxPairs);
   int capacity = config.maxNumInpTokenPerRank;
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
