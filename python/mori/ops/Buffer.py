@@ -735,7 +735,7 @@ class Buffer:
         rec_output = packed_tensor.new_empty((recv_count, hidden_dim))
         rec_output.index_copy_(
             0,
-            sorted_indices.to(dtype=torch.long, device=device, non_blocking=False, copy=False),
+            sorted_indices.to(torch.long).to(device=device, non_blocking=False, copy=False),
             flat_tensor,
         )
         return rec_output
