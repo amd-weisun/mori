@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-experts", type=int, default=256)
     parser.add_argument("--disable-reorder", action="store_true")
     parser.add_argument("--disable-gpu-ll-layout-transform", action="store_true")
-    parser.add_argument("--low-latency", Default = False, action="store_true")
+    parser.add_argument("--low-latency", default=False, action="store_true")
     return parser.parse_args()
 
 
