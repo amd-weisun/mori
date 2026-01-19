@@ -32,7 +32,7 @@ template <typename T>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
 template <typename T>
-__device__ inline void EpDispatchInterNodeV1KernelLowLatencyBody(EpDispatchCombineArgs<T>& args);
+__device__ void EpDispatchInterNodeV1KernelLowLatencyBody(EpDispatchCombineArgs<T>& args);
 
 template <typename T>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);

@@ -275,6 +275,7 @@ def run(rank: int, args: argparse.Namespace) -> None:
         num_qps_per_rank=experts_per_rank,
         max_num_inp_token_per_rank=max_tokens,
         num_experts_per_token=args.topk,
+        low_latency_mode = args.low_latency,
         reorder=not args.disable_reorder,
         use_gpu_ll_layout_transform=not args.disable_gpu_ll_layout_transform,
     )

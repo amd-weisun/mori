@@ -303,6 +303,15 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
        config.numExpertPerRank) *
       sizeof(index_t);
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto isFp8Type = []<typename T>() constexpr {
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+    if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) return true;
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+    if constexpr (std::is_same_v<T, __hip_fp8_e4m3>) return true;
+#endif
+    return false;
+  };
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -316,11 +325,19 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         } else if (kernelType == KernelType::InterNodeV1LL) {
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LLFused) {
-          EpDispatchInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
+          if constexpr (isFp8Type.template operator()<DataT>()) {
+            EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            EpDispatchInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
+          }
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNodeLLFused) {
-          EpDispatchIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          if constexpr (isFp8Type.template operator()<DataT>()) {
+            EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            EpDispatchIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          }
         } else {
           assert(false);
         }
@@ -335,6 +352,15 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
   dim3 block(warpSize * actualWarpNumPerBlock);
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto isFp8Type = []<typename T>() constexpr {
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+    if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) return true;
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+    if constexpr (std::is_same_v<T, __hip_fp8_e4m3>) return true;
+#endif
+    return false;
+  };
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -351,21 +377,29 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LLFused) {
           assert(config.useExternalInpBuffer);
-          HIP_RUNTIME_CHECK(hipMemsetAsync(
-              args.shmemCombineOutTokMemObj->localPtr, 0,
-              static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
-                  config.maxTokenTypeSize,
-              stream));
-          EpCombineInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
+          if constexpr (isFp8Type.template operator()<DataT>()) {
+            EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            HIP_RUNTIME_CHECK(hipMemsetAsync(
+                args.shmemCombineOutTokMemObj->localPtr, 0,
+                static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
+                    config.maxTokenTypeSize,
+                stream));
+            EpCombineInterNodeV1KernelLLFused<<<grid, block, sharedMemSize, stream>>>(args);
+          }
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNodeLLFused) {
-          HIP_RUNTIME_CHECK(hipMemsetAsync(
-              args.shmemCombineOutTokMemObj->localPtr, 0,
-              static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
-                  config.maxTokenTypeSize,
-              stream));
-          EpCombineIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          if constexpr (isFp8Type.template operator()<DataT>()) {
+            EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            HIP_RUNTIME_CHECK(hipMemsetAsync(
+                args.shmemCombineOutTokMemObj->localPtr, 0,
+                static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim *
+                    config.maxTokenTypeSize,
+                stream));
+            EpCombineIntraNodeKernelLLFused<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          }
         } else {
           assert(false);
         }

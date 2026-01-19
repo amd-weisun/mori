@@ -44,8 +44,7 @@
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
-           torch::Tensor>
+pybind11::tuple
 LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
                const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
@@ -105,7 +104,10 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
       handle.lowLatencyPairCountMemObj->Get(), {1},
       torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
 
-    return {packed, packedWeights, packedScales, sortedIdx, pairCount, expertCounts};
+    return pybind11::make_tuple(packed, packedWeights,
+                  packedScales.has_value() ? pybind11::cast(*packedScales)
+                                 : pybind11::none(),
+                  sortedIdx, pairCount, expertCounts);
     }
 
     torch::Tensor out =
@@ -138,7 +140,12 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                torch::TensorOptions()
                  .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                  .device(torch::kCUDA));
-    return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+    return pybind11::make_tuple(out,
+                  outWeights.has_value() ? pybind11::cast(*outWeights)
+                               : pybind11::none(),
+                  outScales.has_value() ? pybind11::cast(*outScales)
+                              : pybind11::none(),
+                  outIndices, totalRecvTokenNum, pybind11::none());
 }
 
 // TODO: translate data type
