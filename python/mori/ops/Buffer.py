@@ -787,12 +787,12 @@ class Buffer:
         ]
         slot_indices = torch.cat(slot_indices_list) if slot_indices_list else torch.empty((0,), device=dispatch_output.device, dtype=torch.long)
         
-        packed_output = dispatch_output.new_zeros((E, N_capacity, H))
+        packed_output = dispatch_output.new_empty((E, N_capacity, H))
         packed_output[sorted_expert_ids, slot_indices] = valid_tokens.index_select(0, sorted_token_indices_long)
 
         packed_scales = None
         if scale_dim > 0 and valid_scales is not None:
-            packed_scales = valid_scales.new_zeros((E, N_capacity, scale_dim))
+            packed_scales = valid_scales.new_empty((E, N_capacity, scale_dim))
             packed_scales[sorted_expert_ids, slot_indices] = valid_scales.index_select(0, sorted_token_indices_long)
         
         return (
@@ -833,7 +833,7 @@ class Buffer:
         flat_values = packed_output[expert_ids, slot_indices]
         
         # Scatter add back
-        rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
+        rec_output = torch.empty((original_N, H), dtype=packed_output.dtype, device=device)
         rec_output.index_add_(0, original_indices.to(torch.long), flat_values)
         
         return rec_output

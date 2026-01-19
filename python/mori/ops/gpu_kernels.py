@@ -38,13 +38,13 @@ def transform_dispatch_output_gpu(dispatch_output, dispatch_indices, config, rec
     E = config.num_experts_per_rank
     
     # 2. Data Movement (C++ GPU Kernel)
-    packed_output = torch.zeros((E, N_capacity, H), dtype=dispatch_output.dtype, device=dispatch_output.device)
+    packed_output = torch.empty((E, N_capacity, H), dtype=dispatch_output.dtype, device=dispatch_output.device)
     valid_tokens = dispatch_output[:recv_count]
     
     packed_scales = None
     if dispatch_scales is not None:
         scale_dim = dispatch_scales.size(1)
-        packed_scales = torch.zeros((E, N_capacity, scale_dim), dtype=dispatch_scales.dtype, device=dispatch_scales.device)
+        packed_scales = torch.empty((E, N_capacity, scale_dim), dtype=dispatch_scales.dtype, device=dispatch_scales.device)
         dispatch_scales = dispatch_scales[:recv_count]
 
     # Call the C++ binding
@@ -75,7 +75,7 @@ def inverse_transform_dispatch_output_gpu(packed_output, original_indices, exper
     # Reconstruct metadata (Compiled)
     slot_indices, expert_ids = _prepare_inverse_metadata(expert_counts, device)
     
-    rec_output = torch.zeros((original_N, H), dtype=packed_output.dtype, device=device)
+    rec_output = torch.empty((original_N, H), dtype=packed_output.dtype, device=device)
     
     # Call the C++ binding
     mori.cpp.inverse_transform_dispatch_output_gpu(
