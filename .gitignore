@@ -11,3 +11,4 @@ lib*
 __pycache__
 
 .vscode
+.cline_storage
