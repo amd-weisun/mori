@@ -22,3 +22,4 @@
 #pragma once
 
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/ops/dispatch_combine_deepep/dispatch_combine_deepep.hpp"

@@ -40,6 +40,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "src/pybind/torch_utils.hpp"
+#include "mori/ops/dispatch_combine/layout_transform_kernels.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
@@ -105,6 +106,71 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
+           torch::Tensor>
+LaunchDispatchDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle, int kernelType,
+                     const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
+                     const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
+                     int blockNum = -1, int warpPerBlock = -1) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightPtr = nullptr;
+  if (weights.has_value()) {
+    assert(weights->is_contiguous() && weights->element_size() == sizeof(float));
+    weightPtr = weights->data_ptr<float>();
+  }
+
+  uint8_t* scalePtr = nullptr;
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
+    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+  }
+
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          input.size(0));
+  handle.LaunchDispatch((mori::moe::deepep::KernelType)kernelType, blockNum, warpPerBlock,
+                        at::cuda::getCurrentHIPStream());
+
+      const int64_t expertCapacity =
+        static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+
+  auto outDtype = handle.config.useFP8
+                      ? mori::GetTorchDataType<__hip_fp8_e4m3_fnuz>()
+                      : input.scalar_type();
+  torch::Tensor out =
+      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
+                       {handle.config.numExpertPerRank, expertCapacity, handle.config.hiddenDim},
+                       torch::TensorOptions().dtype(outDtype).device(torch::kCUDA));
+
+  torch::Tensor outWeights = torch::from_blob(
+      handle.shmemDispatchOutWeightsMemObj->Get(),
+      {handle.config.numExpertPerRank, expertCapacity, handle.config.numExpertPerToken},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
+
+  std::optional<torch::Tensor> outScales{std::nullopt};
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    outScales =
+        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+               {handle.config.numExpertPerRank, expertCapacity, handle.config.scaleDim},
+                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+  }
+
+  torch::Tensor outIndices =
+      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
+               {handle.config.numExpertPerRank, expertCapacity, handle.config.numExpertPerToken},
+                       torch::TensorOptions()
+                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                           .device(torch::kCUDA));
+
+  torch::Tensor totalRecvTokenNum =
+      torch::from_blob(handle.totalRecvTokenNum, {1},
+                       torch::TensorOptions()
+                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                           .device(torch::kCUDA));
+  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+}
+
 // TODO: translate data type
 // template <typename T>
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
@@ -141,8 +207,144 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   return {out, outWeights};
 }
 
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineDeepep(
+    mori::moe::deepep::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
+    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
+    int warpPerBlock) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightsPtr = nullptr;
+  if (weights.has_value() && weights->size(0) != 0) {
+    assert(weights->is_contiguous());
+    weightsPtr = weights->data_ptr<float>();
+  }
+
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          handle.curRankNumToken);
+  handle.LaunchCombine((mori::moe::deepep::KernelType)kernelType, blockNum, warpPerBlock,
+                       at::cuda::getCurrentHIPStream());
+
+  auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
+  torch::Tensor out =
+      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+                       {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
+
+  std::optional<torch::Tensor> outWeights{std::nullopt};
+  if (weightsPtr) {
+    outWeights =
+        torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
+                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+                         torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
+  }
+
+  return {out, outWeights};
+}
+
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
+}
+
+void LaunchResetDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle) {
+  handle.LaunchReset(at::cuda::getCurrentHIPStream());
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
+           torch::Tensor>
+LaunchIntraNodeDispatchDeepepLL(mori::moe::deepep::EpDispatchCombineHandle& handle,
+                                const torch::Tensor& input,
+                                const std::optional<torch::Tensor>& weights,
+                                const std::optional<torch::Tensor>& scales,
+                                const torch::Tensor& topkIds, int blockNum, int warpPerBlock) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightPtr = nullptr;
+  if (weights.has_value()) {
+    assert(weights->is_contiguous() && weights->element_size() == sizeof(float));
+    weightPtr = weights->data_ptr<float>();
+  }
+
+  uint8_t* scalePtr = nullptr;
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
+    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+  }
+
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          input.size(0));
+  handle.LaunchIntraNodeDispatchDeepepLL(blockNum, warpPerBlock, at::cuda::getCurrentHIPStream());
+
+      const int64_t expertCapacity =
+        static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+
+  auto outDtype = handle.config.useFP8
+                      ? mori::GetTorchDataType<__hip_fp8_e4m3_fnuz>()
+                      : input.scalar_type();
+  torch::Tensor out =
+      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
+                       {handle.config.numExpertPerRank, expertCapacity, handle.config.hiddenDim},
+                       torch::TensorOptions().dtype(outDtype).device(torch::kCUDA));
+
+  torch::Tensor outWeights = torch::from_blob(
+      handle.shmemDispatchOutWeightsMemObj->Get(),
+      {handle.config.numExpertPerRank, expertCapacity, handle.config.numExpertPerToken},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
+
+  std::optional<torch::Tensor> outScales{std::nullopt};
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    outScales =
+        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+               {handle.config.numExpertPerRank, expertCapacity, handle.config.scaleDim},
+                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+  }
+
+  torch::Tensor outIndices =
+      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
+               {handle.config.numExpertPerRank, expertCapacity, handle.config.numExpertPerToken},
+                       torch::TensorOptions()
+                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                           .device(torch::kCUDA));
+
+  torch::Tensor totalRecvTokenNum =
+      torch::from_blob(handle.totalRecvTokenNum, {1},
+                       torch::TensorOptions()
+                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                           .device(torch::kCUDA));
+  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchIntraNodeCombineDeepepLL(
+    mori::moe::deepep::EpDispatchCombineHandle& handle, const torch::Tensor& input,
+    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
+    int warpPerBlock) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightsPtr = nullptr;
+  if (weights.has_value() && weights->size(0) != 0) {
+    assert(weights->is_contiguous());
+    weightsPtr = weights->data_ptr<float>();
+  }
+
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          handle.curRankNumToken);
+  handle.LaunchIntraNodeCombineDeepepLL(blockNum, warpPerBlock, at::cuda::getCurrentHIPStream());
+
+  auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
+  torch::Tensor out =
+      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+                       {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
+
+  std::optional<torch::Tensor> outWeights{std::nullopt};
+  if (weightsPtr) {
+    outWeights =
+        torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
+                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+                         torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
+  }
+
+  return {out, outWeights};
 }
 
 torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
@@ -155,7 +357,29 @@ torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) 
   return tensor;
 }
 
+torch::Tensor GetDispatchSrcTokenIdDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions()
+                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                     .device(torch::kCUDA);
+  const int64_t expertCapacity =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  torch::Tensor tensor =
+      torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>(),
+                       {handle.config.numExpertPerRank, expertCapacity}, options);
+  return tensor;
+}
+
 torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions()
+                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                     .device(torch::kCUDA);
+  torch::Tensor tensor = torch::from_blob(
+      handle.dispSenderIdxMap, {handle.curRankNumToken * handle.config.numExpertPerToken}, options);
+  return tensor;
+}
+
+torch::Tensor GetDispatchSenderTokenIdxMapDeepep(
+    mori::moe::deepep::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -173,11 +397,54 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle&
   return tensor;
 }
 
+torch::Tensor GetDispatchReceiverTokenIdxMapDeepep(
+    mori::moe::deepep::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions()
+                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                     .device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.dispReceiverIdxMap, {*handle.localPeTokenCounter}, options);
+  return tensor;
+}
+
+torch::Tensor GetDispatchDestTokIdMapDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions()
+                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                     .device(torch::kCUDA);
+  torch::Tensor tensor = torch::from_blob(
+      handle.dispDestTokIdMap,
+      {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+      options);
+  return tensor;
+}
+
+
+torch::Tensor GetDispatchRecvTokenCountPerExpertDeepep(
+    mori::moe::deepep::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions()
+                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+                     .device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.recvTokenCountPerExpert, {handle.config.numExpertPerRank}, options);
+  return tensor;
+}
+
 torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
                                               at::ScalarType scalarType) {
   torch::Tensor out =
       torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+                       torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
+  return out;
+}
+
+torch::Tensor GetRegisteredCombineInputBufferDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle,
+                                                    at::ScalarType scalarType) {
+  const int64_t expertCapacity =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  torch::Tensor out =
+      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
+                       {handle.config.numExpertPerRank, expertCapacity, handle.config.hiddenDim},
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
 }
@@ -229,7 +496,6 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   funcName = std::string("get_registered_combine_input_buffer");
   m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
-
 #ifdef ENABLE_PROFILER
   funcName = std::string("get_debug_time_buf");
   m.def(funcName.c_str(), &GetDebugTimeBuf);
@@ -237,6 +503,172 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   funcName = std::string("get_debug_time_offset");
   m.def(funcName.c_str(), &GetDebugTimeOffset);
 #endif
+}
+
+void DeclareEpDispatchCombineDeepepHandle(pybind11::module& m) {
+  std::string className = std::string("EpDispatchCombineDeepepHandle");
+  pybind11::class_<mori::moe::deepep::EpDispatchCombineHandle>(m, className.c_str())
+      .def(pybind11::init<mori::moe::deepep::EpDispatchCombineDeepepConfig>(),
+           py::arg("config") = mori::moe::deepep::EpDispatchCombineDeepepConfig{});
+
+  std::string funcName = std::string("launch_dispatch_deepep");
+  m.def(funcName.c_str(), &LaunchDispatchDeepep);
+
+  funcName = std::string("launch_combine_deepep");
+  m.def(funcName.c_str(), &LaunchCombineDeepep);
+
+  funcName = std::string("launch_reset_deepep");
+  m.def(funcName.c_str(), &LaunchResetDeepep);
+
+      funcName = std::string("launch_intra_node_dispatch_deepep_ll");
+      m.def(funcName.c_str(), &LaunchIntraNodeDispatchDeepepLL,
+        py::arg("handle"), py::arg("input"), py::arg("weights"), py::arg("scales"),
+        py::arg("indices"), py::arg("block_num") = -1, py::arg("warp_per_block") = -1);
+
+      funcName = std::string("launch_intra_node_combine_deepep_ll");
+      m.def(funcName.c_str(), &LaunchIntraNodeCombineDeepepLL,
+        py::arg("handle"), py::arg("input"), py::arg("weights"), py::arg("indices"),
+        py::arg("block_num") = -1, py::arg("warp_per_block") = -1);
+
+  funcName = std::string("get_cur_rank_num_token_deepep");
+  m.def(funcName.c_str(), &mori::moe::deepep::EpDispatchCombineHandle::GetCurRankNumToken);
+
+  funcName = std::string("get_dispatch_src_token_pos_deepep");
+  m.def(funcName.c_str(), &GetDispatchSrcTokenIdDeepep);
+
+  funcName = std::string("get_dispatch_sender_token_idx_map_deepep");
+  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMapDeepep);
+
+  funcName = std::string("get_dispatch_receiver_token_idx_map_deepep");
+  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMapDeepep);
+
+  funcName = std::string("get_dispatch_dest_tok_id_map_deepep");
+  m.def(funcName.c_str(), &GetDispatchDestTokIdMapDeepep);
+
+
+  funcName = std::string("get_dispatch_recv_token_count_per_expert_deepep");
+  m.def(funcName.c_str(), &GetDispatchRecvTokenCountPerExpertDeepep);
+
+  funcName = std::string("get_registered_combine_input_buffer_deepep");
+  m.def(funcName.c_str(), &GetRegisteredCombineInputBufferDeepep);
+}
+
+#define DISPATCH_FLOAT_HALF_BFLOAT16(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH( \
+      TYPE, NAME, \
+      AT_DISPATCH_CASE(at::ScalarType::Float, [&] { \
+        using scalar_t = float; \
+        using HipT = float; \
+        __VA_ARGS__(); \
+      }) \
+      AT_DISPATCH_CASE(at::ScalarType::Half, [&] { \
+        using scalar_t = at::Half; \
+        using HipT = __half; \
+        __VA_ARGS__(); \
+      }) \
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] { \
+        using scalar_t = at::BFloat16; \
+        using HipT = __hip_bfloat16; \
+        __VA_ARGS__(); \
+      }) \
+  )
+
+void TransformDispatchOutputGPU(
+    torch::Tensor dispatch_output, torch::Tensor packed_output,
+    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids,
+    std::optional<torch::Tensor> num_tokens_tensor,
+    std::optional<torch::Tensor> dispatch_scales,
+    std::optional<torch::Tensor> packed_scales) {
+    
+    int num_tokens = indices.size(0);
+    int H = dispatch_output.size(1);
+    const int* num_tokens_ptr = nullptr;
+    if (num_tokens_tensor.has_value()) {
+        num_tokens_ptr = num_tokens_tensor.value().data_ptr<int>();
+    }
+
+    const float* scales_src_ptr = nullptr;
+    float* scales_dst_ptr = nullptr;
+    int scale_dim = 0;
+    if (dispatch_scales.has_value() && packed_scales.has_value()) {
+        scales_src_ptr = dispatch_scales.value().data_ptr<float>();
+        scales_dst_ptr = packed_scales.value().data_ptr<float>();
+        scale_dim = dispatch_scales.value().size(1);
+    }
+    
+    DISPATCH_FLOAT_HALF_BFLOAT16(dispatch_output.scalar_type(), "TransformDispatchOutputGPU", ([&] {
+        using T = scalar_t;
+        
+        mori::moe::LaunchTransformDispatchOutput<HipT>(
+            reinterpret_cast<const HipT*>(dispatch_output.data_ptr<T>()),
+            reinterpret_cast<HipT*>(packed_output.data_ptr<T>()),
+            scales_src_ptr, scales_dst_ptr,
+            indices.data_ptr<mori::moe::index_t>(),
+            expert_ids.data_ptr<mori::moe::index_t>(),
+            slot_ids.data_ptr<mori::moe::index_t>(),
+            dispatch_output.stride(0), dispatch_output.stride(1),
+            packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
+            num_tokens, H, scale_dim,
+            at::cuda::getCurrentHIPStream(),
+            num_tokens_ptr
+        );
+    }));
+}
+
+void InverseTransformDispatchOutputGPU(
+    torch::Tensor packed_output, torch::Tensor rec_output,
+    torch::Tensor indices, torch::Tensor expert_ids, torch::Tensor slot_ids) {
+    
+    int num_tokens = indices.size(0);
+    int H = packed_output.size(2);
+    
+    DISPATCH_FLOAT_HALF_BFLOAT16(packed_output.scalar_type(), "InverseTransformDispatchOutputGPU", ([&] {
+        using T = scalar_t;
+        
+        mori::moe::LaunchInverseTransformDispatchOutput<HipT>(
+            reinterpret_cast<const HipT*>(packed_output.data_ptr<T>()),
+            reinterpret_cast<HipT*>(rec_output.data_ptr<T>()),
+            indices.data_ptr<mori::moe::index_t>(),
+            expert_ids.data_ptr<mori::moe::index_t>(),
+            slot_ids.data_ptr<mori::moe::index_t>(),
+            packed_output.stride(0), packed_output.stride(1), packed_output.stride(2),
+            rec_output.stride(0), rec_output.stride(1),
+            num_tokens, H,
+            at::cuda::getCurrentHIPStream()
+        );
+    }));
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+PrepareTransformMetadataGPU(
+    torch::Tensor dispatch_indices,
+    int64_t num_experts_per_rank,
+    int64_t rank) {
+    
+    int64_t num_tokens = dispatch_indices.size(0);
+    int64_t K = dispatch_indices.size(1);
+    int64_t max_valid = num_tokens * K;
+    
+    auto options = dispatch_indices.options().dtype(torch::kInt32); // index_t is int32
+    
+    auto sorted_token_indices = torch::empty({max_valid}, options);
+    auto sorted_expert_ids = torch::empty({max_valid}, options);
+    auto slot_indices = torch::empty({max_valid}, options);
+    auto expert_counts = torch::empty({num_experts_per_rank}, options);
+    auto total_valid_count = torch::empty({1}, options.dtype(torch::kInt32));
+    
+    mori::moe::LaunchPrepareTransformMetadata(
+        dispatch_indices.data_ptr<mori::moe::index_t>(),
+        sorted_token_indices.data_ptr<mori::moe::index_t>(),
+        sorted_expert_ids.data_ptr<mori::moe::index_t>(),
+        slot_indices.data_ptr<mori::moe::index_t>(),
+        expert_counts.data_ptr<mori::moe::index_t>(),
+        total_valid_count.data_ptr<int>(),
+        num_tokens, K, num_experts_per_rank, rank,
+        at::cuda::getCurrentHIPStream()
+    );
+    
+    return std::make_tuple(sorted_token_indices, sorted_expert_ids, slot_indices, expert_counts, total_valid_count);
 }
 
 }  // namespace
@@ -329,6 +761,10 @@ int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
+  m.def("transform_dispatch_output_gpu", &TransformDispatchOutputGPU);
+  m.def("inverse_transform_dispatch_output_gpu", &InverseTransformDispatchOutputGPU);
+  m.def("prepare_transform_metadata_gpu", &PrepareTransformMetadataGPU);
+
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)
@@ -366,8 +802,56 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
+    pybind11::enum_<mori::moe::deepep::KernelType>(m, "EpDispatchCombineDeepepKernelType")
+      .value("IntraNode", mori::moe::deepep::KernelType::IntraNode)
+      .value("InterNode", mori::moe::deepep::KernelType::InterNode)
+      .value("InterNodeV1", mori::moe::deepep::KernelType::InterNodeV1)
+      .value("InterNodeV1LL", mori::moe::deepep::KernelType::InterNodeV1LL)
+      .export_values();
+
+    pybind11::class_<mori::moe::deepep::EpDispatchCombineDeepepConfig>(
+      m, "EpDispatchCombineDeepepConfig")
+                  .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool, bool, bool,
+                  bool, int, int>(),
+         py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
+         py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
+         py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
+         py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
+         py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
+         py::arg("use_external_inp_buf") = true, py::arg("use_fp8") = true,
+         py::arg("use_weighted_combine") = true, py::arg("use_deepep_layout") = true,
+          py::arg("gpu_per_node") = 8,
+         py::arg("rdma_block_num") = 1)
+      .def_readwrite("rank", &mori::moe::deepep::EpDispatchCombineDeepepConfig::rank)
+      .def_readwrite("world_size", &mori::moe::deepep::EpDispatchCombineDeepepConfig::worldSize)
+      .def_readwrite("hidden_dim", &mori::moe::deepep::EpDispatchCombineDeepepConfig::hiddenDim)
+      .def_readwrite("scale_dim", &mori::moe::deepep::EpDispatchCombineDeepepConfig::scaleDim)
+      .def_readwrite("scale_type_size",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::scaleTypeSize)
+      .def_readwrite("max_token_type_size",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::maxTokenTypeSize)
+      .def_readwrite("max_num_inp_token_per_rank",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::maxNumInpTokenPerRank)
+      .def_readwrite("num_experts_per_rank",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::numExpertPerRank)
+      .def_readwrite("num_experts_per_token",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::numExpertPerToken)
+      .def_readwrite("warp_num_per_block",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::warpNumPerBlock)
+      .def_readwrite("block_num", &mori::moe::deepep::EpDispatchCombineDeepepConfig::blockNum)
+      .def_readwrite("use_external_inp_buf",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::useExternalInpBuffer)
+      .def_readwrite("use_fp8", &mori::moe::deepep::EpDispatchCombineDeepepConfig::useFP8)
+      .def_readwrite("use_deepep_layout",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::useDeepepLayout)
+            .def_readwrite("use_weighted_combine",
+              &mori::moe::deepep::EpDispatchCombineDeepepConfig::useWeightedCombine)
+      .def_readwrite("gpu_per_node", &mori::moe::deepep::EpDispatchCombineDeepepConfig::gpuPerNode)
+      .def_readwrite("rdma_block_num",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::rdmaBlockNum);
 
   DeclareEpDispatchCombineHandle(m);
+    DeclareEpDispatchCombineDeepepHandle(m);
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");

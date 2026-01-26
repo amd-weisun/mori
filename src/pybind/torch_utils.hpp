@@ -66,4 +66,16 @@ inline hipDataType ScalarTypeToHipDataType(at::ScalarType scalarType) {
   }
 }
 
+template <typename T>
+struct TorchDataTypeToHipDataType;
+
+template <>
+struct TorchDataTypeToHipDataType<float> { using type = float; };
+
+template <>
+struct TorchDataTypeToHipDataType<at::Half> { using type = __half; };
+
+template <>
+struct TorchDataTypeToHipDataType<at::BFloat16> { using type = __hip_bfloat16; };
+
 }  // namespace mori
