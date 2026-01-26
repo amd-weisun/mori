@@ -43,6 +43,7 @@ target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
 target_link_libraries(
   mori_pybinds
   mori_ops
+  mori_ops_deepep
   mori_io
   ${TORCH_LIBRARIES}
   torch_python

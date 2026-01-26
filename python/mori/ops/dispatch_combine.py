@@ -104,6 +104,9 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
         return self._get_registered_combine_input_buffer(self._handle, dtype)
 
+    def get_cur_rank_num_token(self):
+        return self._get_cur_rank_num_token(self._handle)
+
     def dispatch(
         self,
         input: torch.Tensor,
@@ -148,6 +151,9 @@ class EpDispatchCombineOp:
 
     def reset(self):
         self._reset_func(self._handle)
+
+    def get_dispatch_src_token_pos(self):
+        return self._get_dispatch_src_token_pos_func(self._handle)
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
         shape = list(input.shape)
