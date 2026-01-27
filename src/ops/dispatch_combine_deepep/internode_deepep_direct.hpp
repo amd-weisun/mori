@@ -674,25 +674,12 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Ensure all RDMA puts from the above loops are complete before barrier.
-  // Each warp may have issued puts to various srcPes (for combine, sending back to source).
-  // ShmemQuietThread(pe) only affects puts issued by the SAME warp, so each warp must
-  // quiet ALL remote PEs it may have sent to (not just one PE per warp).
-  // NOTE: We only quiet REMOTE PEs (inter-node) since same-node transfers don't use RDMA.
-  {
-    __syncthreads();  // Ensure all warps finished the RDMA puts
-    int npes = config.worldSize;
-    // Each warp quiets ALL remote PEs it may have sent to
-    if (laneId == 0) {
-      for (int srcPe = 0; srcPe < npes; ++srcPe) {
-        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-        if (isRemote) {
-          shmem::ShmemQuietThread(srcPe);
-        }
-      }
-    }
-    __syncthreads();  // Ensure all warps have completed their quiet
-  }
+  // Synchronize all threads before barrier.
+  // Note: We don't call ShmemQuietThread here like the legacy kernel doesn't.
+  // The warp-level RDMA puts and the cross-device barrier handle synchronization.
+  // Calling quiet after warp-level puts can cause issues.
+  __threadfence_system();
+  __syncthreads();
 
   // Step 2: Cross-rank barrier so all writes are visible
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
