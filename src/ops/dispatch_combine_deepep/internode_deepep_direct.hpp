@@ -458,20 +458,24 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
-        // Write counts for all local experts to this remote destPe
-        for (int e = laneId; e < config.numExpertPerRank; e += warpSize) {
-          index_t localCounterIdx = destPe * config.numExpertPerRank + e;
-          index_t count = args.localPeTokenCounter[localCounterIdx];
-          // Write to slot [myPe * numExpertPerRank + e] on destPe
-          index_t destSlot = myPe * config.numExpertPerRank + e;
-          shmem::ShmemPutTypeImmNbiThread<index_t>(
-              args.srcExpertTokenCounterMemObj,
-              destSlot * sizeof(index_t),
-              count,
-              destPe);
-        }
-        // Ensure RDMA puts to this destPe complete before signaling
+        // Write counts for all local experts to this remote destPe.
+        // Only lane 0 sends the puts to ensure proper quiet synchronization.
+        // ShmemQuietThread only waits for puts from the CALLING THREAD, so
+        // if multiple lanes send puts but only lane 0 quiets, the other lanes'
+        // puts might not be complete - causing race conditions.
         if (laneId == 0) {
+          for (int e = 0; e < config.numExpertPerRank; ++e) {
+            index_t localCounterIdx = destPe * config.numExpertPerRank + e;
+            index_t count = args.localPeTokenCounter[localCounterIdx];
+            // Write to slot [myPe * numExpertPerRank + e] on destPe
+            index_t destSlot = myPe * config.numExpertPerRank + e;
+            shmem::ShmemPutTypeImmNbiThread<index_t>(
+                args.srcExpertTokenCounterMemObj,
+                destSlot * sizeof(index_t),
+                count,
+                destPe);
+          }
+          // Ensure RDMA puts to this destPe complete before signaling
           shmem::ShmemQuietThread(destPe);
         }
       }
@@ -483,21 +487,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Signal token counts to destination ranks
   if (globalWarpId == 0) {
-    // Wait for all warps to complete, then reset barrier (once, outside loop)
+    // Wait for all warps to complete, then reset barrier (once, outside loop).
+    // The barrier ensures all warps have completed their quiets (each warp
+    // increments the barrier AFTER its quiet), so all count puts are complete.
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
     if (laneId == 0) args.dispatchGridBarrier[0] = 0;
-    __syncwarp();
-
-    // Before sending signals, warp 0 must quiet ALL remote destinations.
-    // This ensures count puts from OTHER warps (which used different QPs) are complete.
-    // Without this, the signal might arrive before counts from other warps.
-    if (laneId == 0) {
-      for (int pe = 0; pe < npes; ++pe) {
-        if (internode_ll::IsRemoteRank(myPe, pe, gpuPerNode)) {
-          shmem::ShmemQuietThread(pe);
-        }
-      }
-    }
     __syncwarp();
 
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
