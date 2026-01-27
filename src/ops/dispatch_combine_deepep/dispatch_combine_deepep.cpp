@@ -29,6 +29,7 @@
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine_deepep/intranode_deepep_direct.hpp"
+#include "src/ops/dispatch_combine_deepep/internode_deepep_direct.hpp"
 
 namespace mori {
 namespace moe {
@@ -361,6 +362,108 @@ void EpDispatchCombineHandle::LaunchIntraNodeCombineDeepepLL(int blockNum, int w
             EpCombineIntraNodeDeepepLLKernel<DataT, false, true><<<grid, block, sharedMemSize, stream>>>(args);
           } else {
             EpCombineIntraNodeDeepepLLKernel<DataT, false, false><<<grid, block, sharedMemSize, stream>>>(args);
+          }
+        }
+      },
+      argsVariant);
+}
+
+void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int warpPerBlock,
+                                                               hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  assert(config.useDeepepLayout &&
+         "DeepEP inter-node low-latency dispatch requires useDeepepLayout=true");
+
+  if (config.useFP8) {
+    assert(config.scaleDim == (config.hiddenDim / detail::kNumPerChannels) &&
+           "DeepEP fp8 dispatch expects scaleDim == hiddenDim / 128");
+  }
+
+  // Same initialization as intranode dispatch
+  HIP_RUNTIME_CHECK(hipMemsetAsync(totalRecvTokenNum, 0, sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(
+      hipMemsetAsync(recvTokenCountPerExpert, 0, config.numExpertPerRank * sizeof(index_t), stream));
+  if (destExpertTokenCounterMemObj.IsValid()) {
+    HIP_RUNTIME_CHECK(hipMemsetAsync(destExpertTokenCounterMemObj->Get(), 0,
+                                     config.numExpertPerRank * sizeof(index_t), stream));
+  }
+  HIP_RUNTIME_CHECK(hipMemsetAsync(destPeTokenCounter, 0, config.worldSize * sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(destNodeTokenCounter, 0,
+                                   config.worldSize / config.gpuPerNode * sizeof(index_t), stream));
+
+  size_t expertCapacity = static_cast<size_t>(config.worldSize) * config.maxNumInpTokenPerRank;
+  size_t totalTokenSlots = static_cast<size_t>(config.numExpertPerRank) * expertCapacity;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(dispTokIdToSrcTokIdMemObj->Get(), 0xFF,
+          totalTokenSlots * sizeof(index_t), stream));
+
+  size_t sharedMemSize =
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
+      sizeof(index_t);
+
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        if (config.useFP8) {
+          EpDispatchInterNodeDeepepLLKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          EpDispatchInterNodeDeepepLLKernel<DataT, false><<<grid, block, sharedMemSize, stream>>>(args);
+        }
+      },
+      argsVariant);
+}
+
+void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int warpPerBlock,
+                                                              hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  assert(config.useDeepepLayout &&
+         "DeepEP inter-node low-latency combine requires useDeepepLayout=true");
+
+  if (config.useFP8) {
+    assert(config.scaleDim == (config.hiddenDim / detail::kNumPerChannels) &&
+           "DeepEP fp8 dispatch expects scaleDim == hiddenDim / 128");
+  }
+
+  // Same initialization as intranode combine
+  size_t combineOutSize =
+      static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim * config.maxTokenTypeSize;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(shmemCombineOutTokMemObj->Get(), 0, combineOutSize, stream));
+  if (weightsBuf) {
+    size_t combineOutWeightsSize =
+        static_cast<size_t>(config.maxNumInpTokenPerRank) * config.numExpertPerToken * sizeof(float);
+    HIP_RUNTIME_CHECK(
+        hipMemsetAsync(shmemCombineOutWeightsMemObj->Get(), 0, combineOutWeightsSize, stream));
+  }
+
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+
+        size_t sharedMemSize =
+          actualWarpNumPerBlock * config.numExpertPerToken *
+          (sizeof(DataT*) + sizeof(float*) +
+           (config.useWeightedCombine ? sizeof(float) : 0));
+        if (config.useFP8) {
+          if (config.useWeightedCombine) {
+            EpCombineInterNodeDeepepLLKernel<DataT, true, true><<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            EpCombineInterNodeDeepepLLKernel<DataT, true, false><<<grid, block, sharedMemSize, stream>>>(args);
+          }
+        } else {
+          if (config.useWeightedCombine) {
+            EpCombineInterNodeDeepepLLKernel<DataT, false, true><<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            EpCombineInterNodeDeepepLLKernel<DataT, false, false><<<grid, block, sharedMemSize, stream>>>(args);
           }
         }
       },

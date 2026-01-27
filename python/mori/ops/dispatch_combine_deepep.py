@@ -94,6 +94,12 @@ class EpDispatchCombineDeepepOp:
         self._combine_ll_func = _cpp_dispatch_combine_deepep_factory(
             "launch_intra_node_combine_deepep_ll"
         )
+        self._dispatch_internode_ll_func = _cpp_dispatch_combine_deepep_factory(
+            "launch_inter_node_dispatch_deepep_ll"
+        )
+        self._combine_internode_ll_func = _cpp_dispatch_combine_deepep_factory(
+            "launch_inter_node_combine_deepep_ll"
+        )
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_deepep_factory(
             "get_dispatch_src_token_pos_deepep"
         )
@@ -263,6 +269,80 @@ class EpDispatchCombineDeepepOp:
         - hook: None (reserved for future async support).
         """
         combine_output, _ = self._combine_ll_func(
+            self._handle,
+            x,
+            topk_weights,
+            topk_idx,
+            block_num,
+            warp_per_block,
+        )
+        return combine_output, None, None
+
+    def dispatch_internode_deepep_ll(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int | None = None,
+        num_experts: int | None = None,
+        use_fp8: bool | None = None,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        *,
+        weights: torch.Tensor | None = None,
+        scales: torch.Tensor | None = None,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """Inter-node low-latency DeepEP dispatch (expert-major layout).
+
+        Same interface as dispatch_deepep_ll but uses RDMA for cross-node communication.
+        """
+        if num_max_dispatch_tokens_per_rank is None:
+            num_max_dispatch_tokens_per_rank = self.config.max_num_inp_token_per_rank
+        if num_experts is None:
+            num_experts = self.config.world_size * self.config.num_experts_per_rank
+        if use_fp8 is None:
+            use_fp8 = self.config.use_fp8
+
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            _,
+        ) = self._dispatch_internode_ll_func(
+            self._handle,
+            x,
+            weights,
+            scales,
+            topk_idx,
+            block_num,
+            warp_per_block,
+        )
+        recv_count = self.get_dispatch_recv_token_count_per_expert()
+        recv_x = (dispatch_output, dispatch_scales) if use_fp8 else dispatch_output
+        handle = (dispatch_weights, dispatch_indices)
+        return recv_x, recv_count, handle, None, None
+
+    def combine_internode_deepep_ll(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        handle: tuple | None = None,
+        zero_copy: bool = False,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        out: torch.Tensor | None = None,
+        *,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """Inter-node low-latency DeepEP combine (expert-major dispatch output).
+
+        Same interface as combine_deepep_ll but uses RDMA for cross-node communication.
+        """
+        combine_output, _ = self._combine_internode_ll_func(
             self._handle,
             x,
             topk_weights,
