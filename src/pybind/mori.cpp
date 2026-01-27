@@ -913,8 +913,8 @@ void RegisterMoriOps(py::module_& m) {
     pybind11::enum_<mori::moe::deepep::KernelType>(m, "EpDispatchCombineDeepepKernelType")
       .value("IntraNode", mori::moe::deepep::KernelType::IntraNode)
       .value("InterNode", mori::moe::deepep::KernelType::InterNode)
-      .value("InterNodeV1", mori::moe::deepep::KernelType::InterNodeV1)
-      .value("InterNodeV1LL", mori::moe::deepep::KernelType::InterNodeV1LL)
+      .value("IntraNodeLL", mori::moe::deepep::KernelType::IntraNodeLL)
+      .value("InterNodeLL", mori::moe::deepep::KernelType::InterNodeLL)
       .export_values();
 
     pybind11::class_<mori::moe::deepep::EpDispatchCombineDeepepConfig>(

@@ -211,9 +211,9 @@ def run_test_impl(
     # Determine kernel type based on topology
     is_internode = world_size > gpu_per_node
     kernel_type = (
-        mori.ops.EpDispatchCombineDeepepKernelType.InterNodeV1LL
+        mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
         if is_internode
-        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
+        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNodeLL
     )
 
     if rank == 0:
@@ -365,7 +365,7 @@ def validate_dispatch(rank, config, recv_count, all_rank_indices):
 
 def validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type):
     """Validate combine results (rank 0 only, samples first few tokens)."""
-    num_tokens_to_check = min(5, config.max_num_inp_token_per_rank)
+    num_tokens_to_check = min(100, config.max_num_inp_token_per_rank)
     base_input = all_rank_input[0]
     if use_fp8:
         base_input = dequant_input_like_fp8(base_input, data_type)

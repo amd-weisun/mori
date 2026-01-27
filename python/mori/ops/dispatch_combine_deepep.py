@@ -391,8 +391,9 @@ class EpDispatchCombineDeepepOp:
 
         if self.config.kernel_type.value in (
             EpDispatchCombineDeepepKernelType.IntraNode.value,
-            EpDispatchCombineDeepepKernelType.InterNodeV1.value,
-            EpDispatchCombineDeepepKernelType.InterNodeV1LL.value,
+            EpDispatchCombineDeepepKernelType.InterNode.value,
+            EpDispatchCombineDeepepKernelType.IntraNodeLL.value,
+            EpDispatchCombineDeepepKernelType.InterNodeLL.value,
         ):
             return self._get_dispatch_src_token_pos_func(self._handle)
 

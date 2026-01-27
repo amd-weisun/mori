@@ -38,8 +38,8 @@ namespace deepep {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
-  InterNodeV1 = 2,
-  InterNodeV1LL = 3,
+  IntraNodeLL = 2,
+  InterNodeLL = 3,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
