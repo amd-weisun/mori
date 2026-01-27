@@ -176,10 +176,10 @@ def run_test_multinode(setting: dict):
 
     # Set CUDA device before init_process_group
     torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
 
-    # Initialize process group with device_id for proper GPU association
-    dist.init_process_group(backend="nccl", device_id=device)
+    # Initialize process group with gloo backend (required for shmem CPU operations)
+    # NCCL only supports CUDA devices, but shmem needs CPU backend support
+    dist.init_process_group(backend="gloo")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
