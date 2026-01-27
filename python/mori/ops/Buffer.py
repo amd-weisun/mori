@@ -16,6 +16,14 @@ from mori.ops.dispatch_combine_deepep import (
 
 if "MORI_SHMEM_MODE" not in os.environ:
     os.environ["MORI_SHMEM_MODE"] = "isolation"
+
+# Debug flag: set ENABLE_DEBUG_INFO=1 to enable debug prints
+DEBUG_INFO = os.getenv("ENABLE_DEBUG_INFO", "0") == "1"
+
+def _debug_print(msg: str):
+    """Print debug message if ENABLE_DEBUG_INFO=1"""
+    if DEBUG_INFO:
+        print(f"[Buffer DEBUG] {msg}", flush=True)
 # Mock classes to maintain API compatibility
 class Config:
     def __init__(self, num_sms: int, *args):
@@ -117,6 +125,7 @@ class Buffer:
         if self.ops is None:
             if self.kernel_type_override is not None:
                 kernel_type = self.kernel_type_override
+                _debug_print(f"Using kernel_type override: {kernel_type}")
             else:
                 kernel_type = EpDispatchCombineKernelType.IntraNode
                 # Simple heuristic for kernel type
@@ -124,7 +133,9 @@ class Buffer:
                     kernel_type = EpDispatchCombineKernelType.InterNodeV1
                     if self.low_latency_mode:
                         kernel_type = EpDispatchCombineKernelType.InterNodeV1LL
+                _debug_print(f"Selected kernel_type: {kernel_type} (gpu_per_node={self.gpu_per_node}, group_size={self.group_size}, low_latency_mode={self.low_latency_mode})")
 
+            _debug_print(f"Creating EpDispatchCombineOp: dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}")
             # TODO: These parameters might need to be tuned or exposed
             self.config = EpDispatchCombineConfig(
                 data_type=dtype,
@@ -148,7 +159,9 @@ class Buffer:
         return self.ops
 
     def _should_use_deepep_ll(self) -> bool:
-        return self.gpu_per_node is not None and self.group_size <= self.gpu_per_node
+        result = self.gpu_per_node is not None and self.group_size <= self.gpu_per_node
+        _debug_print(f"_should_use_deepep_ll: {result} (gpu_per_node={self.gpu_per_node}, group_size={self.group_size})")
+        return result
 
     def _get_deepep_op(
         self,
@@ -185,6 +198,7 @@ class Buffer:
         )
 
         if self.deepep_ops is None or self.deepep_config != config:
+            _debug_print(f"Creating EpDispatchCombineDeepepOp: dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, use_fp8={use_fp8}, use_weighted_combine={use_weighted_combine}")
             self.deepep_config = config
             self.deepep_ops = EpDispatchCombineDeepepOp(config)
 
@@ -342,6 +356,7 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        _debug_print(f"dispatch: Processing {x.shape if isinstance(x, torch.Tensor) else (x[0].shape, x[1].shape)} tokens")
         op, inp, inp_scales, dispatch_indices_arg = self._preprocess_dispatch(
             x,
             topk_idx,
@@ -393,6 +408,7 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        _debug_print(f"combine: Processing {x.shape} tokens")
         op = self.ops
 
         combine_input, dispatch_indices_arg, combine_weights = self._preprocess_combine(
@@ -458,6 +474,7 @@ class Buffer:
             raise NotImplementedError("MORI  async_finish/return_recv_hook is not supported yet.")
 
         if self._should_use_deepep_ll():
+            _debug_print(f"low_latency_dispatch: Using DeepEP LL path")
             self.max_num_inp_token_per_rank = max(num_max_dispatch_tokens_per_rank, x.size(0))
             self.num_experts_per_token = topk_idx.size(1)
             scale_dim = x.size(1) // 128 if use_fp8 else 0
@@ -482,6 +499,7 @@ class Buffer:
             new_handle = ("deepep_ll", deepep_op, dispatch_indices, dispatch_weights, use_fp8)
             return recv_x, recv_count, new_handle, EventOverlap(), None
 
+        _debug_print(f"low_latency_dispatch: Using standard dispatch path")
         dispatch_input = Buffer._per_token_cast_to_fp8(x) if use_fp8 else x
 
         op, inp, inp_scales, dispatch_indices_arg = self._preprocess_dispatch(
@@ -517,6 +535,7 @@ class Buffer:
         Not fully supported with the same API.
         """
         if self._should_use_deepep_ll() and handle and len(handle) >= 4 and handle[0] == "deepep_ll":
+            _debug_print(f"low_latency_combine: Using DeepEP LL path")
             if len(handle) >= 5:
                 _, deepep_op, dispatch_indices, dispatch_weights, use_fp8 = handle
             else:
@@ -533,6 +552,7 @@ class Buffer:
             )
             return combine_output, EventOverlap(), None
 
+        _debug_print(f"low_latency_combine: Using standard combine path")
         rec_output, dispatch_weights, dispatch_indices_arg = self._preprocess_low_latency_combine(
             x,
             handle,
