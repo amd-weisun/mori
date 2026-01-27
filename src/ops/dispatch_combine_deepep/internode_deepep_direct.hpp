@@ -204,9 +204,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
 
       if (laneId == 0) {
-        index_t* expertCounter =
-            args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-        destTokId = atomicAdd(expertCounter + localExpert, 1);
+        if (isRemote) {
+          // For remote ranks, use RDMA atomic fetch-and-add
+          destTokId = shmem::ShmemInt32AtomicFetchAddThread(
+              args.destExpertTokenCounterMemObj,
+              localExpert * sizeof(index_t),
+              1,
+              destPe);
+        } else {
+          // For same-node ranks, use local atomicAdd
+          index_t* expertCounter =
+              args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
+          destTokId = atomicAdd(expertCounter + localExpert, 1);
+        }
         atomicAdd(args.destPeTokenCounter + destPe, 1);
         if (isRemote) {
           atomicAdd(args.destNodeTokenCounter + destNode, 1);
@@ -217,9 +227,20 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t destLinearTok = localExpert * expertCapacity + destTokId;
 
       if (laneId == 0) {
-        core::AtomicStoreRelaxedSystem(
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
-            static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId));
+        index_t srcTokMappingValue = static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId);
+        if (isRemote) {
+          // For remote ranks, use RDMA put for the srcTokId mapping
+          shmem::ShmemPutTypeImmNbiThread<index_t>(
+              args.dispTokIdToSrcTokIdMemObj,
+              destLinearTok * sizeof(index_t),
+              srcTokMappingValue,
+              destPe);
+        } else {
+          // For same-node ranks, use local atomic store
+          core::AtomicStoreRelaxedSystem(
+              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
+              srcTokMappingValue);
+        }
       }
 
       // Copy weights and indices for same-node ranks
