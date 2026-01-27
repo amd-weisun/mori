@@ -21,12 +21,12 @@ Usage (single node with mp.spawn):
 Usage (multi-node with torchrun):
   # Node 0:
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
-      --master_addr=<node0_ip> --master_port=29500 \
+      --master_addr=${MASTER_ADDR} --master_port=29500 \
       tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode
 
   # Node 1:
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
-      --master_addr=<node0_ip> --master_port=29500 \
+      --master_addr=${MASTER_ADDR} --master_port=29500 \
       tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode
 
 Usage (SLURM):
@@ -178,6 +178,11 @@ def run_test_multinode(setting: dict):
         print(f"[DeepEP MultiNode] world_size={world_size}, gpu_per_node={gpu_per_node}", flush=True)
         print(f"[DeepEP MultiNode] num_nodes={world_size // gpu_per_node}", flush=True)
 
+    # Register process group with name "default" for MORI shmem
+    world_group = torch.distributed.group.WORLD
+    assert world_group is not None
+    torch._C._distributed_c10d._register_process_group("default", world_group)
+
     mori.shmem.shmem_torch_process_group_init("default")
 
     try:
@@ -213,7 +218,7 @@ def run_test_impl(
     kernel_type = (
         mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
         if is_internode
-        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNodeLL
+        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
     )
 
     if rank == 0:
