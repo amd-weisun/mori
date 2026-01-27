@@ -153,6 +153,10 @@ class EpDispatchCombineHandle {
   void LaunchIntraNodeDispatchDeepepLL(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchIntraNodeCombineDeepepLL(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 
+  // DeepEP-compatible low-latency internode variants
+  void LaunchInterNodeDispatchDeepepLL(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchInterNodeCombineDeepepLL(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+
   void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
@@ -264,6 +268,7 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+
 };
 
 template <typename T>
