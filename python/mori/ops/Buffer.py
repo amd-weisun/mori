@@ -18,11 +18,16 @@ if "MORI_SHMEM_MODE" not in os.environ:
     os.environ["MORI_SHMEM_MODE"] = "isolation"
 
 # Debug flag: set ENABLE_DEBUG_INFO=1 to enable debug prints
-DEBUG_INFO = os.getenv("ENABLE_DEBUG_INFO", "0") == "1"
+ENABLE_DEBUG_INFO = os.getenv("ENABLE_DEBUG_INFO", "0") == "1"
 
 def _debug_print(msg: str):
-    """Print debug message if ENABLE_DEBUG_INFO=1"""
-    if DEBUG_INFO:
+    """Print debug message if ENABLE_DEBUG_INFO=1 and rank=0"""
+    if ENABLE_DEBUG_INFO:
+        try:
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except Exception:
+            pass
         print(f"[Buffer DEBUG] {msg}", flush=True)
 # Mock classes to maintain API compatibility
 class Config:
