@@ -102,10 +102,17 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   // Step 1: Intra-node barrier - signal to all same-node ranks
+  // Wait for all warps to arrive, then reset barrier (only thread 0 resets)
   if (globalThdId < gpuPerNode) {
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+  }
+  __syncthreads();
+  if (globalThdId == 0) {
     args.combineGridBarrier[0] = 0;
+  }
+  __syncthreads();
 
+  if (globalThdId < gpuPerNode) {
     int destPe = myNode * gpuPerNode + globalThdId;
     // Direct atomic store for same-node ranks
     core::AtomicStoreRelaxedSystem(
@@ -476,10 +483,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Signal token counts to destination ranks
   if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-      args.dispatchGridBarrier[0] = 0;
+    // Wait for all warps to complete, then reset barrier (once, outside loop)
+    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
+    __syncwarp();
 
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
 
