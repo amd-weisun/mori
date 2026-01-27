@@ -611,7 +611,9 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
           if (isRemote) {
             // For remote ranks, first stage to symmetric buffer, then RDMA put
-            T* localStaging = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
+            // Use shmemStagingTokMemObj (known to work from dispatch) as source.
+            // Use linear offset for staging to avoid race conditions between warps.
+            T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() +
                               linear * config.hiddenDim;
             for (int j = laneId; j < config.hiddenDim; j += warpSize) {
               localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
@@ -623,7 +625,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
               size_t destOffset = srcTokId * config.hiddenDim * sizeof(T);
               shmem::ShmemPutMemNbiThread(
                   args.shmemCombineOutTokMemObj, destOffset,
-                  args.shmemCombineInpTokMemObj, srcOffset,
+                  args.shmemStagingTokMemObj, srcOffset,
                   config.hiddenDim * sizeof(T), srcPe, 0);
             }
           } else {
