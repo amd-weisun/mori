@@ -421,19 +421,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // Ensure all token data RDMA puts from the main loop are complete.
-  // Each warp may have issued puts to various destPes. We need to quiet ALL outstanding
-  // puts before proceeding to expert count signaling, since ShmemQuietThread(pe) only
-  // affects puts issued by the SAME warp, not puts from other warps.
+  // Each warp may have issued puts to various destPes. ShmemQuietThread(pe) only
+  // affects puts issued by the SAME warp, so each warp must quiet ALL remote PEs
+  // it may have sent to (not just one PE per warp).
   // NOTE: We only quiet REMOTE PEs (inter-node) since same-node transfers don't use RDMA.
-  // Calling ShmemQuietThread() without args would try to quiet ALL PEs and may fail
-  // for same-node PEs that don't have RDMA connections.
   {
     __syncthreads();  // Ensure all warps finished the main loop
-    // Each warp quiets one or more remote PEs
-    for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote && laneId == 0) {
-        shmem::ShmemQuietThread(destPe);
+    // Each warp quiets ALL remote PEs it may have sent to
+    if (laneId == 0) {
+      for (int destPe = 0; destPe < npes; ++destPe) {
+        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+        if (isRemote) {
+          shmem::ShmemQuietThread(destPe);
+        }
       }
     }
     __syncthreads();  // Ensure all warps have completed their quiet
@@ -674,17 +674,19 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
   // Ensure all RDMA puts from the above loops are complete before barrier.
   // Each warp may have issued puts to various srcPes (for combine, sending back to source).
+  // ShmemQuietThread(pe) only affects puts issued by the SAME warp, so each warp must
+  // quiet ALL remote PEs it may have sent to (not just one PE per warp).
   // NOTE: We only quiet REMOTE PEs (inter-node) since same-node transfers don't use RDMA.
-  // Calling ShmemQuietThread() without args would try to quiet ALL PEs and may fail
-  // for same-node PEs that don't have RDMA connections.
   {
     __syncthreads();  // Ensure all warps finished the RDMA puts
     int npes = config.worldSize;
-    // Each warp quiets one or more remote PEs
-    for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-      if (isRemote && laneId == 0) {
-        shmem::ShmemQuietThread(srcPe);
+    // Each warp quiets ALL remote PEs it may have sent to
+    if (laneId == 0) {
+      for (int srcPe = 0; srcPe < npes; ++srcPe) {
+        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+        if (isRemote) {
+          shmem::ShmemQuietThread(srcPe);
+        }
       }
     }
     __syncthreads();  // Ensure all warps have completed their quiet
