@@ -190,6 +190,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     for (int node = 0; node < npes / gpuPerNode; ++node) {
       args.destNodeTokenCounter[node] = 0;
     }
+    // Reset local per-(destPe, localExpert) counters for inter-node dispatch
+    int localPeCounterSize = npes * config.numExpertPerRank;
+    for (int idx = 0; idx < localPeCounterSize; ++idx) {
+      args.localPeTokenCounter[idx] = 0;
+    }
   }
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
 
@@ -204,18 +209,33 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
 
       if (laneId == 0) {
+        // Use source-rank-partitioned layout for ALL tokens (same-node and remote).
+        // Each source rank has a reserved section in each expert's buffer:
+        // [srcPe * maxNumInpTokenPerRank, (srcPe+1) * maxNumInpTokenPerRank)
+        // This avoids RDMA fetch atomics for remote ranks.
+
+        // Compute our slot within our reserved section.
+        // Use local counter partitioned by (destPe, localExpert).
+        // Index: destPe * numExpertPerRank + localExpert
+        index_t localCounterIdx = destPe * config.numExpertPerRank + localExpert;
+        index_t localSlot = atomicAdd(args.localPeTokenCounter + localCounterIdx, 1);
+
+        // Our destTokId within the expert buffer uses source-rank partitioning
+        destTokId = myPe * config.maxNumInpTokenPerRank + localSlot;
+
         if (isRemote) {
-          // For remote ranks, use RDMA atomic fetch-and-add
-          destTokId = shmem::ShmemInt32AtomicFetchAddThread(
+          // Use non-fetch RDMA atomic to increment remote expert counter
+          shmem::ShmemAtomicTypeNonFetchThread<index_t>(
               args.destExpertTokenCounterMemObj,
               localExpert * sizeof(index_t),
               1,
+              core::AMO_ADD,
               destPe);
         } else {
-          // For same-node ranks, use local atomicAdd
+          // For same-node ranks, use local atomicAdd on the expert counter
           index_t* expertCounter =
               args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-          destTokId = atomicAdd(expertCounter + localExpert, 1);
+          atomicAdd(expertCounter + localExpert, 1);
         }
         atomicAdd(args.destPeTokenCounter + destPe, 1);
         if (isRemote) {
@@ -445,33 +465,52 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
 
   // Step 1: Copy expert outputs to symmetric combine buffer for same-node access
-  // and issue RDMA puts for remote ranks
+  // and issue RDMA puts for remote ranks.
+  // With source-rank-partitioned slots, each source PE has slots at:
+  // [srcPe * maxNumInpTokenPerRank, (srcPe+1) * maxNumInpTokenPerRank)
+  // We iterate through all source PEs and check for valid entries.
   if (args.config.useExternalInpBuffer) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
-      index_t count = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
-      for (int slot = globalWarpId; slot < count; slot += globalWarpNum) {
-        index_t linear = e * expertCapacity + slot;
-
-        // Get the source rank and token for this slot
-        index_t srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
-        index_t srcPe = srcInfo / config.maxNumInpTokenPerRank;
-        index_t srcTokId = srcInfo % config.maxNumInpTokenPerRank;
+      // Iterate through all source PEs
+      for (int srcPe = 0; srcPe < config.worldSize; ++srcPe) {
+        index_t slotBase = srcPe * config.maxNumInpTokenPerRank;
         bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
 
-        if (isRemote) {
-          // For remote ranks, issue RDMA put
+        // Each warp handles a portion of this srcPe's slots
+        for (int localSlot = globalWarpId; localSlot < config.maxNumInpTokenPerRank;
+             localSlot += globalWarpNum) {
+          index_t slot = slotBase + localSlot;
+          index_t linear = e * expertCapacity + slot;
+
+          // Check if this slot has valid data (srcInfo != -1)
+          // Read at lane 0 and broadcast to all lanes
+          index_t srcInfo;
           if (laneId == 0) {
-            void* remoteBuf = args.shmemCombineOutTokMemObj->template GetAs<T*>(srcPe) +
-                              srcTokId * config.hiddenDim;
-            shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + linear * config.hiddenDim,
-                                          config.hiddenDim * sizeof(T), srcPe, 0);
+            srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
           }
-        } else {
-          // For same-node ranks, use WarpCopy
-          core::WarpCopy(
-              args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim,
-              args.inpTokenBuf + linear * config.hiddenDim,
-              config.hiddenDim);
+          srcInfo = __shfl(srcInfo, 0);
+
+          if (srcInfo == static_cast<index_t>(-1)) {
+            continue;  // Slot not used, all lanes skip together
+          }
+
+          index_t srcTokId = srcInfo % config.maxNumInpTokenPerRank;
+
+          if (isRemote) {
+            // For remote ranks, issue RDMA put
+            if (laneId == 0) {
+              void* remoteBuf = args.shmemCombineOutTokMemObj->template GetAs<T*>(srcPe) +
+                                srcTokId * config.hiddenDim;
+              shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + linear * config.hiddenDim,
+                                            config.hiddenDim * sizeof(T), srcPe, 0);
+            }
+          } else {
+            // For same-node ranks, use WarpCopy
+            core::WarpCopy(
+                args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim,
+                args.inpTokenBuf + linear * config.hiddenDim,
+                config.hiddenDim);
+          }
         }
       }
     }
@@ -479,19 +518,33 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
   if (args.weightsBuf) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
-      index_t count = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
-      for (int slot = globalWarpId; slot < count; slot += globalWarpNum) {
-        index_t linear = e * expertCapacity + slot;
-
-        index_t srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
-        index_t srcPe = srcInfo / config.maxNumInpTokenPerRank;
+      // Iterate through all source PEs
+      for (int srcPe = 0; srcPe < config.worldSize; ++srcPe) {
+        index_t slotBase = srcPe * config.maxNumInpTokenPerRank;
         bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
 
         if (!isRemote) {
-          core::WarpCopy(
-              args.shmemInpWeightsMemObj->template GetAs<float*>() + linear * config.numExpertPerToken,
-              args.weightsBuf + linear * config.numExpertPerToken,
-              config.numExpertPerToken);
+          for (int localSlot = globalWarpId; localSlot < config.maxNumInpTokenPerRank;
+               localSlot += globalWarpNum) {
+            index_t slot = slotBase + localSlot;
+            index_t linear = e * expertCapacity + slot;
+
+            // Check if this slot has valid data (srcInfo != -1)
+            index_t srcInfo;
+            if (laneId == 0) {
+              srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
+            }
+            srcInfo = __shfl(srcInfo, 0);
+
+            if (srcInfo == static_cast<index_t>(-1)) {
+              continue;  // Slot not used, all lanes skip together
+            }
+
+            core::WarpCopy(
+                args.shmemInpWeightsMemObj->template GetAs<float*>() + linear * config.numExpertPerToken,
+                args.weightsBuf + linear * config.numExpertPerToken,
+                config.numExpertPerToken);
+          }
         }
       }
     }
