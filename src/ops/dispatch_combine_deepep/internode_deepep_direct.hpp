@@ -25,7 +25,6 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/core/core.hpp"
-#include "mori/ops/dispatch_combine_deepep/intranode_deepep_direct.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/shmem_device_api_wrapper.hpp"
 
