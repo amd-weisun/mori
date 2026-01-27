@@ -620,14 +620,14 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
             }
             __syncwarp();
 
-            if (laneId == 0) {
-              size_t srcOffset = linear * config.hiddenDim * sizeof(T);
-              size_t destOffset = srcTokId * config.hiddenDim * sizeof(T);
-              shmem::ShmemPutMemNbiThread(
-                  args.shmemCombineOutTokMemObj, destOffset,
-                  args.shmemStagingTokMemObj, srcOffset,
-                  config.hiddenDim * sizeof(T), srcPe, 0);
-            }
+            // Use warp-level RDMA put like the legacy internode kernel does.
+            // Element offsets (not byte offsets) and element counts are used.
+            size_t srcElmOffset = linear * config.hiddenDim;
+            size_t destElmOffset = srcTokId * config.hiddenDim;
+            shmem::ShmemPutTypeNbiWarp<T>(
+                args.shmemCombineOutTokMemObj, destElmOffset,
+                args.shmemStagingTokMemObj, srcElmOffset,
+                config.hiddenDim, srcPe, 0);
           } else {
             // For same-node ranks, use WarpCopy
             core::WarpCopy(
