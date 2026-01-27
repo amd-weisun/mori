@@ -19,7 +19,7 @@ Usage (single node with mp.spawn):
   python tests/python/ops/test_dispatch_combine_deepep_ll.py --all
 
 Usage (multi-node with torchrun):
-  # Node 0:
+  # Node 0 (2 nodes, 8 GPUs per node):
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
       --master_addr=${MASTER_ADDR} --master_port=29500 \
       tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode
@@ -28,6 +28,11 @@ Usage (multi-node with torchrun):
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
       --master_addr=${MASTER_ADDR} --master_port=29500 \
       tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode
+
+  # Override gpu_per_node (defaults to nproc_per_node):
+  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+      --master_addr=${MASTER_ADDR} --master_port=29500 \
+      tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --gpu-per-node 4
 
 Usage (SLURM):
   srun -N 2 --ntasks-per-node=8 --gpus-per-node=8 \
@@ -165,14 +170,19 @@ def run_test_worker(
 
 def run_test_multinode(setting: dict):
     """Entry point for torchrun/srun mode (multi-node)."""
-    dist.init_process_group(backend="nccl")
+    # Get local rank from environment (set by torchrun/srun) before init
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    gpu_per_node = setting["gpu_per_node"]
+
+    # Set CUDA device before init_process_group
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    # Initialize process group with device_id for proper GPU association
+    dist.init_process_group(backend="nccl", device_id=device)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % 8))
-    gpu_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", 8))
-
-    torch.cuda.set_device(local_rank)
 
     if rank == 0:
         print(f"[DeepEP MultiNode] world_size={world_size}, gpu_per_node={gpu_per_node}", flush=True)
@@ -429,7 +439,11 @@ def main():
     if args.multinode:
         setting = PRESET_SETTINGS[args.setting].copy()
         if args.gpu_per_node:
+            # Explicit override via --gpu-per-node
             setting["gpu_per_node"] = args.gpu_per_node
+        else:
+            # Default to LOCAL_WORLD_SIZE (nproc_per_node from torchrun)
+            setting["gpu_per_node"] = int(os.environ.get("LOCAL_WORLD_SIZE", setting["gpu_per_node"]))
         run_test_multinode(setting)
         return
 
