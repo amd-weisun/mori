@@ -488,6 +488,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     if (laneId == 0) args.dispatchGridBarrier[0] = 0;
     __syncwarp();
 
+    // Before sending signals, warp 0 must quiet ALL remote destinations.
+    // This ensures count puts from OTHER warps (which used different QPs) are complete.
+    // Without this, the signal might arrive before counts from other warps.
+    if (laneId == 0) {
+      for (int pe = 0; pe < npes; ++pe) {
+        if (internode_ll::IsRemoteRank(myPe, pe, gpuPerNode)) {
+          shmem::ShmemQuietThread(pe);
+        }
+      }
+    }
+    __syncwarp();
+
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
@@ -521,6 +533,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[srcPe] = 0;
     }
+    // Ensure all lanes have received their signals before lane 0 reads counts.
+    // Without this, lane 0 might read srcExpertCounter before the RDMA puts
+    // from remote ranks (signaled by other lanes) are complete.
+    __syncwarp();
+
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
 
