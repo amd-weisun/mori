@@ -76,6 +76,79 @@ __device__ __forceinline__ int GetNodeId(int rank, int gpuPerNode) {
 }  // namespace internode_ll
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                          Inter-Node Barrier (uses RDMA for remote ranks)                       */
+/* ---------------------------------------------------------------------------------------------- */
+/*
+ * 1. Intra-node barrier: direct atomic stores/loads for same-node ranks
+ * 2. Inter-node barrier: RDMA atomics via proxy PEs for cross-node synchronization
+ *
+ * Proxy PE concept: Each rank communicates with its corresponding rank on other nodes.
+ * E.g., rank 0 on node 0 <-> rank 8 on node 1 (if gpuPerNode=8)
+ */
+template <typename T>
+inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args,
+                                                          const uint32_t crossDeviceBarrierFlag) {
+  int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpNum = gridDim.x * warpNum;
+  int myPe = args.config.rank;
+  int gpuPerNode = args.config.gpuPerNode;
+  int myNode = myPe / gpuPerNode;
+  int nNodes = args.config.worldSize / gpuPerNode;
+
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+
+  // Step 1: Intra-node barrier - signal to all same-node ranks
+  if (globalThdId < gpuPerNode) {
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    args.combineGridBarrier[0] = 0;
+
+    int destPe = myNode * gpuPerNode + globalThdId;
+    // Direct atomic store for same-node ranks
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe,
+        crossDeviceBarrierFlag);
+  }
+
+  if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+
+  // Wait for all same-node ranks to signal
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < gpuPerNode) {
+    int srcPe = myNode * gpuPerNode + thdId;
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + srcPe) != crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+
+  // Step 2: Inter-node barrier - use RDMA atomics via proxy PEs
+  if (globalThdId < nNodes && globalThdId != myNode) {
+    int proxyPe = globalThdId * gpuPerNode + (myPe % gpuPerNode);
+    // Use RDMA atomic add for cross-node signaling
+    shmem::ShmemAtomicTypeNonFetchThread<uint32_t>(
+        args.crossDeviceBarrierMemObj,
+        myPe * sizeof(uint32_t),
+        1,
+        core::AMO_ADD,
+        proxyPe,
+        0);
+  }
+
+  // Wait for all remote nodes to signal (via their proxy PEs)
+  // Each proxy PE slot is only written via RDMA add from the corresponding remote rank.
+  // After N barrier invocations, the slot has value N. So we wait for crossDeviceBarrierFlag.
+  if (thdId < nNodes && thdId != myNode) {
+    int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                              Multi-Node Dispatch Kernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -118,7 +191,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       args.destNodeTokenCounter[node] = 0;
     }
   }
-  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
 
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += globalWarpNum) {
@@ -404,7 +477,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Step 2: Cross-rank barrier so all writes are visible
-  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
   *args.totalRecvTokenNum = 0;
 
   if (args.curRankNumToken == 0) {
