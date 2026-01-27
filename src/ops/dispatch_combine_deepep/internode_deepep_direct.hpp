@@ -124,17 +124,17 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
   __syncthreads();
 
-  // Step 2: Inter-node barrier - use RDMA atomics via proxy PEs
+  // Step 2: Inter-node barrier - use RDMA put instead of atomic (to avoid RDMA atomic issues)
+  // Each rank writes its barrier flag to all proxy PEs on other nodes via RDMA put.
+  // Since each proxyPe slot is written by only one source rank (myPe), we can use put.
   if (globalThdId < nNodes && globalThdId != myNode) {
     int proxyPe = globalThdId * gpuPerNode + (myPe % gpuPerNode);
-    // Use RDMA atomic add for cross-node signaling
-    shmem::ShmemAtomicTypeNonFetchThread<uint32_t>(
+    // Use RDMA put to write the barrier flag value directly
+    shmem::ShmemPutTypeImmNbiThread<uint32_t>(
         args.crossDeviceBarrierMemObj,
         myPe * sizeof(uint32_t),
-        1,
-        core::AMO_ADD,
-        proxyPe,
-        0);
+        crossDeviceBarrierFlag,
+        proxyPe);
   }
 
   // Wait for all remote nodes to signal (via their proxy PEs)
@@ -223,20 +223,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         // Our destTokId within the expert buffer uses source-rank partitioning
         destTokId = myPe * config.maxNumInpTokenPerRank + localSlot;
 
-        if (isRemote) {
-          // Use non-fetch RDMA atomic to increment remote expert counter
-          shmem::ShmemAtomicTypeNonFetchThread<index_t>(
-              args.destExpertTokenCounterMemObj,
-              localExpert * sizeof(index_t),
-              1,
-              core::AMO_ADD,
-              destPe);
-        } else {
+        if (!isRemote) {
           // For same-node ranks, use local atomicAdd on the expert counter
           index_t* expertCounter =
               args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
           atomicAdd(expertCounter + localExpert, 1);
         }
+        // For remote ranks, we don't use RDMA atomic here.
+        // The counts are written via RDMA put after the main loop ends.
         atomicAdd(args.destPeTokenCounter + destPe, 1);
         if (isRemote) {
           atomicAdd(args.destNodeTokenCounter + destNode, 1);
@@ -388,6 +382,34 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
+  // After processing all tokens, use RDMA put to write per-(srcPe, localExpert) counts
+  // to each remote destination rank. This avoids RDMA atomics.
+  // localPeTokenCounter[destPe * numExpertPerRank + localExpert] contains the count
+  // of tokens sent from this rank (myPe) to (destPe, localExpert).
+  // We write this to srcExpertTokenCounterMemObj on destPe at slot [myPe * numExpertPerRank + localExpert].
+  {
+    // Synchronize so all token writes are done before sending counts
+    __syncthreads();
+    // Each warp handles one destPe
+    for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        // Write counts for all local experts to this remote destPe
+        for (int e = laneId; e < config.numExpertPerRank; e += warpSize) {
+          index_t localCounterIdx = destPe * config.numExpertPerRank + e;
+          index_t count = args.localPeTokenCounter[localCounterIdx];
+          // Write to slot [myPe * numExpertPerRank + e] on destPe
+          index_t destSlot = myPe * config.numExpertPerRank + e;
+          shmem::ShmemPutTypeImmNbiThread<index_t>(
+              args.srcExpertTokenCounterMemObj,
+              destSlot * sizeof(index_t),
+              count,
+              destPe);
+        }
+      }
+    }
+  }
+
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
@@ -424,13 +446,36 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+
+      // Sum expert counts from all source ranks:
+      // - Same-node ranks: already accumulated in destExpertTokenCounterMemObj
+      // - Remote ranks: stored in srcExpertTokenCounterMemObj[srcPe * numExpertPerRank + e]
       index_t* localExpertCounter =
           args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
+      index_t* srcExpertCounter =
+          args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
+
       for (int e = 0; e < config.numExpertPerRank; ++e) {
-        args.recvTokenCountPerExpert[e] = localExpertCounter[e];
+        // Start with same-node counts
+        index_t totalCount = localExpertCounter[e];
+        // Add remote counts from srcExpertTokenCounterMemObj
+        for (int srcPe = 0; srcPe < npes; ++srcPe) {
+          bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+          if (isRemote) {
+            totalCount += srcExpertCounter[srcPe * config.numExpertPerRank + e];
+          }
+        }
+        args.recvTokenCountPerExpert[e] = totalCount;
       }
+
+      // Reset counters for next dispatch
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         localExpertCounter[e] = 0;
+      }
+      for (int srcPe = 0; srcPe < npes; ++srcPe) {
+        for (int e = 0; e < config.numExpertPerRank; ++e) {
+          srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
+        }
       }
     }
   }

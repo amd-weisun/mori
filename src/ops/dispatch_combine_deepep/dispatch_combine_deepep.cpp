@@ -178,6 +178,11 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(
       hipMemset(recvTokenCountPerExpert, 0, config.numExpertPerRank * sizeof(index_t)));
 
+  // Symmetric buffer for per-(srcPe, localExpert) token counts on each destination.
+  // Used by inter-node dispatch to avoid RDMA atomics.
+  size_t srcExpertTokenCounterSize = static_cast<size_t>(config.worldSize) * config.numExpertPerRank * sizeof(index_t);
+  srcExpertTokenCounterMemObj = ShmemMallocAndReturnMemObjPtr(srcExpertTokenCounterSize, hipDeviceMallocUncached);
+
   dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
       ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
@@ -213,6 +218,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(destNodeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(recvTokenCountPerExpert));
+  ShmemFree(srcExpertTokenCounterMemObj->localPtr);
   ShmemFree(dispTokOffsetMemObj->localPtr);
   ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
@@ -400,6 +406,10 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
   // Reset local per-(destPe, localExpert) counters for inter-node dispatch
   size_t localPeTokenCounterSize = static_cast<size_t>(config.worldSize) * config.numExpertPerRank * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMemsetAsync(localPeTokenCounter, 0, localPeTokenCounterSize, stream));
+
+  // Reset per-source-rank expert counters (used to avoid RDMA atomics)
+  size_t srcExpertTokenCounterSize = static_cast<size_t>(config.worldSize) * config.numExpertPerRank * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMemsetAsync(srcExpertTokenCounterMemObj->Get(), 0, srcExpertTokenCounterSize, stream));
 
   size_t expertCapacity = static_cast<size_t>(config.worldSize) * config.maxNumInpTokenPerRank;
   size_t totalTokenSlots = static_cast<size_t>(config.numExpertPerRank) * expertCapacity;
