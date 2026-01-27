@@ -462,9 +462,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
-        // For remote ranks, use RDMA atomic
-        shmem::ShmemInt32WaitUntilEquals(signal, 0);
-        shmem::ShmemPutTypeImmNbiThread<int32_t>(signal, numTokenSignal, destPe, 0);
+        // For remote ranks, use RDMA put to write the signal.
+        // We can't directly poll remote memory, so we skip the wait and rely on
+        // the barrier synchronization to ensure ordering. The signal value is
+        // only written after all data has been sent.
+        size_t signalOffset = myPe * sizeof(index_t);
+        shmem::ShmemPutTypeImmNbiThread<index_t>(
+            args.recvTokenNumMemObj,
+            signalOffset,
+            numTokenSignal,
+            destPe);
       } else {
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
