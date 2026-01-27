@@ -242,6 +242,9 @@ class EpDispatchCombineHandle {
   index_t* localPeTokenCounter{nullptr};
   // Count the number of tokens received by each local expert (LL dispatch)
   index_t* recvTokenCountPerExpert{nullptr};
+  // Symmetric buffer for per-(srcPe, localExpert) token counts on each destination
+  // Used by inter-node dispatch to avoid RDMA atomics. Size: worldSize * numExpertPerRank
+  mori::application::SymmMemObjPtr srcExpertTokenCounterMemObj;
 
   // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
@@ -303,6 +306,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr destExpertTokenCounterMemObj;
   index_t* localPeTokenCounter{nullptr};
   index_t* recvTokenCountPerExpert{nullptr};
+  mori::application::SymmMemObjPtr srcExpertTokenCounterMemObj;
   index_t* dispReceiverIdxMap{nullptr};
   index_t* dispSenderIdxMap{nullptr};
   index_t* destPeTokenIdxMap{nullptr};
@@ -350,6 +354,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.destExpertTokenCounterMemObj = handle.destExpertTokenCounterMemObj;
   args.localPeTokenCounter = handle.localPeTokenCounter;
   args.recvTokenCountPerExpert = handle.recvTokenCountPerExpert;
+  args.srcExpertTokenCounterMemObj = handle.srcExpertTokenCounterMemObj;
   args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
   args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
   args.shmemDispatchOutTokMemObj = handle.shmemDispatchOutTokMemObj;
