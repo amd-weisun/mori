@@ -311,40 +311,78 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           }
           __syncwarp();
 
-          // Issue RDMA put for FP8 data
+          // Issue RDMA put for FP8 data using SymmMemObjPtr-based API
           if (laneId == 0) {
-            void* remoteFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
-                args.shmemDispatchOutTokMemObj->peerPtrs[destPe]) + baseOffset;
-            shmem::ShmemPutMemNbiThread(remoteFp8, localFp8Staging,
-                                          config.hiddenDim * sizeof(__hip_fp8_storage_t), destPe, 0);
-            void* remoteScales = reinterpret_cast<void*>(args.shmemOutScalesMemObj->peerPtrs[destPe]);
-            remoteScales = reinterpret_cast<float*>(remoteScales) + destLinearTok * numScales;
-            shmem::ShmemPutMemNbiThread(remoteScales, localScalesStaging,
-                                          numScales * sizeof(float), destPe, 0);
+            // Source offset within shmemStagingTokMemObj
+            size_t srcFp8Offset = srcTokId * config.hiddenDim * sizeof(__hip_fp8_storage_t);
+            // Destination offset within shmemDispatchOutTokMemObj
+            size_t destFp8Offset = baseOffset * sizeof(__hip_fp8_storage_t);
+            shmem::ShmemPutMemNbiThread(
+                args.shmemDispatchOutTokMemObj, destFp8Offset,
+                args.shmemStagingTokMemObj, srcFp8Offset,
+                config.hiddenDim * sizeof(__hip_fp8_storage_t), destPe, 0);
+
+            // Scales offset
+            size_t stagingScalesBase = config.maxNumInpTokenPerRank * config.hiddenDim * sizeof(__hip_fp8_storage_t);
+            size_t srcScalesOffset = stagingScalesBase + srcTokId * numScales * sizeof(float);
+            size_t destScalesOffset = destLinearTok * numScales * sizeof(float);
+            shmem::ShmemPutMemNbiThread(
+                args.shmemOutScalesMemObj, destScalesOffset,
+                args.shmemStagingTokMemObj, srcScalesOffset,
+                numScales * sizeof(float), destPe, 0);
           }
         } else {
-          // BF16: direct RDMA
+          // BF16: stage to symmetric buffer then RDMA put
+          // First copy to staging buffer
+          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() +
+                            srcTokId * config.hiddenDim;
+          for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+            localStaging[j] = args.inpTokenBuf[srcTokOffset + j];
+          }
+          __syncwarp();
+
+          // Issue RDMA put using SymmMemObjPtr-based API
           if (laneId == 0) {
-            void* remoteBuf = args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset;
-            shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + srcTokOffset,
-                                          config.hiddenDim * sizeof(T), destPe, 0);
+            size_t srcOffset = srcTokId * config.hiddenDim * sizeof(T);
+            size_t destOffset = baseOffset * sizeof(T);
+            shmem::ShmemPutMemNbiThread(
+                args.shmemDispatchOutTokMemObj, destOffset,
+                args.shmemStagingTokMemObj, srcOffset,
+                config.hiddenDim * sizeof(T), destPe, 0);
           }
         }
 
         // Also send weights and indices via RDMA for remote ranks
+        // First stage to local symmetric buffers, then issue RDMA puts
+        if (args.weightsBuf) {
+          float* localWeightsStaging = args.shmemInpWeightsMemObj->template GetAs<float*>() +
+                                       srcTokId * config.numExpertPerToken;
+          if (laneId < config.numExpertPerToken) {
+            localWeightsStaging[laneId] = args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+          }
+        }
+        index_t* localIndicesStaging = args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
+                                       srcTokId * config.numExpertPerToken;
+        if (laneId < config.numExpertPerToken) {
+          localIndicesStaging[laneId] = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+        }
+        __syncwarp();
+
         if (laneId == 0) {
           if (args.weightsBuf) {
-            void* remoteWeights = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
-                                  destLinearTok * config.numExpertPerToken;
-            shmem::ShmemPutMemNbiThread(remoteWeights,
-                                          args.weightsBuf + srcTokId * config.numExpertPerToken,
-                                          config.numExpertPerToken * sizeof(float), destPe, 0);
+            size_t srcWeightsOffset = srcTokId * config.numExpertPerToken * sizeof(float);
+            size_t destWeightsOffset = destLinearTok * config.numExpertPerToken * sizeof(float);
+            shmem::ShmemPutMemNbiThread(
+                args.shmemDispatchOutWeightsMemObj, destWeightsOffset,
+                args.shmemInpWeightsMemObj, srcWeightsOffset,
+                config.numExpertPerToken * sizeof(float), destPe, 0);
           }
-          void* remoteIndices = args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
-                                destLinearTok * config.numExpertPerToken;
-          shmem::ShmemPutMemNbiThread(remoteIndices,
-                                        args.tokenIndices + srcTokId * config.numExpertPerToken,
-                                        config.numExpertPerToken * sizeof(index_t), destPe, 0);
+          size_t srcIndicesOffset = srcTokId * config.numExpertPerToken * sizeof(index_t);
+          size_t destIndicesOffset = destLinearTok * config.numExpertPerToken * sizeof(index_t);
+          shmem::ShmemPutMemNbiThread(
+              args.shmemOutIndicesMemObj, destIndicesOffset,
+              args.shmemInpIndicesMemObj, srcIndicesOffset,
+              config.numExpertPerToken * sizeof(index_t), destPe, 0);
         }
       } else {
         // For same-node ranks, use SHMEM (same as intranode)
@@ -542,12 +580,21 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           index_t srcTokId = srcInfo % config.maxNumInpTokenPerRank;
 
           if (isRemote) {
-            // For remote ranks, issue RDMA put
+            // For remote ranks, first stage to symmetric buffer, then RDMA put
+            T* localStaging = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
+                              linear * config.hiddenDim;
+            for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+              localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
+            }
+            __syncwarp();
+
             if (laneId == 0) {
-              void* remoteBuf = args.shmemCombineOutTokMemObj->template GetAs<T*>(srcPe) +
-                                srcTokId * config.hiddenDim;
-              shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + linear * config.hiddenDim,
-                                            config.hiddenDim * sizeof(T), srcPe, 0);
+              size_t srcOffset = linear * config.hiddenDim * sizeof(T);
+              size_t destOffset = srcTokId * config.hiddenDim * sizeof(T);
+              shmem::ShmemPutMemNbiThread(
+                  args.shmemCombineOutTokMemObj, destOffset,
+                  args.shmemCombineInpTokMemObj, srcOffset,
+                  config.hiddenDim * sizeof(T), srcPe, 0);
             }
           } else {
             // For same-node ranks, use WarpCopy
