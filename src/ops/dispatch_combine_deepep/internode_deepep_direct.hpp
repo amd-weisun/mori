@@ -210,7 +210,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
                 args.shmemDispatchOutTokMemObj->peerPtrs[destPe]) + baseOffset;
             mori_shmem_putmem_nbi_thread(remoteFp8, localFp8Staging,
                                           config.hiddenDim * sizeof(__hip_fp8_storage_t), destPe, 0);
-            void* remoteScales = args.shmemOutScalesMemObj->peerPtrs[destPe];
+            void* remoteScales = reinterpret_cast<void*>(args.shmemOutScalesMemObj->peerPtrs[destPe]);
             remoteScales = reinterpret_cast<float*>(remoteScales) + destLinearTok * numScales;
             mori_shmem_putmem_nbi_thread(remoteScales, localScalesStaging,
                                           numScales * sizeof(float), destPe, 0);
