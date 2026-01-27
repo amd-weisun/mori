@@ -167,8 +167,12 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(
       hipMemset(destNodeTokenCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.worldSize * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
+  // For inter-node dispatch, we need per-(destPe, localExpert) counters
+  // to track local slot assignment without RDMA fetch atomics.
+  // Size: worldSize * numExpertPerRank
+  size_t localPeTokenCounterSize = static_cast<size_t>(config.worldSize) * config.numExpertPerRank * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, localPeTokenCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, localPeTokenCounterSize));
 
   HIP_RUNTIME_CHECK(hipMalloc(&recvTokenCountPerExpert, config.numExpertPerRank * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
@@ -393,6 +397,9 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
   HIP_RUNTIME_CHECK(hipMemsetAsync(destPeTokenCounter, 0, config.worldSize * sizeof(index_t), stream));
   HIP_RUNTIME_CHECK(hipMemsetAsync(destNodeTokenCounter, 0,
                                    config.worldSize / config.gpuPerNode * sizeof(index_t), stream));
+  // Reset local per-(destPe, localExpert) counters for inter-node dispatch
+  size_t localPeTokenCounterSize = static_cast<size_t>(config.worldSize) * config.numExpertPerRank * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMemsetAsync(localPeTokenCounter, 0, localPeTokenCounterSize, stream));
 
   size_t expertCapacity = static_cast<size_t>(config.worldSize) * config.maxNumInpTokenPerRank;
   size_t totalTokenSlots = static_cast<size_t>(config.numExpertPerRank) * expertCapacity;
