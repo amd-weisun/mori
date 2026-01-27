@@ -420,6 +420,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
+  // Ensure all token data RDMA puts from the main loop are complete.
+  // Each warp may have issued puts to various destPes. We need to quiet ALL outstanding
+  // puts before proceeding to expert count signaling, since ShmemQuietThread(pe) only
+  // affects puts issued by the SAME warp, not puts from other warps.
+  {
+    __syncthreads();  // Ensure all warps finished the main loop
+    // Each lane calls quiet for all outstanding puts from this thread
+    if (laneId == 0) {
+      shmem::ShmemQuietThread();  // Quiet all pending RDMA puts from this warp
+    }
+    __syncthreads();  // Ensure all warps have completed their quiet
+  }
+
   // After processing all tokens, use RDMA put to write per-(srcPe, localExpert) counts
   // to each remote destination rank. This avoids RDMA atomics.
   // localPeTokenCounter[destPe * numExpertPerRank + localExpert] contains the count
@@ -443,6 +456,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               destSlot * sizeof(index_t),
               count,
               destPe);
+        }
+        // Ensure RDMA puts to this destPe complete before signaling
+        if (laneId == 0) {
+          shmem::ShmemQuietThread(destPe);
         }
       }
     }
@@ -647,6 +664,16 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         }
       }
     }
+  }
+
+  // Ensure all RDMA puts from the above loops are complete before barrier.
+  // Each warp may have issued puts to various srcPes (for combine, sending back to source).
+  {
+    __syncthreads();  // Ensure all warps finished the RDMA puts
+    if (laneId == 0) {
+      shmem::ShmemQuietThread();  // Quiet all pending RDMA puts from this warp
+    }
+    __syncthreads();  // Ensure all warps have completed their quiet
   }
 
   // Step 2: Cross-rank barrier so all writes are visible
