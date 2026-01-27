@@ -26,7 +26,6 @@
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
-#include "mori/shmem/shmem_device_api_wrapper.hpp"
 
 namespace mori {
 namespace moe {
@@ -208,18 +207,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           if (laneId == 0) {
             void* remoteFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
                 args.shmemDispatchOutTokMemObj->peerPtrs[destPe]) + baseOffset;
-            mori_shmem_putmem_nbi_thread(remoteFp8, localFp8Staging,
+            shmem::ShmemPutMemNbiThread(remoteFp8, localFp8Staging,
                                           config.hiddenDim * sizeof(__hip_fp8_storage_t), destPe, 0);
             void* remoteScales = reinterpret_cast<void*>(args.shmemOutScalesMemObj->peerPtrs[destPe]);
             remoteScales = reinterpret_cast<float*>(remoteScales) + destLinearTok * numScales;
-            mori_shmem_putmem_nbi_thread(remoteScales, localScalesStaging,
+            shmem::ShmemPutMemNbiThread(remoteScales, localScalesStaging,
                                           numScales * sizeof(float), destPe, 0);
           }
         } else {
           // BF16: direct RDMA
           if (laneId == 0) {
             void* remoteBuf = args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset;
-            mori_shmem_putmem_nbi_thread(remoteBuf, args.inpTokenBuf + srcTokOffset,
+            shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + srcTokOffset,
                                           config.hiddenDim * sizeof(T), destPe, 0);
           }
         }
@@ -229,13 +228,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           if (args.weightsBuf) {
             void* remoteWeights = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
                                   destLinearTok * config.numExpertPerToken;
-            mori_shmem_putmem_nbi_thread(remoteWeights,
+            shmem::ShmemPutMemNbiThread(remoteWeights,
                                           args.weightsBuf + srcTokId * config.numExpertPerToken,
                                           config.numExpertPerToken * sizeof(float), destPe, 0);
           }
           void* remoteIndices = args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
                                 destLinearTok * config.numExpertPerToken;
-          mori_shmem_putmem_nbi_thread(remoteIndices,
+          shmem::ShmemPutMemNbiThread(remoteIndices,
                                         args.tokenIndices + srcTokId * config.numExpertPerToken,
                                         config.numExpertPerToken * sizeof(index_t), destPe, 0);
         }
@@ -291,7 +290,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (isRemote) {
         // For remote ranks, use RDMA atomic
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
-        mori_shmem_int32_p(signal, numTokenSignal, destPe, 0);
+        shmem::ShmemPutTypeImmNbiThread<int32_t>(signal, numTokenSignal, destPe, 0);
       } else {
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
@@ -370,7 +369,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           if (laneId == 0) {
             void* remoteBuf = args.shmemCombineOutTokMemObj->template GetAs<T*>(srcPe) +
                               srcTokId * config.hiddenDim;
-            mori_shmem_putmem_nbi_thread(remoteBuf, args.inpTokenBuf + linear * config.hiddenDim,
+            shmem::ShmemPutMemNbiThread(remoteBuf, args.inpTokenBuf + linear * config.hiddenDim,
                                           config.hiddenDim * sizeof(T), srcPe, 0);
           }
         } else {
