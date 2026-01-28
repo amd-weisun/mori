@@ -62,8 +62,6 @@ SKIP_DISPATCH_CHECKS = SKIP_CHECKS or os.getenv("MORI_DEEPEP_SKIP_DISPATCH_CHECK
 SKIP_COMBINE_CHECKS = SKIP_CHECKS or os.getenv("MORI_DEEPEP_SKIP_COMBINE_CHECKS", "0") == "1"
 DEBUG_LOG = os.getenv("MORI_DEEPEP_DEBUG_LOG", "0") == "1"
 
-# Global flags set by command-line args
-DISPATCH_ONLY = False
 
 
 PRESET_SETTINGS = {
@@ -179,6 +177,7 @@ def run_test_worker(
     setting: dict,
     port: int,
     gpu_per_node_override: int | None = None,
+    dispatch_only: bool = False,
 ):
     """Worker function for mp.spawn mode (single node).
 
@@ -199,12 +198,15 @@ def run_test_worker(
         try:
             # Pass local_gpu_id=local_rank so each process uses its own GPU
             # even when simulating multi-node topology (gpu_per_node < world_size)
-            run_test_impl(rank, world_size, setting, gpu_per_node_override, local_gpu_id=local_rank)
+            run_test_impl(
+                rank, world_size, setting, gpu_per_node_override,
+                local_gpu_id=local_rank, dispatch_only=dispatch_only
+            )
         finally:
             mori.shmem.shmem_finalize()
 
 
-def run_test_multinode(setting: dict, iterations: int = 1):
+def run_test_multinode(setting: dict, iterations: int = 1, dispatch_only: bool = False):
     """Entry point for torchrun/srun mode (multi-node)."""
     # Get local rank from environment (set by torchrun/srun) before init
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -235,7 +237,7 @@ def run_test_multinode(setting: dict, iterations: int = 1):
         for iteration in range(iterations):
             if iterations > 1 and rank == 0:
                 print(f"\n[DeepEP] Iteration {iteration + 1}/{iterations}", flush=True)
-            run_test_impl(rank, world_size, setting, gpu_per_node)
+            run_test_impl(rank, world_size, setting, gpu_per_node, dispatch_only=dispatch_only)
             dist.barrier()  # Sync between iterations
     finally:
         mori.shmem.shmem_finalize()
@@ -251,6 +253,7 @@ def run_test_impl(
     setting: dict,
     gpu_per_node_override: int | None = None,
     local_gpu_id: int | None = None,
+    dispatch_only: bool = False,
 ):
     """Core test implementation shared by both single-node and multi-node modes.
 
@@ -259,6 +262,7 @@ def run_test_impl(
                       (mp.spawn on single physical node), this should be `rank` since
                       each process needs its own physical GPU regardless of virtual
                       node topology.
+        dispatch_only: If True, skip the combine phase (for debugging dispatch).
     """
     hidden_dim = setting["hidden_dim"]
     max_num_inp_token_per_rank = setting["max_num_inp_token_per_rank"]
@@ -386,7 +390,7 @@ def run_test_impl(
         )
 
     # Skip combine phase if dispatch-only mode
-    if DISPATCH_ONLY:
+    if dispatch_only:
         op.reset()
         if rank == 0:
             print(f"[DeepEP] Dispatch-only test '{setting['name']}' PASSED", flush=True)
@@ -506,9 +510,6 @@ def main():
     args = parser.parse_args()
 
     # Set global flags
-    global DISPATCH_ONLY
-    DISPATCH_ONLY = args.dispatch_only
-
     # Multi-node mode: use torchrun/srun for process management
     if args.multinode:
         setting = PRESET_SETTINGS[args.setting].copy()
@@ -518,7 +519,7 @@ def main():
         else:
             # Default to LOCAL_WORLD_SIZE (nproc_per_node from torchrun)
             setting["gpu_per_node"] = int(os.environ.get("LOCAL_WORLD_SIZE", setting["gpu_per_node"]))
-        run_test_multinode(setting, iterations=args.iterations)
+        run_test_multinode(setting, iterations=args.iterations, dispatch_only=args.dispatch_only)
         return
 
     # Single-node mode: use mp.spawn for process management
@@ -540,7 +541,7 @@ def main():
         port = get_free_port()
         mp.spawn(
             run_test_worker,
-            args=(num_processes, setting, port, gpu_per_node),
+            args=(num_processes, setting, port, gpu_per_node, args.dispatch_only),
             nprocs=num_processes,
         )
 
