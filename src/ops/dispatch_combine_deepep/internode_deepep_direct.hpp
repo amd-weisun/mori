@@ -38,8 +38,8 @@ namespace deepep {
 // Enable one at a time to find the critical one
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
 #define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
-#define DEBUG_RECV_SIGNAL 1           // After receiving each signal
-#define DEBUG_RECV_COUNTS 1           // Print actual count values read from remote srcPe
+#define DEBUG_RECV_SIGNAL 0           // After receiving each signal
+#define DEBUG_RECV_COUNTS 0           // Print actual count values read from remote srcPe
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
 #define DEBUG_FINAL_SUMMARY 0         // After counting, before reset
 
@@ -815,19 +815,24 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         readTotal = 0;
         sameNodeTotal = 0;
         remoteTotal = 0;
+
+        // WORKAROUND: printf triggers host synchronization that flushes GPU L2 cache,
+        // making RDMA-written data visible. Without this, the L2 cache holds stale
+        // values that __threadfence_system() and volatile cannot invalidate.
+        // We call this once per retry iteration before reading any counts.
+        printf("");
+
         // Sum expert counts from all source ranks
         for (int e = 0; e < config.numExpertPerRank; ++e) {
           // Start with same-node counts
           index_t totalCount = localExpertCounter[e];
           sameNodeTotal += localExpertCounter[e];
           // Add remote counts from srcExpertTokenCounterMemObj
-          // Use volatile access to bypass GPU cache and see RDMA-written data
-          volatile index_t* volatileSrcExpertCounter =
-              reinterpret_cast<volatile index_t*>(srcExpertCounter);
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              index_t srcCount = volatileSrcExpertCounter[srcPe * config.numExpertPerRank + e];
+              index_t srcCount = core::AtomicLoadRelaxedSystem(
+                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
               remoteTotal += srcCount;
             }
