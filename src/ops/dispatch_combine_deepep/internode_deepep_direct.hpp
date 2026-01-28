@@ -38,7 +38,7 @@ namespace deepep {
 // Enable one at a time to find the critical one
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
 #define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
-#define DEBUG_RECV_SIGNAL 0           // After receiving each signal
+#define DEBUG_RECV_SIGNAL 1           // After receiving each signal
 #define DEBUG_RECV_COUNTS 1           // Print actual count values read from remote srcPe
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
 #define DEBUG_FINAL_SUMMARY 0         // After counting, before reset
@@ -761,8 +761,17 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // below works around this by retrying until the data is consistent.
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
+    if (laneId == 0) {
+      printf("[DEBUG][Rank %d] Waiting for signals from %d source ranks...\n", myPe, npes);
+    }
+#endif
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
       index_t* signal = recvTokenNums + srcPe;
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
+      printf("[DEBUG][Rank %d] Waiting for signal from srcPe=%d (current value=%d)...\n",
+             myPe, srcPe, core::AtomicLoadRelaxedSystem(signal));
+#endif
       // Use RDMA-aware polling with memory fence to see remote RDMA writes
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
@@ -788,19 +797,29 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Expected total from signals (already accumulated in totalRecvTokenNum)
       index_t expectedTotal = *args.totalRecvTokenNum;
 
+#if DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
+      printf("[DEBUG][Rank %d] Starting count validation: expectedTotal=%d (from signals)\n",
+             myPe, expectedTotal);
+#endif
+
       // Poll-then-validate-then-retry: The signal may arrive before count data is visible.
       // Keep retrying until the per-expert counts sum matches the signal total.
       // This works around RDMA put+signal not guaranteeing visibility ordering.
       int retryCount = 0;
       const int maxRetries = 1000000;  // Generous retry limit
       index_t readTotal = 0;
+      index_t sameNodeTotal = 0;
+      index_t remoteTotal = 0;
 
       do {
         readTotal = 0;
+        sameNodeTotal = 0;
+        remoteTotal = 0;
         // Sum expert counts from all source ranks
         for (int e = 0; e < config.numExpertPerRank; ++e) {
           // Start with same-node counts
           index_t totalCount = localExpertCounter[e];
+          sameNodeTotal += localExpertCounter[e];
           // Add remote counts from srcExpertTokenCounterMemObj
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
@@ -808,6 +827,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               index_t srcCount = core::AtomicLoadRelaxedSystem(
                   srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
+              remoteTotal += srcCount;
             }
           }
           args.recvTokenCountPerExpert[e] = totalCount;
@@ -821,6 +841,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         // Data not yet visible, fence and retry
         __threadfence_system();
         retryCount++;
+
+        // Print progress every 100000 retries to diagnose stuck loops
+        if (retryCount % 100000 == 0) {
+          printf("[DEBUG][Rank %d] Retry %d: read=%d (sameNode=%d, remote=%d), expected=%d, diff=%d\n",
+                 myPe, retryCount, readTotal, sameNodeTotal, remoteTotal, expectedTotal, expectedTotal - readTotal);
+        }
 
         if (retryCount >= maxRetries) {
           printf("[ERROR][Rank %d] Count validation failed after %d retries: read=%d, expected=%d\n",
