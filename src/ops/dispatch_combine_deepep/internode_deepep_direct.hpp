@@ -37,7 +37,7 @@ namespace deepep {
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
-#define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
+#define DEBUG_SEND_COUNTS 1           // After each count+signal RDMA send
 #define DEBUG_RECV_SIGNAL 0           // After receiving each signal
 #define DEBUG_RECV_COUNTS 0           // Print actual count values read from remote srcPe
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
@@ -825,12 +825,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              // WORKAROUND: Read and print a value from the address we're about to load.
-              // This forces the GPU to actually access the memory location, which may
-              // trigger cache coherence for RDMA-written data.
-              index_t* addrToRead = srcExpertCounter + srcPe * config.numExpertPerRank + e;
-              index_t srcCount = core::AtomicLoadRelaxedSystem(addrToRead);
-              printf("%d", srcCount);  // Print the actual value to prevent optimization
+              index_t srcCount = core::AtomicLoadRelaxedSystem(
+                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
               remoteTotal += srcCount;
             }
@@ -843,10 +839,22 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           break;  // Data is consistent, exit retry loop
         }
 
-        // Print first mismatch to diagnose
+        // Print first mismatch with per-srcPe breakdown to compare against sender
         if (retryCount == 0) {
           printf("[DEBUG][Rank %d] FIRST READ MISMATCH: read=%d (sameNode=%d, remote=%d), expected=%d\n",
                  myPe, readTotal, sameNodeTotal, remoteTotal, expectedTotal);
+          // Print per-srcPe totals for comparison with sender DEBUG_SEND_COUNTS
+          for (int srcPe = 0; srcPe < npes; ++srcPe) {
+            bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+            if (isRemote) {
+              index_t srcPeTotal = 0;
+              for (int e = 0; e < config.numExpertPerRank; ++e) {
+                srcPeTotal += core::AtomicLoadRelaxedSystem(
+                    srcExpertCounter + srcPe * config.numExpertPerRank + e);
+              }
+              printf("[DEBUG][Rank %d] RECV from srcPe=%d: read=%d\n", myPe, srcPe, srcPeTotal);
+            }
+          }
         }
 
         // Data not yet visible, fence and retry
