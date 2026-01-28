@@ -76,6 +76,20 @@ __device__ __forceinline__ int GetNodeId(int rank, int gpuPerNode) {
   return rank / gpuPerNode;
 }
 
+// RDMA-aware polling: wait until value > threshold with memory fence.
+// The __threadfence_system() inside the loop forces cache invalidation to
+// see RDMA-written data. Without this, the GPU cache may hold stale values
+// indefinitely, causing deadlocks when waiting for remote RDMA updates.
+template <typename T>
+__device__ __forceinline__ T RdmaWaitUntilGreaterThan(T* addr, T val) {
+  T got;
+  do {
+    got = core::AtomicLoadRelaxedSystem(addr);
+    __threadfence_system();  // Force cache invalidation to see RDMA writes
+  } while (got <= val);
+  return got;
+}
+
 }  // namespace internode_ll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -152,9 +166,12 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   // Wait for all remote nodes to signal (via their proxy PEs)
   // Each proxy PE slot is only written via RDMA add from the corresponding remote rank.
   // After N barrier invocations, the slot has value N. So we wait for crossDeviceBarrierFlag.
+  // CRITICAL: Add __threadfence_system() inside the loop to force cache invalidation.
+  // Without this, RDMA-written data may not be visible due to GPU cache coherence issues.
   if (thdId < nNodes && thdId != myNode) {
     int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
+      __threadfence_system();  // Force cache invalidation to see RDMA writes
     }
   }
   __syncthreads();
@@ -663,7 +680,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   if (globalWarpId == 0) {
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
       index_t* signal = recvTokenNums + srcPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      // Use RDMA-aware polling with memory fence to see remote RDMA writes
+      index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, 0) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[srcPe] = 0;
