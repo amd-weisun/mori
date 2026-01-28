@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -642,8 +642,22 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // All warps use the same staging area (myPe * numExpertPerRank), so parallel puts
   // would cause data corruption. The count exchange is not performance-critical.
   {
-    // Synchronize so all token writes are done before sending counts
-    __syncthreads();
+    // Grid-level barrier to ensure ALL blocks have completed their token dispatch
+    // before reading the counters. __syncthreads() only syncs within a block, but
+    // the atomicAdd updates to localPeTokenCounter happen across all 40 blocks.
+    // Without this barrier, block 0 may read partial counts while other blocks
+    // are still updating them.
+    __threadfence();  // Ensure all writes are visible
+    __syncthreads();  // Sync within block first
+    if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+    if (globalWarpId == 0 && laneId == 0) {
+      // Wait for all warps across all blocks to reach this point
+      while (atomicAdd(args.dispatchGridBarrier, 0) < globalWarpNum) {
+        __threadfence();
+      }
+      args.dispatchGridBarrier[0] = 0;  // Reset for next use
+    }
+    __syncthreads();  // Ensure all threads see the barrier completion
 
     // Only warp 0, lane 0 handles all remote count puts (serialized to avoid staging race)
     if (globalWarpId == 0 && laneId == 0) {
