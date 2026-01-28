@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
@@ -660,6 +660,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
           // Quiet to ensure the put+signal is complete before reusing staging area
           shmem::ShmemQuietThread(destPe);
+          // Memory fence to ensure RDMA completion is visible locally
+          __threadfence_system();
 
 #if INTERNODE_DEEPEP_DEBUG
           // Verify what was staged vs what localPeTokenCounter says
@@ -694,6 +696,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
+
+  // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
+  // This is critical for correctness without debug prints.
+  __threadfence_system();
 
   // Signal token counts to same-node destination ranks (direct store, not RDMA)
   // Remote ranks already received their signals via the bundled put above.
