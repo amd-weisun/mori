@@ -142,6 +142,8 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
         myPe * sizeof(uint32_t),
         crossDeviceBarrierFlag,
         proxyPe);
+    // Must quiet to ensure the RDMA put is visible on remote rank before we poll
+    shmem::ShmemQuietThread(proxyPe);
   }
 
   // Wait for all remote nodes to signal (via their proxy PEs)
@@ -501,15 +503,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
         // For remote ranks, use RDMA put to write the signal.
-        // We can't directly poll remote memory, so we skip the wait and rely on
-        // the barrier synchronization to ensure ordering. The signal value is
-        // only written after all data has been sent.
         size_t signalOffset = myPe * sizeof(index_t);
         shmem::ShmemPutTypeImmNbiThread<index_t>(
             args.recvTokenNumMemObj,
             signalOffset,
             numTokenSignal,
             destPe);
+        // Must quiet to ensure signal is visible on remote rank before they poll.
+        // Each lane quiets its own put (ShmemQuietThread is per-thread).
+        shmem::ShmemQuietThread(destPe);
       } else {
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
