@@ -396,6 +396,8 @@ def run_test_impl(
 
     # Skip combine phase if dispatch-only mode
     if dispatch_only:
+        # Barrier to ensure all ranks complete validation before reset
+        dist.barrier()
         op.reset()
         if rank == 0:
             print(f"[DeepEP] Dispatch-only test '{setting['name']}' PASSED", flush=True)
@@ -437,6 +439,10 @@ def validate_dispatch(rank, config, recv_count, all_rank_indices):
         expected_from_indices += int(((idx >= rank_begin) & (idx < rank_end)).sum().item())
 
     actual_from_counts = int(recv_count.sum().item())
+
+    # Debug: print expected vs actual before checking
+    if DEBUG_LOG or actual_from_counts != expected_from_indices:
+        print(f"[Rank {rank}] Validation: expected={expected_from_indices}, actual={actual_from_counts}", flush=True)
 
     if actual_from_counts != expected_from_indices:
         raise AssertionError(
