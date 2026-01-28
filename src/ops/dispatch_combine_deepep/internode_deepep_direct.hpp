@@ -37,12 +37,19 @@ namespace deepep {
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
-#define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send  <-- TEST THIS FIRST
+#define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
 #define DEBUG_RECV_SIGNAL 0           // After receiving each signal
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
-#define DEBUG_FINAL_SUMMARY 1         // After counting, before reset
+#define DEBUG_FINAL_SUMMARY 0         // After counting, before reset
+
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
+
+// Configurable delay after RDMA operations to simulate printf timing effect.
+// Set to non-zero to add a spin-wait after RDMA put+signal operations.
+// This helps diagnose if the issue is purely timing-related.
+// Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
+#define INTERNODE_RDMA_DELAY_CYCLES 1000000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -84,6 +91,17 @@ __device__ __forceinline__ bool IsRemoteRank(int srcRank, int dstRank, int gpuPe
 // Get node ID from global rank
 __device__ __forceinline__ int GetNodeId(int rank, int gpuPerNode) {
   return rank / gpuPerNode;
+}
+
+// Spin-wait delay for a specified number of GPU clock cycles.
+// Used to simulate the timing effect of printf for debugging RDMA issues.
+__device__ __forceinline__ void SpinDelayCycles(long long cycles) {
+  if (cycles <= 0) return;
+  long long start = clock64();
+  while (clock64() - start < cycles) {
+    // Busy wait - use memory fence to prevent optimization
+    __threadfence();
+  }
 }
 
 // RDMA-aware polling: wait until value > threshold with memory fence and timeout.
@@ -670,6 +688,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // Memory fence to ensure RDMA completion is visible locally
           __threadfence_system();
 
+#if INTERNODE_RDMA_DELAY_CYCLES > 0
+          // Configurable delay after RDMA operations (simulates printf timing effect)
+          internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
+#endif
+
 #if INTERNODE_DEEPEP_DEBUG || DEBUG_SEND_COUNTS
           // Verify what was staged vs what localPeTokenCounter says
           index_t stagedTotal = 0;
@@ -707,6 +730,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
   // This is critical for correctness without debug prints.
   __threadfence_system();
+
+#if INTERNODE_RDMA_DELAY_CYCLES > 0
+  // Configurable delay after barrier (simulates printf timing effect for receiving)
+  if (globalWarpId == 0 && laneId == 0) {
+    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
+  }
+  __syncthreads();
+#endif
 
   // Signal token counts to same-node destination ranks (direct store, not RDMA)
   // Remote ranks already received their signals via the bundled put above.
