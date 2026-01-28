@@ -49,7 +49,7 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 50000000
+#define INTERNODE_RDMA_DELAY_CYCLES 500000000ll
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
