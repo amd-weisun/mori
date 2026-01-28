@@ -32,12 +32,12 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
-#define DEBUG_SEND_COUNTS 1           // After each count+signal RDMA send
+#define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
 #define DEBUG_RECV_SIGNAL 0           // After receiving each signal
 #define DEBUG_RECV_COUNTS 0           // Print actual count values read from remote srcPe
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
