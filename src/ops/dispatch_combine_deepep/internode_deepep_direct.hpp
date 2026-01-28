@@ -31,6 +31,9 @@ namespace mori {
 namespace moe {
 namespace deepep {
 
+// Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
+#define INTERNODE_DEEPEP_DEBUG 1
+
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
  *
@@ -224,6 +227,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     for (int pe = 0; pe < npes; ++pe) {
       recvTokenNums[pe] = 0;
     }
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] Dispatch start: reset complete, barrierFlag=%u, curRankNumToken=%d, numExpertPerToken=%d, totalTokensToDispatch=%d\n",
+           myPe, crossDeviceBarrierFlag, args.curRankNumToken, config.numExpertPerToken,
+           args.curRankNumToken * config.numExpertPerToken);
+#endif
   }
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
 
@@ -466,6 +474,38 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       }
     }
     __syncthreads();  // Ensure all warps have completed their quiet
+#if INTERNODE_DEEPEP_DEBUG
+    if (globalWarpId == 0 && laneId == 0) {
+      printf("[DEBUG][Rank %d] After token dispatch: destPeTokenCounter = [", myPe);
+      for (int pe = 0; pe < npes; ++pe) {
+        printf("%d%s", args.destPeTokenCounter[pe], pe < npes-1 ? ", " : "");
+      }
+      printf("]\n");
+      // Also print localPeTokenCounter totals per destPe
+      printf("[DEBUG][Rank %d] localPeTokenCounter totals per destPe = [", myPe);
+      for (int pe = 0; pe < npes; ++pe) {
+        index_t total = 0;
+        for (int e = 0; e < config.numExpertPerRank; ++e) {
+          total += args.localPeTokenCounter[pe * config.numExpertPerRank + e];
+        }
+        printf("%d%s", total, pe < npes-1 ? ", " : "");
+      }
+      printf("]\n");
+      // Print destNodeTokenCounter (remote tokens per node)
+      int nNodes = npes / gpuPerNode;
+      printf("[DEBUG][Rank %d] destNodeTokenCounter (remote only) = [", myPe);
+      for (int node = 0; node < nNodes; ++node) {
+        printf("%d%s", args.destNodeTokenCounter[node], node < nNodes-1 ? ", " : "");
+      }
+      printf("]\n");
+      // Compute total tokens sent
+      index_t totalSent = 0;
+      for (int pe = 0; pe < npes; ++pe) {
+        totalSent += args.destPeTokenCounter[pe];
+      }
+      printf("[DEBUG][Rank %d] Total tokens sent = %d\n", myPe, totalSent);
+    }
+#endif
   }
 
   // After processing all tokens, use RDMA put to write per-(srcPe, localExpert) counts
@@ -499,6 +539,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           }
           // Ensure RDMA puts to this destPe complete before signaling
           shmem::ShmemQuietThread(destPe);
+#if INTERNODE_DEEPEP_DEBUG
+          // Sum what we sent to this destPe
+          index_t sentTotal = 0;
+          for (int e = 0; e < config.numExpertPerRank; ++e) {
+            sentTotal += args.localPeTokenCounter[destPe * config.numExpertPerRank + e];
+          }
+          printf("[DEBUG][Rank %d] Sent count RDMA to destPe=%d: total=%d tokens\n",
+                 myPe, destPe, sentTotal);
+#endif
         }
       }
     }
@@ -548,6 +597,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[srcPe] = 0;
+#if INTERNODE_DEEPEP_DEBUG
+      printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
+             myPe, srcPe, recvTokenNum);
+#endif
     }
     // Ensure all lanes have received their signals before lane 0 reads counts.
     // Without this, lane 0 might read srcExpertCounter before the RDMA puts
@@ -571,14 +624,30 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         // Start with same-node counts
         index_t totalCount = localExpertCounter[e];
+#if INTERNODE_DEEPEP_DEBUG
+        index_t sameNodeCount = localExpertCounter[e];
+        index_t remoteCount = 0;
+#endif
         // Add remote counts from srcExpertTokenCounterMemObj
         for (int srcPe = 0; srcPe < npes; ++srcPe) {
           bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
           if (isRemote) {
-            totalCount += srcExpertCounter[srcPe * config.numExpertPerRank + e];
+            index_t srcCount = srcExpertCounter[srcPe * config.numExpertPerRank + e];
+            totalCount += srcCount;
+#if INTERNODE_DEEPEP_DEBUG
+            remoteCount += srcCount;
+            if (srcCount > 0) {
+              printf("[DEBUG][Rank %d] Expert %d: from srcPe=%d got count=%d\n",
+                     myPe, e, srcPe, srcCount);
+            }
+#endif
           }
         }
         args.recvTokenCountPerExpert[e] = totalCount;
+#if INTERNODE_DEEPEP_DEBUG
+        printf("[DEBUG][Rank %d] Expert %d: sameNode=%d, remote=%d, total=%d\n",
+               myPe, e, sameNodeCount, remoteCount, totalCount);
+#endif
       }
 
       // Reset counters for next dispatch
@@ -590,6 +659,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
         }
       }
+#if INTERNODE_DEEPEP_DEBUG
+      // Print final summary
+      index_t totalRecv = *args.totalRecvTokenNum;
+      printf("[DEBUG][Rank %d] Final dispatch summary: totalRecvTokenNum=%d, recvTokenCountPerExpert=[",
+             myPe, totalRecv);
+      for (int e = 0; e < config.numExpertPerRank; ++e) {
+        printf("%d%s", args.recvTokenCountPerExpert[e], e < config.numExpertPerRank-1 ? ", " : "");
+      }
+      printf("]\n");
+#endif
     }
   }
 
