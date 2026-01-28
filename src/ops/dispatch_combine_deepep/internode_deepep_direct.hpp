@@ -649,7 +649,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               countBytes,
               args.recvTokenNumMemObj, signalOffset,
               static_cast<uint64_t>(numTokenSignal),
-              core::atomicType::ATOMIC_SWAP,  // Use swap to set the signal value
+              core::atomicType::SIGNAL_SET,  // Use SET to write the signal value
               destPe);
 
           // Quiet to ensure the put+signal is issued
