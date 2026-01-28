@@ -571,16 +571,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
-        // For remote ranks, use RDMA put to write the signal.
+        // For remote ranks, use RDMA atomic add for the signal.
+        // CRITICAL: Atomic operations provide hardware-level ordering guarantees.
+        // All prior RDMA puts (count data) are guaranteed to be globally visible
+        // before the atomic operation completes on the remote side.
+        // This is the key difference from regular puts - atomics enforce ordering.
         size_t signalOffset = myPe * sizeof(index_t);
-        shmem::ShmemPutTypeImmNbiThread<index_t>(
+        shmem::ShmemInt32AtomicAddThread(
             args.recvTokenNumMemObj,
             signalOffset,
             numTokenSignal,
             destPe);
-        // Must quiet to ensure signal is visible on remote rank before they poll.
-        // Each lane quiets its own put (ShmemQuietThread is per-thread).
-        shmem::ShmemQuietThread(destPe);
+        // No need for quiet after atomic - atomic operations are self-ordering.
       } else {
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
