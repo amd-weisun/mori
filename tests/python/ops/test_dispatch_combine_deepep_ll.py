@@ -117,6 +117,29 @@ PRESET_SETTINGS = {
         "gpu_per_node": 2,  # Simulate 4 nodes with 2 GPUs each
         "use_fp8": True,
     },
+    # Minimal 2-GPU setting to simulate 2 nodes (1 GPU per node)
+    # Use this for debugging inter-node logic on single physical node
+    "internode_2gpu_sim": {
+        "name": "internode_2gpu_sim",
+        "num_processes": 2,
+        "hidden_dim": 1024,
+        "max_num_inp_token_per_rank": 32,
+        "total_experts": 16,  # 8 experts per rank
+        "num_experts_per_token": 2,
+        "gpu_per_node": 1,  # Each GPU is a separate "node"
+        "use_fp8": False,  # BF16 for easier debugging
+    },
+    # Same as above but with FP8
+    "internode_2gpu_sim_fp8": {
+        "name": "internode_2gpu_sim_fp8",
+        "num_processes": 2,
+        "hidden_dim": 1024,
+        "max_num_inp_token_per_rank": 32,
+        "total_experts": 16,
+        "num_experts_per_token": 2,
+        "gpu_per_node": 1,
+        "use_fp8": True,
+    },
 }
 
 
