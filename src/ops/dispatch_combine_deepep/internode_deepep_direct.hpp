@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
@@ -662,12 +662,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           shmem::ShmemQuietThread(destPe);
 
 #if INTERNODE_DEEPEP_DEBUG
-          index_t sentTotal = 0;
+          // Verify what was staged vs what localPeTokenCounter says
+          index_t stagedTotal = 0;
+          index_t localCounterTotal = 0;
           for (int e = 0; e < config.numExpertPerRank; ++e) {
-            sentTotal += args.localPeTokenCounter[destPe * config.numExpertPerRank + e];
+            stagedTotal += localSrcExpertCounter[myPe * config.numExpertPerRank + e];
+            localCounterTotal += args.localPeTokenCounter[destPe * config.numExpertPerRank + e];
           }
-          printf("[DEBUG][Rank %d] Sent count+signal RDMA to destPe=%d: total=%d tokens, signal=%d\n",
-                 myPe, destPe, sentTotal, numTokenSignal);
+          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, signal=%d\n",
+                 myPe, destPe, localCounterTotal, stagedTotal, numTokenSignal);
+          if (stagedTotal != localCounterTotal) {
+            printf("[DEBUG][Rank %d] STAGING BUG: staged=%d != localCounter=%d for destPe=%d\n",
+                   myPe, stagedTotal, localCounterTotal, destPe);
+          }
 #endif
         }
       }
@@ -733,12 +740,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
 
       // Sum expert counts from all source ranks
+#if INTERNODE_DEEPEP_DEBUG
+      index_t totalSameNodeCount = 0;
+      index_t totalRemoteCount = 0;
+#endif
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         // Start with same-node counts
         index_t totalCount = localExpertCounter[e];
 #if INTERNODE_DEEPEP_DEBUG
-        index_t sameNodeCount = localExpertCounter[e];
-        index_t remoteCount = 0;
+        totalSameNodeCount += localExpertCounter[e];
 #endif
         // Add remote counts from srcExpertTokenCounterMemObj
         for (int srcPe = 0; srcPe < npes; ++srcPe) {
@@ -748,20 +758,23 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
                 srcExpertCounter + srcPe * config.numExpertPerRank + e);
             totalCount += srcCount;
 #if INTERNODE_DEEPEP_DEBUG
-            remoteCount += srcCount;
-            if (srcCount > 0) {
-              printf("[DEBUG][Rank %d] Expert %d: from srcPe=%d got count=%d\n",
-                     myPe, e, srcPe, srcCount);
-            }
+            totalRemoteCount += srcCount;
 #endif
           }
         }
         args.recvTokenCountPerExpert[e] = totalCount;
-#if INTERNODE_DEEPEP_DEBUG
-        printf("[DEBUG][Rank %d] Expert %d: sameNode=%d, remote=%d, total=%d\n",
-               myPe, e, sameNodeCount, remoteCount, totalCount);
-#endif
       }
+#if INTERNODE_DEEPEP_DEBUG
+      // Print summary: signal total vs per-expert count total
+      index_t signalTotal = *args.totalRecvTokenNum;
+      index_t perExpertTotal = totalSameNodeCount + totalRemoteCount;
+      printf("[DEBUG][Rank %d] COUNT SUMMARY: signalTotal=%d, perExpertTotal=%d (sameNode=%d, remote=%d)\n",
+             myPe, signalTotal, perExpertTotal, totalSameNodeCount, totalRemoteCount);
+      if (signalTotal != perExpertTotal) {
+        printf("[DEBUG][Rank %d] MISMATCH: signal says %d tokens, but per-expert counts sum to %d\n",
+               myPe, signalTotal, perExpertTotal);
+      }
+#endif
 
       // Reset counters for next dispatch
       for (int e = 0; e < config.numExpertPerRank; ++e) {
@@ -774,14 +787,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
       }
 #if INTERNODE_DEEPEP_DEBUG
-      // Print final summary
-      index_t totalRecv = *args.totalRecvTokenNum;
-      printf("[DEBUG][Rank %d] Final dispatch summary: totalRecvTokenNum=%d, recvTokenCountPerExpert=[",
-             myPe, totalRecv);
+      // Print final summary (sum only, not per-expert)
+      index_t finalSum = 0;
       for (int e = 0; e < config.numExpertPerRank; ++e) {
-        printf("%d%s", args.recvTokenCountPerExpert[e], e < config.numExpertPerRank-1 ? ", " : "");
+        finalSum += args.recvTokenCountPerExpert[e];
       }
-      printf("]\n");
+      printf("[DEBUG][Rank %d] FINAL: recvTokenCountPerExpert sum=%d\n", myPe, finalSum);
 #endif
     }
   }
