@@ -816,12 +816,6 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         sameNodeTotal = 0;
         remoteTotal = 0;
 
-        // WORKAROUND: printf triggers host synchronization that flushes GPU L2 cache,
-        // making RDMA-written data visible. Without this, the L2 cache holds stale
-        // values that __threadfence_system() and volatile cannot invalidate.
-        // We call this once per retry iteration before reading any counts.
-        printf("");
-
         // Sum expert counts from all source ranks
         for (int e = 0; e < config.numExpertPerRank; ++e) {
           // Start with same-node counts
@@ -831,6 +825,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
+              // WORKAROUND: printf triggers host synchronization that flushes GPU L2 cache,
+              // making RDMA-written data visible. Without this, the L2 cache holds stale
+              // values that __threadfence_system() and volatile cannot invalidate.
+              // Use a single space (not empty string) to prevent compiler optimization.
+              printf(" ");
               index_t srcCount = core::AtomicLoadRelaxedSystem(
                   srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
