@@ -36,9 +36,9 @@ namespace deepep {
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
-#define DEBUG_AFTER_TOKEN_DISPATCH 1  // After token dispatch loop, before count exchange
+#define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
 #define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send  <-- TEST THIS FIRST
-#define DEBUG_RECV_SIGNAL 0           // After receiving each signal
+#define DEBUG_RECV_SIGNAL 1           // After receiving each signal
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
 
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
