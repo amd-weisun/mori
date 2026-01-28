@@ -719,16 +719,17 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // Use slots [myPe * numExpertPerRank, myPe * numExpertPerRank + numExpertPerRank)
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             index_t localCounterIdx = destPe * config.numExpertPerRank + e;
-            // Use atomic read since localPeTokenCounter was updated via atomicAdd
-            index_t count = core::AtomicLoadRelaxed(args.localPeTokenCounter + localCounterIdx);
+            // Use system-scope atomic read to see updates from ALL blocks
+            // (device-scope AtomicLoadRelaxed may not see updates from other blocks on AMD)
+            index_t count = core::AtomicLoadRelaxedSystem(args.localPeTokenCounter + localCounterIdx);
             localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
           }
 
           // Use ShmemPutMemNbiSignalThread to send counts AND signal atomically.
           // The RDMA hardware guarantees that when the signal arrives at destPe,
           // the count data is also visible. This avoids the out-of-order issue.
-          // Use atomic read since destPeTokenCounter was updated via atomicAdd
-          index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+          // Use system-scope atomic read to see updates from ALL blocks
+          index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
 
           // Source: our local srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
           size_t srcOffset = myPe * config.numExpertPerRank * sizeof(index_t);
@@ -763,12 +764,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           index_t localCounterTotal = 0;
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             stagedTotal += localSrcExpertCounter[myPe * config.numExpertPerRank + e];
-            // Use atomic read for consistency
-            localCounterTotal += core::AtomicLoadRelaxed(
+            // Use system-scope atomic read to see updates from ALL blocks
+            localCounterTotal += core::AtomicLoadRelaxedSystem(
                 args.localPeTokenCounter + destPe * config.numExpertPerRank + e);
           }
-          // Also read destPeTokenCounter with atomic for comparison
-          index_t destPeTotal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+          // Also read destPeTokenCounter with system-scope atomic for comparison
+          index_t destPeTotal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe);
           printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d, signal=%d\n",
                  myPe, destPe, localCounterTotal, stagedTotal, destPeTotal, numTokenSignal);
           if (stagedTotal != localCounterTotal) {
@@ -818,7 +819,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (!isRemote) {
         // For same-node ranks, use direct store for the signal
-        index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+        // Use system-scope atomic read to see updates from ALL blocks
+        index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
         index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
