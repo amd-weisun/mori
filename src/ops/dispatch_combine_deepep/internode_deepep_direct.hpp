@@ -672,7 +672,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // CRITICAL: Use system-scope atomics for barrier to ensure proper ordering
     // with the system-scope counter reads/writes after the barrier.
     if (laneId == 0) {
-      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1);  // Count arrival
+      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1u);  // Count arrival
     }
 
     // Warp 0, lane 0 waits for all arrivals and sets release flag
@@ -681,14 +681,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         __threadfence_system();
       }
       __threadfence_system();
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 1);  // Set release flag
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 1u);  // Set release flag
       __threadfence_system();
     }
 
     // All other lane 0s wait for release flag
     // Use system-scope atomic read for consistency with system-scope writes
     if (laneId == 0 && globalWarpId != 0) {
-      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[1]) == 0) {
+      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[1]) == 0u) {
         __threadfence_system();
       }
     }
@@ -696,7 +696,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
     // Phase 2: Signal that we've passed the barrier (for safe reset)
     if (laneId == 0) {
-      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1);  // Now barrier[0] goes to 2*globalWarpNum
+      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1u);  // Now barrier[0] goes to 2*globalWarpNum
     }
 
     // Warp 0, lane 0 waits for all to pass, then resets
@@ -704,8 +704,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[0]) < 2 * globalWarpNum) {
         __threadfence_system();
       }
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[0], 0);
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 0);
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[0], 0u);
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 0u);
       __threadfence_system();
     }
     __syncthreads();  // Ensure reset is visible to all threads in block
