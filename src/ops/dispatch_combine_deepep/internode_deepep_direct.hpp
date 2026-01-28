@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
