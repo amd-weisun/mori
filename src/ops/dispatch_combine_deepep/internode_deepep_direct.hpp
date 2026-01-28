@@ -373,8 +373,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         // Compute our slot within our reserved section.
         // Use local counter partitioned by (destPe, localExpert).
         // Index: destPe * numExpertPerRank + localExpert
+        //
+        // CRITICAL: Use system-scope atomics for ALL counter updates.
+        // This ensures that when warp 0, lane 0 reads the counters (with
+        // AtomicLoadRelaxedSystem) after the grid barrier, it sees ALL updates
+        // from ALL blocks. Device-scope atomicAdd can get stuck in L2 cache
+        // and not be visible to system-scope reads from other blocks.
         index_t localCounterIdx = destPe * config.numExpertPerRank + localExpert;
-        index_t localSlot = atomicAdd(args.localPeTokenCounter + localCounterIdx, 1);
+        index_t localSlot = core::AtomicAddRelaxedSystem(args.localPeTokenCounter + localCounterIdx, 1);
 
         // Our destTokId within the expert buffer uses source-rank partitioning
         destTokId = myPe * config.maxNumInpTokenPerRank + localSlot;
@@ -383,13 +389,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // For same-node ranks, use local atomicAdd on the expert counter
           index_t* expertCounter =
               args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-          atomicAdd(expertCounter + localExpert, 1);
+          core::AtomicAddRelaxedSystem(expertCounter + localExpert, 1);
         }
         // For remote ranks, we don't use RDMA atomic here.
         // The counts are written via RDMA put after the main loop ends.
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
+        core::AtomicAddRelaxedSystem(args.destPeTokenCounter + destPe, 1);
         if (isRemote) {
-          atomicAdd(args.destNodeTokenCounter + destNode, 1);
+          core::AtomicAddRelaxedSystem(args.destNodeTokenCounter + destNode, 1);
         }
         args.dispDestTokIdMap[i] = destExpert * expertCapacity + destTokId;
       }
