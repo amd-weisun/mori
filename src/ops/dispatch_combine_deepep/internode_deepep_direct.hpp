@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -629,10 +629,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         index_t remoteCount = 0;
 #endif
         // Add remote counts from srcExpertTokenCounterMemObj
+        // IMPORTANT: Use atomic loads for RDMA-written data to ensure visibility.
+        // Regular pointer access might read stale cached values.
         for (int srcPe = 0; srcPe < npes; ++srcPe) {
           bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
           if (isRemote) {
-            index_t srcCount = srcExpertCounter[srcPe * config.numExpertPerRank + e];
+            index_t srcCount = core::AtomicLoadRelaxedSystem(
+                srcExpertCounter + srcPe * config.numExpertPerRank + e);
             totalCount += srcCount;
 #if INTERNODE_DEEPEP_DEBUG
             remoteCount += srcCount;
