@@ -34,6 +34,13 @@ namespace deepep {
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
 #define INTERNODE_DEEPEP_DEBUG 0
 
+// Individual debug flags to isolate which print provides synchronization
+// Enable one at a time to find the critical one
+#define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
+#define DEBUG_SEND_COUNTS 1           // After each count+signal RDMA send  <-- TEST THIS FIRST
+#define DEBUG_RECV_SIGNAL 0           // After receiving each signal
+#define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
+
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
 
@@ -567,7 +574,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       }
     }
     __syncthreads();  // Ensure all warps have completed their quiet
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_AFTER_TOKEN_DISPATCH
     if (globalWarpId == 0 && laneId == 0) {
       printf("[DEBUG][Rank %d] After token dispatch: destPeTokenCounter = [", myPe);
       for (int pe = 0; pe < npes; ++pe) {
@@ -663,7 +670,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // Memory fence to ensure RDMA completion is visible locally
           __threadfence_system();
 
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_SEND_COUNTS
           // Verify what was staged vs what localPeTokenCounter says
           index_t stagedTotal = 0;
           index_t localCounterTotal = 0;
@@ -727,7 +734,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
              myPe, srcPe, recvTokenNum);
 #endif
@@ -746,14 +753,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
 
       // Sum expert counts from all source ranks
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
       index_t totalSameNodeCount = 0;
       index_t totalRemoteCount = 0;
 #endif
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         // Start with same-node counts
         index_t totalCount = localExpertCounter[e];
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
         totalSameNodeCount += localExpertCounter[e];
 #endif
         // Add remote counts from srcExpertTokenCounterMemObj
@@ -763,14 +770,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             index_t srcCount = core::AtomicLoadRelaxedSystem(
                 srcExpertCounter + srcPe * config.numExpertPerRank + e);
             totalCount += srcCount;
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
             totalRemoteCount += srcCount;
 #endif
           }
         }
         args.recvTokenCountPerExpert[e] = totalCount;
       }
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
       // Print summary: signal total vs per-expert count total
       index_t signalTotal = *args.totalRecvTokenNum;
       index_t perExpertTotal = totalSameNodeCount + totalRemoteCount;
