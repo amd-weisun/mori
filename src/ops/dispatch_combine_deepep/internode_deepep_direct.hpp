@@ -654,7 +654,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // - All other lane 0s wait for release flag
     // - Phase 2: All lane 0s increment again to signal they've passed
     // - Warp 0, lane 0 waits for all to pass, then resets both counters
-    __threadfence();  // Ensure all writes are visible
+    //
+    // CRITICAL: Use __threadfence_system() to ensure all atomic writes (including
+    // localPeTokenCounter and destPeTokenCounter updates) are globally visible across
+    // all L2 cache partitions before we enter the barrier. Without system-level fence,
+    // atomic writes may be stuck in L2 cache and not visible to other blocks.
+    __threadfence_system();  // Ensure all atomics are globally visible
     __syncthreads();  // Sync within block first
 
     // Phase 1: Count arrivals and wait for release
@@ -697,6 +702,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
     __syncthreads();  // Ensure reset is visible to all threads in block
 
+    // After barrier, ensure we see all atomic writes from other blocks.
+    // This is critical for reading localPeTokenCounter/destPeTokenCounter.
+    __threadfence_system();
+
     // Only warp 0, lane 0 handles all remote count puts (serialized to avoid staging race)
     if (globalWarpId == 0 && laneId == 0) {
       // Get pointers to local staging area (our portion of srcExpertTokenCounterMemObj)
@@ -710,14 +719,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // Use slots [myPe * numExpertPerRank, myPe * numExpertPerRank + numExpertPerRank)
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             index_t localCounterIdx = destPe * config.numExpertPerRank + e;
-            index_t count = args.localPeTokenCounter[localCounterIdx];
+            // Use atomic read since localPeTokenCounter was updated via atomicAdd
+            index_t count = core::AtomicLoadRelaxed(args.localPeTokenCounter + localCounterIdx);
             localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
           }
 
           // Use ShmemPutMemNbiSignalThread to send counts AND signal atomically.
           // The RDMA hardware guarantees that when the signal arrives at destPe,
           // the count data is also visible. This avoids the out-of-order issue.
-          index_t numTokenSignal = args.destPeTokenCounter[destPe] + 1;
+          // Use atomic read since destPeTokenCounter was updated via atomicAdd
+          index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
 
           // Source: our local srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
           size_t srcOffset = myPe * config.numExpertPerRank * sizeof(index_t);
@@ -752,13 +763,21 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           index_t localCounterTotal = 0;
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             stagedTotal += localSrcExpertCounter[myPe * config.numExpertPerRank + e];
-            localCounterTotal += args.localPeTokenCounter[destPe * config.numExpertPerRank + e];
+            // Use atomic read for consistency
+            localCounterTotal += core::AtomicLoadRelaxed(
+                args.localPeTokenCounter + destPe * config.numExpertPerRank + e);
           }
-          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, signal=%d\n",
-                 myPe, destPe, localCounterTotal, stagedTotal, numTokenSignal);
+          // Also read destPeTokenCounter with atomic for comparison
+          index_t destPeTotal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d, signal=%d\n",
+                 myPe, destPe, localCounterTotal, stagedTotal, destPeTotal, numTokenSignal);
           if (stagedTotal != localCounterTotal) {
             printf("[DEBUG][Rank %d] STAGING BUG: staged=%d != localCounter=%d for destPe=%d\n",
                    myPe, stagedTotal, localCounterTotal, destPe);
+          }
+          if (localCounterTotal != destPeTotal) {
+            printf("[DEBUG][Rank %d] COUNTER BUG: localCounter=%d != destPeCounter=%d for destPe=%d\n",
+                   myPe, localCounterTotal, destPeTotal, destPe);
           }
 #endif
         }
