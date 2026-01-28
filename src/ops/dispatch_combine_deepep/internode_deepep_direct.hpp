@@ -825,11 +825,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              // WORKAROUND: printf triggers host synchronization that flushes GPU L2 cache,
-              // making RDMA-written data visible. Without this, the L2 cache holds stale
-              // values that __threadfence_system() and volatile cannot invalidate.
-              // Use a single space (not empty string) to prevent compiler optimization.
-              printf(" ");
+              // WORKAROUND: printf with format specifiers and runtime values triggers
+              // host synchronization that flushes GPU L2 cache, making RDMA-written data
+              // visible. Simple printf(" ") doesn't work - need actual formatted output.
+              // The newline forces buffer flush which triggers cache coherence.
+              printf(".\n");
               index_t srcCount = core::AtomicLoadRelaxedSystem(
                   srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
