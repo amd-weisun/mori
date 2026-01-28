@@ -821,11 +821,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           index_t totalCount = localExpertCounter[e];
           sameNodeTotal += localExpertCounter[e];
           // Add remote counts from srcExpertTokenCounterMemObj
+          // Use volatile access to bypass GPU cache and see RDMA-written data
+          volatile index_t* volatileSrcExpertCounter =
+              reinterpret_cast<volatile index_t*>(srcExpertCounter);
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              index_t srcCount = core::AtomicLoadRelaxedSystem(
-                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
+              index_t srcCount = volatileSrcExpertCounter[srcPe * config.numExpertPerRank + e];
               totalCount += srcCount;
               remoteTotal += srcCount;
             }
