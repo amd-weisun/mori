@@ -39,8 +39,8 @@ namespace deepep {
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
 #define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send  <-- TEST THIS FIRST
 #define DEBUG_RECV_SIGNAL 0           // After receiving each signal
-#define DEBUG_COUNT_SUMMARY 1         // After counting, before reset
-
+#define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
+#define DEBUG_FINAL_SUMMARY 1         // After counting, before reset
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
 
@@ -799,7 +799,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
         }
       }
-#if INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_FINAL_SUMMARY
       // Print final summary (sum only, not per-expert)
       index_t finalSum = 0;
       for (int e = 0; e < config.numExpertPerRank; ++e) {
