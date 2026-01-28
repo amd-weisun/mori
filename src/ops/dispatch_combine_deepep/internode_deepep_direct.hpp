@@ -593,45 +593,75 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 #endif
   }
 
-  // After processing all tokens, use RDMA put to write per-(srcPe, localExpert) counts
-  // to each remote destination rank. This avoids RDMA atomics.
+  // After processing all tokens, use RDMA put with signal to write per-(srcPe, localExpert)
+  // counts to each remote destination rank. Using ShmemPutMemNbiSignalThread ensures
+  // hardware-enforced ordering: when the signal arrives, the data is guaranteed visible.
+  // This avoids the race condition where separate count puts and signals can arrive
+  // out of order on network RDMA.
+  //
   // localPeTokenCounter[destPe * numExpertPerRank + localExpert] contains the count
   // of tokens sent from this rank (myPe) to (destPe, localExpert).
-  // We write this to srcExpertTokenCounterMemObj on destPe at slot [myPe * numExpertPerRank + localExpert].
+  // We stage this to our local portion of srcExpertTokenCounterMemObj, then RDMA put
+  // with signal to destPe.
   {
     // Synchronize so all token writes are done before sending counts
     __syncthreads();
+
+    // Get pointers to local staging area (our portion of srcExpertTokenCounterMemObj)
+    index_t* localSrcExpertCounter =
+        args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
+
     // Each warp handles one destPe
     for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
-        // Write counts for all local experts to this remote destPe.
-        // Only lane 0 sends the puts to ensure proper quiet synchronization.
-        // ShmemQuietThread only waits for puts from the CALLING THREAD, so
-        // if multiple lanes send puts but only lane 0 quiets, the other lanes'
-        // puts might not be complete - causing race conditions.
+        // Stage counts to our local portion of srcExpertTokenCounterMemObj
+        // Use slots [myPe * numExpertPerRank, myPe * numExpertPerRank + numExpertPerRank)
+        // which are our "outgoing" slots (not used for receiving from ourselves).
         if (laneId == 0) {
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             index_t localCounterIdx = destPe * config.numExpertPerRank + e;
             index_t count = args.localPeTokenCounter[localCounterIdx];
-            // Write to slot [myPe * numExpertPerRank + e] on destPe
-            index_t destSlot = myPe * config.numExpertPerRank + e;
-            shmem::ShmemPutTypeImmNbiThread<index_t>(
-                args.srcExpertTokenCounterMemObj,
-                destSlot * sizeof(index_t),
-                count,
-                destPe);
+            // Stage to our local portion
+            localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
           }
-          // Ensure RDMA puts to this destPe complete before signaling
+        }
+        __syncwarp();
+
+        // Use ShmemPutMemNbiSignalThread to send counts AND signal atomically.
+        // The RDMA hardware guarantees that when the signal arrives at destPe,
+        // the count data is also visible. This avoids the out-of-order issue.
+        if (laneId == 0) {
+          // Signal value: numTokens + 1 (same encoding as before)
+          index_t numTokenSignal = args.destPeTokenCounter[destPe] + 1;
+
+          // Source: our local srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
+          size_t srcOffset = myPe * config.numExpertPerRank * sizeof(index_t);
+          // Dest: remote srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
+          size_t destOffset = myPe * config.numExpertPerRank * sizeof(index_t);
+          size_t countBytes = config.numExpertPerRank * sizeof(index_t);
+          // Signal dest: recvTokenNumMemObj[myPe] on destPe
+          size_t signalOffset = myPe * sizeof(index_t);
+
+          shmem::ShmemPutMemNbiSignalThread(
+              args.srcExpertTokenCounterMemObj, destOffset,
+              args.srcExpertTokenCounterMemObj, srcOffset,
+              countBytes,
+              args.recvTokenNumMemObj, signalOffset,
+              static_cast<uint64_t>(numTokenSignal),
+              core::atomicType::ATOMIC_SWAP,  // Use swap to set the signal value
+              destPe);
+
+          // Quiet to ensure the put+signal is issued
           shmem::ShmemQuietThread(destPe);
+
 #if INTERNODE_DEEPEP_DEBUG
-          // Sum what we sent to this destPe
           index_t sentTotal = 0;
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             sentTotal += args.localPeTokenCounter[destPe * config.numExpertPerRank + e];
           }
-          printf("[DEBUG][Rank %d] Sent count RDMA to destPe=%d: total=%d tokens\n",
-                 myPe, destPe, sentTotal);
+          printf("[DEBUG][Rank %d] Sent count+signal RDMA to destPe=%d: total=%d tokens, signal=%d\n",
+                 myPe, destPe, sentTotal, numTokenSignal);
 #endif
         }
       }
@@ -641,37 +671,25 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Wait for all local warps to complete their count puts.
+  // Wait for all local warps to complete their count+signal puts.
   if (globalWarpId == 0 && laneId == 0) {
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
     args.dispatchGridBarrier[0] = 0;
   }
   __syncthreads();
 
-  // CRITICAL: Cross-device barrier to ensure all ranks have completed their
-  // count RDMA puts AND those puts are globally visible on all remote ranks.
-  // Without this barrier, signals might arrive before count data is visible.
+  // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
 
-  // Signal token counts to destination ranks
-  // Now all count data is guaranteed to be visible on all remote ranks.
+  // Signal token counts to same-node destination ranks (direct store, not RDMA)
+  // Remote ranks already received their signals via the bundled put above.
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote) {
-        // For remote ranks, use RDMA put for the signal.
-        // Note: RDMA atomics cause assertion failures in this environment.
-        size_t signalOffset = myPe * sizeof(index_t);
-        shmem::ShmemPutTypeImmNbiThread<index_t>(
-            args.recvTokenNumMemObj,
-            signalOffset,
-            numTokenSignal,
-            destPe);
-        shmem::ShmemQuietThread(destPe);
-      } else {
+      if (!isRemote) {
+        // For same-node ranks, use direct store for the signal
+        index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
       }
@@ -679,6 +697,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // Wait for token counts from all source ranks
+  // With ShmemPutMemNbiSignalThread, when the signal arrives the count data is
+  // guaranteed to be visible (hardware-enforced ordering).
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
@@ -687,9 +707,6 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, 0) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      // Store expected count from this srcPe for verification below.
-      // Repurpose destPeTokenCounter (which is done being used for sending).
-      args.destPeTokenCounter[srcPe] = recvTokenNum;
 #if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
              myPe, srcPe, recvTokenNum);
@@ -697,6 +714,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
     // Ensure all lanes have received their signals before lane 0 reads counts.
     __syncwarp();
+    // Memory fence to ensure count data (bundled with signal) is visible
+    __threadfence_system();
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
@@ -706,40 +725,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t* srcExpertCounter =
           args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
 
-      // For network RDMA: poll until per-expert counts from each remote srcPe
-      // sum to the expected value from the signal. This uses the signal as a
-      // checksum to ensure all count data has arrived.
-      // Uses clock-based timeout like DeepEP legacy kernels.
-      for (int srcPe = 0; srcPe < npes; ++srcPe) {
-        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-        if (isRemote) {
-          index_t expectedFromSrc = args.destPeTokenCounter[srcPe];
-          if (expectedFromSrc > 0) {
-            // Poll until the sum of per-expert counts from this srcPe matches expected
-            index_t gotFromSrc = 0;
-            auto startTime = clock64();
-            while (gotFromSrc < expectedFromSrc) {
-              __threadfence_system();
-              gotFromSrc = 0;
-              for (int e = 0; e < config.numExpertPerRank; ++e) {
-                gotFromSrc += core::AtomicLoadRelaxedSystem(
-                    srcExpertCounter + srcPe * config.numExpertPerRank + e);
-              }
-              if ((clock64() - startTime) >= INTERNODE_TIMEOUT_CYCLES) {
-                printf("[TIMEOUT][Rank %d] Polling srcPe=%d: expected=%d, got=%d\n",
-                       myPe, srcPe, expectedFromSrc, gotFromSrc);
-                break;
-              }
-            }
-#if INTERNODE_DEEPEP_DEBUG
-            printf("[DEBUG][Rank %d] Polled srcPe=%d: expected=%d, got=%d\n",
-                   myPe, srcPe, expectedFromSrc, gotFromSrc);
-#endif
-          }
-        }
-      }
-
-      // Now sum expert counts from all source ranks
+      // Sum expert counts from all source ranks
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         // Start with same-node counts
         index_t totalCount = localExpertCounter[e];
@@ -775,7 +761,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         localExpertCounter[e] = 0;
       }
       for (int srcPe = 0; srcPe < npes; ++srcPe) {
-        args.destPeTokenCounter[srcPe] = 0;  // Reset the repurposed counter
+        args.destPeTokenCounter[srcPe] = 0;
         for (int e = 0; e < config.numExpertPerRank; ++e) {
           srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
         }
