@@ -533,6 +533,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // Without this, lane 0 might read srcExpertCounter before the RDMA puts
     // from remote ranks (signaled by other lanes) are complete.
     __syncwarp();
+    // Memory fence to ensure RDMA-written count data is visible after signal arrival.
+    // The signal indicates data was sent, but we need a fence to read the data.
+    __threadfence_system();
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
@@ -569,6 +572,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       }
     }
   }
+
+  // Final barrier to ensure all ranks have completed dispatch before kernel exits.
+  // This prevents race conditions where one rank starts validation while another
+  // is still processing RDMA operations.
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
