@@ -178,6 +178,7 @@ def run_test_worker(
     port: int,
     gpu_per_node_override: int | None = None,
     dispatch_only: bool = False,
+    iterations: int = 1,
 ):
     """Worker function for mp.spawn mode (single node).
 
@@ -196,12 +197,16 @@ def run_test_worker(
         mori.shmem.shmem_torch_process_group_init("default")
 
         try:
-            # Pass local_gpu_id=local_rank so each process uses its own GPU
-            # even when simulating multi-node topology (gpu_per_node < world_size)
-            run_test_impl(
-                rank, world_size, setting, gpu_per_node_override,
-                local_gpu_id=local_rank, dispatch_only=dispatch_only
-            )
+            for iteration in range(iterations):
+                if iterations > 1 and rank == 0:
+                    print(f"\n[DeepEP] Iteration {iteration + 1}/{iterations}", flush=True)
+                # Pass local_gpu_id=local_rank so each process uses its own GPU
+                # even when simulating multi-node topology (gpu_per_node < world_size)
+                run_test_impl(
+                    rank, world_size, setting, gpu_per_node_override,
+                    local_gpu_id=local_rank, dispatch_only=dispatch_only
+                )
+                dist.barrier()  # Sync between iterations
         finally:
             mori.shmem.shmem_finalize()
 
@@ -536,15 +541,19 @@ def main():
 
         print("=" * 80, flush=True)
         print(f"[DeepEP] Running setting '{setting['name']}' with {num_processes} processes", flush=True)
+        if args.iterations > 1:
+            print(f"[DeepEP] Running {args.iterations} iterations", flush=True)
         print("=" * 80, flush=True)
 
         port = get_free_port()
         mp.spawn(
             run_test_worker,
-            args=(num_processes, setting, port, gpu_per_node, args.dispatch_only),
+            args=(num_processes, setting, port, gpu_per_node, args.dispatch_only, args.iterations),
             nprocs=num_processes,
         )
 
+        if args.iterations > 1:
+            print(f"[DeepEP] All {args.iterations} iterations passed!", flush=True)
         print("=" * 80, flush=True)
 
 
