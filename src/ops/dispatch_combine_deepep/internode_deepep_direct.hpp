@@ -825,13 +825,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              // WORKAROUND: printf with format specifiers and runtime values triggers
-              // host synchronization that flushes GPU L2 cache, making RDMA-written data
-              // visible. Simple printf(" ") doesn't work - need actual formatted output.
-              // The newline forces buffer flush which triggers cache coherence.
-              printf(".\n");
-              index_t srcCount = core::AtomicLoadRelaxedSystem(
-                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
+              // WORKAROUND: Read and print a value from the address we're about to load.
+              // This forces the GPU to actually access the memory location, which may
+              // trigger cache coherence for RDMA-written data.
+              index_t* addrToRead = srcExpertCounter + srcPe * config.numExpertPerRank + e;
+              index_t srcCount = core::AtomicLoadRelaxedSystem(addrToRead);
+              printf("%d", srcCount);  // Print the actual value to prevent optimization
               totalCount += srcCount;
               remoteTotal += srcCount;
             }
