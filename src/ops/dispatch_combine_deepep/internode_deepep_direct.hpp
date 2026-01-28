@@ -556,33 +556,36 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Signal token counts to destination ranks
-  if (globalWarpId == 0) {
-    // Wait for all warps to complete, then reset barrier (once, outside loop).
-    // The barrier ensures all warps have completed their quiets (each warp
-    // increments the barrier AFTER its quiet), so all count puts are complete.
+  // Wait for all local warps to complete their count puts.
+  if (globalWarpId == 0 && laneId == 0) {
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
-    __syncwarp();
+    args.dispatchGridBarrier[0] = 0;
+  }
+  __syncthreads();
 
+  // CRITICAL: Cross-device barrier to ensure all ranks have completed their
+  // count RDMA puts AND those puts are globally visible on all remote ranks.
+  // Without this barrier, signals might arrive before count data is visible.
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
+
+  // Signal token counts to destination ranks
+  // Now all count data is guaranteed to be visible on all remote ranks.
+  if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
 
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       if (isRemote) {
-        // For remote ranks, use RDMA atomic add for the signal.
-        // CRITICAL: Atomic operations provide hardware-level ordering guarantees.
-        // All prior RDMA puts (count data) are guaranteed to be globally visible
-        // before the atomic operation completes on the remote side.
-        // This is the key difference from regular puts - atomics enforce ordering.
+        // For remote ranks, use RDMA put for the signal.
+        // Note: RDMA atomics cause assertion failures in this environment.
         size_t signalOffset = myPe * sizeof(index_t);
-        shmem::ShmemInt32AtomicAddThread(
+        shmem::ShmemPutTypeImmNbiThread<index_t>(
             args.recvTokenNumMemObj,
             signalOffset,
             numTokenSignal,
             destPe);
-        // No need for quiet after atomic - atomic operations are self-ordering.
+        shmem::ShmemQuietThread(destPe);
       } else {
         shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
@@ -680,7 +683,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Final barrier to ensure all ranks have completed dispatch before kernel exits.
   // This prevents race conditions where one rank starts validation while another
   // is still processing RDMA operations.
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
+  // Note: We use +2 because +1 was used for the mid-dispatch count sync barrier.
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 2);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
