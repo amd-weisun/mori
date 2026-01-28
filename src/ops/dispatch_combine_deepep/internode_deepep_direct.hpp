@@ -647,17 +647,54 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // the atomicAdd updates to localPeTokenCounter happen across all 40 blocks.
     // Without this barrier, block 0 may read partial counts while other blocks
     // are still updating them.
+    //
+    // We use a two-phase barrier with a release flag to avoid reset race:
+    // - Phase 1: All lane 0s increment arrival counter (dispatchGridBarrier[0])
+    // - Warp 0, lane 0 waits for all arrivals, then sets release flag (dispatchGridBarrier[1])
+    // - All other lane 0s wait for release flag
+    // - Phase 2: All lane 0s increment again to signal they've passed
+    // - Warp 0, lane 0 waits for all to pass, then resets both counters
     __threadfence();  // Ensure all writes are visible
     __syncthreads();  // Sync within block first
-    if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+
+    // Phase 1: Count arrivals and wait for release
+    if (laneId == 0) {
+      atomicAdd(&args.dispatchGridBarrier[0], 1);  // Count arrival
+    }
+
+    // Warp 0, lane 0 waits for all arrivals and sets release flag
     if (globalWarpId == 0 && laneId == 0) {
-      // Wait for all warps across all blocks to reach this point
-      while (atomicAdd(args.dispatchGridBarrier, 0) < globalWarpNum) {
+      while (atomicAdd(&args.dispatchGridBarrier[0], 0) < globalWarpNum) {
         __threadfence();
       }
-      args.dispatchGridBarrier[0] = 0;  // Reset for next use
+      __threadfence();
+      args.dispatchGridBarrier[1] = 1;  // Set release flag
+      __threadfence();
     }
-    __syncthreads();  // Ensure all threads see the barrier completion
+
+    // All other lane 0s wait for release flag
+    if (laneId == 0 && globalWarpId != 0) {
+      while (args.dispatchGridBarrier[1] == 0) {
+        __threadfence();
+      }
+    }
+    __syncwarp();  // All lanes wait for their lane 0
+
+    // Phase 2: Signal that we've passed the barrier (for safe reset)
+    if (laneId == 0) {
+      atomicAdd(&args.dispatchGridBarrier[0], 1);  // Now barrier[0] goes to 2*globalWarpNum
+    }
+
+    // Warp 0, lane 0 waits for all to pass, then resets
+    if (globalWarpId == 0 && laneId == 0) {
+      while (atomicAdd(&args.dispatchGridBarrier[0], 0) < 2 * globalWarpNum) {
+        __threadfence();
+      }
+      args.dispatchGridBarrier[0] = 0;
+      args.dispatchGridBarrier[1] = 0;
+      __threadfence();
+    }
+    __syncthreads();  // Ensure reset is visible to all threads in block
 
     // Only warp 0, lane 0 handles all remote count puts (serialized to avoid staging race)
     if (globalWarpId == 0 && laneId == 0) {
