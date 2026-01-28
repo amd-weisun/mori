@@ -188,6 +188,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Reset local counters and synchronize all ranks before using remote counters.
   if (globalWarpId == 0 && laneId == 0) {
+    // Reset totalRecvTokenNum (normally reset by combine kernel, but needed for dispatch-only)
+    *args.totalRecvTokenNum = 0;
+
     index_t* localExpertCounter =
         args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
     for (int e = 0; e < config.numExpertPerRank; ++e) {
@@ -203,6 +206,23 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     int localPeCounterSize = npes * config.numExpertPerRank;
     for (int idx = 0; idx < localPeCounterSize; ++idx) {
       args.localPeTokenCounter[idx] = 0;
+    }
+    // Reset srcExpertTokenCounterMemObj (receives remote counts via RDMA)
+    index_t* srcExpertCounter =
+        args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
+    for (int srcPe = 0; srcPe < npes; ++srcPe) {
+      for (int e = 0; e < config.numExpertPerRank; ++e) {
+        srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
+      }
+    }
+    // Reset dispatch grid barrier
+    args.dispatchGridBarrier[0] = 0;
+    // Reset dispTokOffset
+    args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+    // Reset recvTokenNum signals
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    for (int pe = 0; pe < npes; ++pe) {
+      recvTokenNums[pe] = 0;
     }
   }
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
