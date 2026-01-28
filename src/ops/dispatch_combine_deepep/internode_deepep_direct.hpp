@@ -39,6 +39,7 @@ namespace deepep {
 #define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
 #define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
 #define DEBUG_RECV_SIGNAL 0           // After receiving each signal
+#define DEBUG_RECV_COUNTS 1           // Print actual count values read from remote srcPe
 #define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
 #define DEBUG_FINAL_SUMMARY 0         // After counting, before reset
 
@@ -49,7 +50,7 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 2000000000ll
+#define INTERNODE_RDMA_DELAY_CYCLES 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -804,10 +805,27 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 #if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
             totalRemoteCount += srcCount;
 #endif
+#if DEBUG_RECV_COUNTS
+            // Print every non-zero remote count to see what we're reading
+            if (srcCount > 0 || e == 0) {
+              printf("[DEBUG][Rank %d] READ from srcPe=%d expert=%d: count=%d (addr=%p)\n",
+                     myPe, srcPe, e, srcCount,
+                     (void*)(srcExpertCounter + srcPe * config.numExpertPerRank + e));
+            }
+#endif
           }
         }
         args.recvTokenCountPerExpert[e] = totalCount;
       }
+#if DEBUG_RECV_COUNTS
+      // Print total received counts
+      index_t readTotal = 0;
+      for (int e = 0; e < config.numExpertPerRank; ++e) {
+        readTotal += args.recvTokenCountPerExpert[e];
+      }
+      printf("[DEBUG][Rank %d] RECV COUNTS TOTAL: read=%d, signal=%d\n",
+             myPe, readTotal, *args.totalRecvTokenNum);
+#endif
 #if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
       // Print summary: signal total vs per-expert count total
       index_t signalTotal = *args.totalRecvTokenNum;
