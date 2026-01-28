@@ -694,9 +694,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // Without this, lane 0 might read srcExpertCounter before the RDMA puts
     // from remote ranks (signaled by other lanes) are complete.
     __syncwarp();
-    // Memory fence to ensure RDMA-written count data is visible after signal arrival.
-    // The signal indicates data was sent, but we need a fence to read the data.
-    __threadfence_system();
+    // Multiple memory fences to ensure RDMA-written count data is visible.
+    // On real network RDMA (InfiniBand), data can arrive out-of-order relative to signals.
+    // The signal indicates data was sent, but network buffering means we need aggressive
+    // fencing to ensure all count data has arrived before reading.
+    // A single fence is often not enough for network RDMA.
+    #pragma unroll
+    for (int fence_iter = 0; fence_iter < 16; ++fence_iter) {
+      __threadfence_system();
+    }
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
@@ -719,9 +725,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         // Add remote counts from srcExpertTokenCounterMemObj
         // IMPORTANT: Use atomic loads for RDMA-written data to ensure visibility.
         // Regular pointer access might read stale cached values.
+        // Also add fence before each read to ensure network RDMA data is visible.
         for (int srcPe = 0; srcPe < npes; ++srcPe) {
           bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
           if (isRemote) {
+            // Fence before each read to ensure RDMA data is visible on network RDMA
+            __threadfence_system();
             index_t srcCount = core::AtomicLoadRelaxedSystem(
                 srcExpertCounter + srcPe * config.numExpertPerRank + e);
             totalCount += srcCount;
