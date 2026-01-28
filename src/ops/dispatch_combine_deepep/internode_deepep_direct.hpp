@@ -669,42 +669,44 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // Sync within block first
 
     // Phase 1: Count arrivals and wait for release
+    // CRITICAL: Use system-scope atomics for barrier to ensure proper ordering
+    // with the system-scope counter reads/writes after the barrier.
     if (laneId == 0) {
-      atomicAdd(&args.dispatchGridBarrier[0], 1);  // Count arrival
+      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1);  // Count arrival
     }
 
     // Warp 0, lane 0 waits for all arrivals and sets release flag
     if (globalWarpId == 0 && laneId == 0) {
-      while (atomicAdd(&args.dispatchGridBarrier[0], 0) < globalWarpNum) {
-        __threadfence();
+      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[0]) < globalWarpNum) {
+        __threadfence_system();
       }
-      __threadfence();
-      args.dispatchGridBarrier[1] = 1;  // Set release flag
-      __threadfence();
+      __threadfence_system();
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 1);  // Set release flag
+      __threadfence_system();
     }
 
     // All other lane 0s wait for release flag
-    // Use atomicAdd(..., 0) for consistent atomic read (simple read might not see updates due to caching)
+    // Use system-scope atomic read for consistency with system-scope writes
     if (laneId == 0 && globalWarpId != 0) {
-      while (atomicAdd(&args.dispatchGridBarrier[1], 0) == 0) {
-        __threadfence();
+      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[1]) == 0) {
+        __threadfence_system();
       }
     }
     __syncwarp();  // All lanes wait for their lane 0
 
     // Phase 2: Signal that we've passed the barrier (for safe reset)
     if (laneId == 0) {
-      atomicAdd(&args.dispatchGridBarrier[0], 1);  // Now barrier[0] goes to 2*globalWarpNum
+      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1);  // Now barrier[0] goes to 2*globalWarpNum
     }
 
     // Warp 0, lane 0 waits for all to pass, then resets
     if (globalWarpId == 0 && laneId == 0) {
-      while (atomicAdd(&args.dispatchGridBarrier[0], 0) < 2 * globalWarpNum) {
-        __threadfence();
+      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[0]) < 2 * globalWarpNum) {
+        __threadfence_system();
       }
-      args.dispatchGridBarrier[0] = 0;
-      args.dispatchGridBarrier[1] = 0;
-      __threadfence();
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[0], 0);
+      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 0);
+      __threadfence_system();
     }
     __syncthreads();  // Ensure reset is visible to all threads in block
 
