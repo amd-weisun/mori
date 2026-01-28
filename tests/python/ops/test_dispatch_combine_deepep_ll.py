@@ -123,9 +123,9 @@ PRESET_SETTINGS = {
         "name": "internode_2gpu_sim",
         "num_processes": 2,
         "hidden_dim": 1024,
-        "max_num_inp_token_per_rank": 32,
-        "total_experts": 16,  # 8 experts per rank
-        "num_experts_per_token": 2,
+        "max_num_inp_token_per_rank": 128,
+        "total_experts": 288,  # 8 experts per rank
+        "num_experts_per_token": 8,
         "gpu_per_node": 1,  # Each GPU is a separate "node"
         "use_fp8": False,  # BF16 for easier debugging
     },
@@ -134,9 +134,9 @@ PRESET_SETTINGS = {
         "name": "internode_2gpu_sim_fp8",
         "num_processes": 2,
         "hidden_dim": 1024,
-        "max_num_inp_token_per_rank": 32,
-        "total_experts": 16,
-        "num_experts_per_token": 2,
+        "max_num_inp_token_per_rank": 128,
+        "total_experts": 288,
+        "num_experts_per_token": 8,
         "gpu_per_node": 1,
         "use_fp8": True,
     },

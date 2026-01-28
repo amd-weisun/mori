@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -171,6 +171,51 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
  * - Uses RDMA for remote ranks on different nodes
  * - Uses SHMEM for same-node ranks
  * - Packs messages with source token index for combine phase routing
+
+Phase 1: RESET (thread 0 only)
+├── Reset local counters: destPeTokenCounter, localPeTokenCounter, etc.
+├── Reset srcExpertTokenCounterMemObj (receives remote counts)
+├── Reset recvTokenNumMemObj (signal slots)
+└── CrossDeviceBarrier #1 (crossDeviceBarrierFlag)
+
+Phase 2: TOKEN DISPATCH (all warps)
+├── For each token:
+│   ├── Compute destPe, localExpert, destTokId
+│   ├── Update local counters (atomicAdd)
+│   ├── If REMOTE:
+│   │   ├── RDMA PUT: dispTokIdToSrcTokIdMemObj[destLinearTok] → destPe
+│   │   ├── RDMA PUT: shmemDispatchOutTokMemObj[baseOffset] → destPe
+│   │   ├── RDMA PUT: shmemOutScalesMemObj (if FP8) → destPe
+│   │   ├── RDMA PUT: shmemDispatchOutWeightsMemObj → destPe
+│   │   └── RDMA PUT: shmemOutIndicesMemObj → destPe
+│   └── If SAME-NODE:
+│       └── Direct memory writes to destPe's buffers
+└── Quiet all remote PEs after token dispatch loop
+
+Phase 3: COUNT EXCHANGE (per remote destPe)
+├── RDMA PUT: localPeTokenCounter → srcExpertTokenCounterMemObj on destPe
+├── Quiet each destPe after count puts
+└── Local grid barrier (dispatchGridBarrier)
+
+Phase 4: CROSS-DEVICE BARRIER #2 (crossDeviceBarrierFlag + 1)
+└── Ensures all count PUTs are globally visible
+
+Phase 5: SIGNAL SENDING (warp 0 only)
+├── For each destPe:
+│   ├── If REMOTE: RDMA PUT signal → recvTokenNumMemObj[myPe] on destPe
+│   └── If SAME-NODE: Direct store to signal slot
+└── Quiet after each remote signal
+
+Phase 6: SIGNAL RECEIVING & COUNT ACCUMULATION (warp 0 only)
+├── Poll recvTokenNumMemObj for signals from all srcPe
+├── __syncwarp() + __threadfence_system()
+├── Read destExpertTokenCounterMemObj (same-node counts)
+├── Read srcExpertTokenCounterMemObj (remote counts) ← USES AtomicLoadRelaxedSystem
+└── Sum counts → recvTokenCountPerExpert
+
+Phase 7: CROSS-DEVICE BARRIER #3 (crossDeviceBarrierFlag + 2)
+└── Final sync before kernel exit
+
  */
 
 template <typename T, bool kUseFP8>
@@ -188,6 +233,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   const int gpuPerNode = config.gpuPerNode;
   const int myNode = myPe / gpuPerNode;
+
+#if INTERNODE_DEEPEP_DEBUG
+  // Debug: Print kernel config and pointers at start
+  if (globalWarpId == 0 && laneId == 0) {
+    printf("[DEBUG][Rank %d] Kernel start: gridDim.x=%d, blockDim.x=%d, globalWarpNum=%d\n",
+           myPe, gridDim.x, blockDim.x, globalWarpNum);
+    printf("[DEBUG][Rank %d] curRankNumToken=%d, numExpertPerToken=%d, totalIterations=%d\n",
+           myPe, args.curRankNumToken, config.numExpertPerToken,
+           args.curRankNumToken * config.numExpertPerToken);
+    printf("[DEBUG][Rank %d] tokenIndices=%p, inpTokenBuf=%p\n",
+           myPe, (void*)args.tokenIndices, (void*)args.inpTokenBuf);
+  }
+#endif
 
   // Reset local counters and synchronize all ranks before using remote counters.
   if (globalWarpId == 0 && laneId == 0) {
@@ -238,6 +296,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
+#if INTERNODE_DEEPEP_DEBUG
+      // Debug: Print first few accesses to verify bounds
+      if (i < 5 && laneId == 0) {
+        printf("[DEBUG][Rank %d] Warp %d accessing tokenIndices[%d], ptr=%p\n",
+               myPe, globalWarpId, i, (void*)(args.tokenIndices + i));
+      }
+#endif
       index_t destExpert = args.tokenIndices[i];
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t localExpert = destExpert % config.numExpertPerRank;
