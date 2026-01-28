@@ -755,9 +755,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Wait for token counts from all source ranks
-  // With ShmemPutMemNbiSignalThread, when the signal arrives the count data is
-  // guaranteed to be visible (hardware-enforced ordering).
+  // Wait for token counts from all source ranks.
+  // NOTE: ShmemPutMemNbiSignalThread does NOT guarantee that count data is visible
+  // when the signal arrives on network RDMA. The poll-then-validate-then-retry loop
+  // below works around this by retrying until the data is consistent.
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
@@ -784,58 +785,53 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t* srcExpertCounter =
           args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
 
-      // Sum expert counts from all source ranks
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
-      index_t totalSameNodeCount = 0;
-      index_t totalRemoteCount = 0;
-#endif
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        // Start with same-node counts
-        index_t totalCount = localExpertCounter[e];
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
-        totalSameNodeCount += localExpertCounter[e];
-#endif
-        // Add remote counts from srcExpertTokenCounterMemObj
-        for (int srcPe = 0; srcPe < npes; ++srcPe) {
-          bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-          if (isRemote) {
-            index_t srcCount = core::AtomicLoadRelaxedSystem(
-                srcExpertCounter + srcPe * config.numExpertPerRank + e);
-            totalCount += srcCount;
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
-            totalRemoteCount += srcCount;
-#endif
-#if DEBUG_RECV_COUNTS
-            // Print every non-zero remote count to see what we're reading
-            if (srcCount > 0 || e == 0) {
-              printf("[DEBUG][Rank %d] READ from srcPe=%d expert=%d: count=%d (addr=%p)\n",
-                     myPe, srcPe, e, srcCount,
-                     (void*)(srcExpertCounter + srcPe * config.numExpertPerRank + e));
-            }
-#endif
-          }
-        }
-        args.recvTokenCountPerExpert[e] = totalCount;
-      }
-#if DEBUG_RECV_COUNTS
-      // Print total received counts
+      // Expected total from signals (already accumulated in totalRecvTokenNum)
+      index_t expectedTotal = *args.totalRecvTokenNum;
+
+      // Poll-then-validate-then-retry: The signal may arrive before count data is visible.
+      // Keep retrying until the per-expert counts sum matches the signal total.
+      // This works around RDMA put+signal not guaranteeing visibility ordering.
+      int retryCount = 0;
+      const int maxRetries = 1000000;  // Generous retry limit
       index_t readTotal = 0;
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        readTotal += args.recvTokenCountPerExpert[e];
-      }
-      printf("[DEBUG][Rank %d] RECV COUNTS TOTAL: read=%d, signal=%d\n",
-             myPe, readTotal, *args.totalRecvTokenNum);
-#endif
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_COUNT_SUMMARY
-      // Print summary: signal total vs per-expert count total
-      index_t signalTotal = *args.totalRecvTokenNum;
-      index_t perExpertTotal = totalSameNodeCount + totalRemoteCount;
-      printf("[DEBUG][Rank %d] COUNT SUMMARY: signalTotal=%d, perExpertTotal=%d (sameNode=%d, remote=%d)\n",
-             myPe, signalTotal, perExpertTotal, totalSameNodeCount, totalRemoteCount);
-      if (signalTotal != perExpertTotal) {
-        printf("[DEBUG][Rank %d] MISMATCH: signal says %d tokens, but per-expert counts sum to %d\n",
-               myPe, signalTotal, perExpertTotal);
-      }
+
+      do {
+        readTotal = 0;
+        // Sum expert counts from all source ranks
+        for (int e = 0; e < config.numExpertPerRank; ++e) {
+          // Start with same-node counts
+          index_t totalCount = localExpertCounter[e];
+          // Add remote counts from srcExpertTokenCounterMemObj
+          for (int srcPe = 0; srcPe < npes; ++srcPe) {
+            bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+            if (isRemote) {
+              index_t srcCount = core::AtomicLoadRelaxedSystem(
+                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
+              totalCount += srcCount;
+            }
+          }
+          args.recvTokenCountPerExpert[e] = totalCount;
+          readTotal += totalCount;
+        }
+
+        if (readTotal == expectedTotal) {
+          break;  // Data is consistent, exit retry loop
+        }
+
+        // Data not yet visible, fence and retry
+        __threadfence_system();
+        retryCount++;
+
+        if (retryCount >= maxRetries) {
+          printf("[ERROR][Rank %d] Count validation failed after %d retries: read=%d, expected=%d\n",
+                 myPe, retryCount, readTotal, expectedTotal);
+          break;
+        }
+      } while (true);
+
+#if DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
+      printf("[DEBUG][Rank %d] RECV COUNTS: read=%d, signal=%d, retries=%d\n",
+             myPe, readTotal, expectedTotal, retryCount);
 #endif
 
       // Reset counters for next dispatch
