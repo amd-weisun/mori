@@ -34,6 +34,9 @@ namespace deepep {
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
 #define INTERNODE_DEEPEP_DEBUG 0
 
+// Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
+#define INTERNODE_TIMEOUT_CYCLES 200000000000ll
+
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
  *
@@ -684,37 +687,59 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, 0) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[srcPe] = 0;
+      // Store expected count from this srcPe for verification below.
+      // Repurpose destPeTokenCounter (which is done being used for sending).
+      args.destPeTokenCounter[srcPe] = recvTokenNum;
 #if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
              myPe, srcPe, recvTokenNum);
 #endif
     }
     // Ensure all lanes have received their signals before lane 0 reads counts.
-    // Without this, lane 0 might read srcExpertCounter before the RDMA puts
-    // from remote ranks (signaled by other lanes) are complete.
     __syncwarp();
-    // Multiple memory fences to ensure RDMA-written count data is visible.
-    // On real network RDMA (InfiniBand), data can arrive out-of-order relative to signals.
-    // The signal indicates data was sent, but network buffering means we need aggressive
-    // fencing to ensure all count data has arrived before reading.
-    // A single fence is often not enough for network RDMA.
-    #pragma unroll
-    for (int fence_iter = 0; fence_iter < 16; ++fence_iter) {
-      __threadfence_system();
-    }
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
 
-      // Sum expert counts from all source ranks:
-      // - Same-node ranks: already accumulated in destExpertTokenCounterMemObj
-      // - Remote ranks: stored in srcExpertTokenCounterMemObj[srcPe * numExpertPerRank + e]
       index_t* localExpertCounter =
           args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
       index_t* srcExpertCounter =
           args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
 
+      // For network RDMA: poll until per-expert counts from each remote srcPe
+      // sum to the expected value from the signal. This uses the signal as a
+      // checksum to ensure all count data has arrived.
+      // Uses clock-based timeout like DeepEP legacy kernels.
+      for (int srcPe = 0; srcPe < npes; ++srcPe) {
+        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+        if (isRemote) {
+          index_t expectedFromSrc = args.destPeTokenCounter[srcPe];
+          if (expectedFromSrc > 0) {
+            // Poll until the sum of per-expert counts from this srcPe matches expected
+            index_t gotFromSrc = 0;
+            auto startTime = clock64();
+            while (gotFromSrc < expectedFromSrc) {
+              __threadfence_system();
+              gotFromSrc = 0;
+              for (int e = 0; e < config.numExpertPerRank; ++e) {
+                gotFromSrc += core::AtomicLoadRelaxedSystem(
+                    srcExpertCounter + srcPe * config.numExpertPerRank + e);
+              }
+              if ((clock64() - startTime) >= INTERNODE_TIMEOUT_CYCLES) {
+                printf("[TIMEOUT][Rank %d] Polling srcPe=%d: expected=%d, got=%d\n",
+                       myPe, srcPe, expectedFromSrc, gotFromSrc);
+                break;
+              }
+            }
+#if INTERNODE_DEEPEP_DEBUG
+            printf("[DEBUG][Rank %d] Polled srcPe=%d: expected=%d, got=%d\n",
+                   myPe, srcPe, expectedFromSrc, gotFromSrc);
+#endif
+          }
+        }
+      }
+
+      // Now sum expert counts from all source ranks
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         // Start with same-node counts
         index_t totalCount = localExpertCounter[e];
@@ -723,14 +748,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         index_t remoteCount = 0;
 #endif
         // Add remote counts from srcExpertTokenCounterMemObj
-        // IMPORTANT: Use atomic loads for RDMA-written data to ensure visibility.
-        // Regular pointer access might read stale cached values.
-        // Also add fence before each read to ensure network RDMA data is visible.
         for (int srcPe = 0; srcPe < npes; ++srcPe) {
           bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
           if (isRemote) {
-            // Fence before each read to ensure RDMA data is visible on network RDMA
-            __threadfence_system();
             index_t srcCount = core::AtomicLoadRelaxedSystem(
                 srcExpertCounter + srcPe * config.numExpertPerRank + e);
             totalCount += srcCount;
@@ -755,6 +775,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         localExpertCounter[e] = 0;
       }
       for (int srcPe = 0; srcPe < npes; ++srcPe) {
+        args.destPeTokenCounter[srcPe] = 0;  // Reset the repurposed counter
         for (int e = 0; e < config.numExpertPerRank; ++e) {
           srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
         }
