@@ -838,12 +838,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           break;  // Data is consistent, exit retry loop
         }
 
+        // Print first mismatch to diagnose
+        if (retryCount == 0) {
+          printf("[DEBUG][Rank %d] FIRST READ MISMATCH: read=%d (sameNode=%d, remote=%d), expected=%d\n",
+                 myPe, readTotal, sameNodeTotal, remoteTotal, expectedTotal);
+        }
+
         // Data not yet visible, fence and retry
         __threadfence_system();
         retryCount++;
 
-        // Print progress every 100000 retries to diagnose stuck loops
-        if (retryCount % 100000 == 0) {
+        // Print progress on first retry and periodically
+        if (retryCount == 1 || retryCount % 100000 == 0) {
           printf("[DEBUG][Rank %d] Retry %d: read=%d (sameNode=%d, remote=%d), expected=%d, diff=%d\n",
                  myPe, retryCount, readTotal, sameNodeTotal, remoteTotal, expectedTotal, expectedTotal - readTotal);
         }
