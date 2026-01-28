@@ -180,16 +180,26 @@ def run_test_worker(
     port: int,
     gpu_per_node_override: int | None = None,
 ):
-    """Worker function for mp.spawn mode (single node)."""
+    """Worker function for mp.spawn mode (single node).
+
+    In mp.spawn mode, all processes run on the same physical node. Each process
+    gets its own physical GPU based on local_rank, regardless of virtual node
+    topology set by gpu_per_node.
+    """
     rank = local_rank
     world_size = num_local_ranks
 
+    # Set CUDA device before any CUDA/shmem operations
+    torch.cuda.set_device(local_rank)
+
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        _log(f"[Rank {rank}] Initializing shmem...", force=True)
+        _log(f"[Rank {rank}] Initializing shmem on GPU {local_rank}...", force=True)
         mori.shmem.shmem_torch_process_group_init("default")
 
         try:
-            run_test_impl(rank, world_size, setting, gpu_per_node_override)
+            # Pass local_gpu_id=local_rank so each process uses its own GPU
+            # even when simulating multi-node topology (gpu_per_node < world_size)
+            run_test_impl(rank, world_size, setting, gpu_per_node_override, local_gpu_id=local_rank)
         finally:
             mori.shmem.shmem_finalize()
 
@@ -240,8 +250,16 @@ def run_test_impl(
     world_size: int,
     setting: dict,
     gpu_per_node_override: int | None = None,
+    local_gpu_id: int | None = None,
 ):
-    """Core test implementation shared by both single-node and multi-node modes."""
+    """Core test implementation shared by both single-node and multi-node modes.
+
+    Args:
+        local_gpu_id: Override for local GPU device ID. In simulated multi-node mode
+                      (mp.spawn on single physical node), this should be `rank` since
+                      each process needs its own physical GPU regardless of virtual
+                      node topology.
+    """
     hidden_dim = setting["hidden_dim"]
     max_num_inp_token_per_rank = setting["max_num_inp_token_per_rank"]
     total_experts = setting["total_experts"]
@@ -271,7 +289,11 @@ def run_test_impl(
             flush=True,
         )
 
-    device = torch.device("cuda", rank % gpu_per_node)
+    # In simulated multi-node mode (mp.spawn), local_gpu_id is passed explicitly
+    # since each process needs its own physical GPU regardless of virtual topology.
+    # In real multi-node mode, use rank % gpu_per_node to get local device.
+    device_id = local_gpu_id if local_gpu_id is not None else (rank % gpu_per_node)
+    device = torch.device("cuda", device_id)
     rng = torch.Generator(device=device)
     rng.manual_seed(123)
 
