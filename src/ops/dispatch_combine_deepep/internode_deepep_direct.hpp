@@ -50,7 +50,7 @@ namespace deepep {
 // With proper ShmemQuietThread() calls, this delay should not be needed.
 // Set to 0 for production. Set to non-zero only for debugging timing issues.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 0
+#define INTERNODE_RDMA_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
