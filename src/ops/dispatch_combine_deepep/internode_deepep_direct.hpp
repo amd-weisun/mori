@@ -34,18 +34,12 @@ namespace deepep {
 
 namespace internode_ll {
 
+inline __host__ __device__ bool SymmMemIsValid(const mori::application::SymmMemObjPtr& mem) {
+  return (mem.cpu != nullptr) && (mem.gpu != nullptr);
+}
+
 inline __device__ bool IsRemoteRank(int myPe, int destPe, int gpuPerNode) {
   return (myPe / gpuPerNode) != (destPe / gpuPerNode);
-}
-
-template <typename T>
-inline __device__ T* GetSymmPtr(const mori::application::SymmMemObjPtr& mem, int pe) {
-  return mem.IsValid() ? mem->template GetAs<T*>(pe) : nullptr;
-}
-
-template <typename T>
-inline __device__ const T* GetSymmPtrConst(const mori::application::SymmMemObjPtr& mem, int pe) {
-  return mem.IsValid() ? mem->template GetAs<T*>(pe) : nullptr;
 }
 
 template <typename T>
@@ -81,7 +75,7 @@ inline __device__ int LaneId() {
 
 }  // namespace internode_ll
 
-namespace detail {
+namespace internode_detail {
 
 constexpr int kNumPerChannels = 128;
 
@@ -115,7 +109,7 @@ __device__ inline __hip_fp8_storage_t CastFloatToFp8(float v, float scale) {
 #endif
 }
 
-}  // namespace detail
+}  // namespace internode_detail
 
 template <typename T>
 __device__ void ResetDispatchCounters(EpDispatchCombineArgs<T>& args) {
@@ -130,7 +124,7 @@ __device__ void ResetDispatchCounters(EpDispatchCombineArgs<T>& args) {
   __syncwarp();
 
   if (laneId == 0) {
-    if (args.destExpertTokenCounterMemObj.IsValid()) {
+    if (internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
       index_t* localExpertCounter =
           args.destExpertTokenCounterMemObj->template GetAs<index_t*>(myPe);
       for (int e = 0; e < config.numExpertPerRank; ++e) {
@@ -162,7 +156,7 @@ __device__ void ResetDispatchCounters(EpDispatchCombineArgs<T>& args) {
 
   __syncwarp();
 
-  if (laneId == 0 && args.dispTokIdToSrcTokIdMemObj.IsValid()) {
+  if (laneId == 0 && internode_ll::SymmMemIsValid(args.dispTokIdToSrcTokIdMemObj)) {
     index_t* localMap = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
     size_t totalTokenSlots =
         static_cast<size_t>(config.numExpertPerRank) * config.worldSize * config.maxNumInpTokenPerRank;
@@ -199,7 +193,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
     for (int i = laneId; i < config.hiddenDim; i += warpSize) {
       destTok[i] = tokenPtr[i];
     }
-    if (args.shmemOutIndicesMemObj.IsValid()) {
+    if (internode_ll::SymmMemIsValid(args.shmemOutIndicesMemObj)) {
       index_t* destIdx =
           args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
           destLinearTok * config.numExpertPerToken;
@@ -209,7 +203,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
         }
       }
     }
-    if (args.shmemDispatchOutWeightsMemObj.IsValid() && weightPtr) {
+    if (internode_ll::SymmMemIsValid(args.shmemDispatchOutWeightsMemObj) && weightPtr) {
       float* destWeight =
           args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
           destLinearTok * config.numExpertPerToken;
@@ -218,7 +212,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
       }
     }
     if constexpr (kUseFP8) {
-      int numScales = config.hiddenDim / detail::kNumPerChannels;
+      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
       float* destScales =
           args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
           destLinearTok * numScales;
@@ -227,7 +221,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
           destScales[i] = fp8ScalePtr[i];
         }
       }
-    } else if (args.shmemOutScalesMemObj.IsValid() && scalesBytes > 0 && genericScalePtr) {
+    } else if (internode_ll::SymmMemIsValid(args.shmemOutScalesMemObj) && scalesBytes > 0 && genericScalePtr) {
       uint8_t* destScales =
           args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
           destLinearTok * scalesBytes;
@@ -253,7 +247,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
                                    hiddenBytes,
                                    destPe);
     }
-    if (args.shmemOutIndicesMemObj.IsValid()) {
+    if (internode_ll::SymmMemIsValid(args.shmemOutIndicesMemObj)) {
       size_t elemOffset =
           static_cast<size_t>(destLinearTok) * config.numExpertPerToken;
       index_t* stagingIdx =
@@ -274,7 +268,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
                                      destPe);
       }
     }
-    if (args.shmemDispatchOutWeightsMemObj.IsValid() && weightPtr) {
+    if (internode_ll::SymmMemIsValid(args.shmemDispatchOutWeightsMemObj) && weightPtr) {
       size_t elemOffset =
           static_cast<size_t>(destLinearTok) * config.numExpertPerToken;
       float* stagingWeight =
@@ -294,7 +288,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
       }
     }
     if constexpr (kUseFP8) {
-      int numScales = config.hiddenDim / detail::kNumPerChannels;
+      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
       size_t elemOffset =
           static_cast<size_t>(destLinearTok) * numScales;
       float* stagingScale =
@@ -314,7 +308,7 @@ __device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
                                      numScales * sizeof(float),
                                      destPe);
       }
-    } else if (args.shmemOutScalesMemObj.IsValid() && scalesBytes > 0 && genericScalePtr) {
+    } else if (internode_ll::SymmMemIsValid(args.shmemOutScalesMemObj) && scalesBytes > 0 && genericScalePtr) {
       size_t elemOffset =
           static_cast<size_t>(destLinearTok) * scalesBytes;
       uint8_t* stagingScale =
@@ -363,7 +357,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     const uint8_t* genericScalePtr = nullptr;
     if constexpr (kUseFP8) {
       if (args.scalesBuf) {
-        int numScales = config.hiddenDim / detail::kNumPerChannels;
+        int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
         fp8ScalePtr =
             reinterpret_cast<const float*>(args.scalesBuf + tok * numScales * sizeof(float));
       }
@@ -393,14 +387,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (laneId == 0 && args.localPeTokenCounter) {
         args.localPeTokenCounter[localCounterIdx] = destLocalSlot + 1;
       }
-      destLocalSlot = __shfl_sync(0xffffffff, destLocalSlot, 0);
+      destLocalSlot = __shfl_sync(0xffffffffffffffffull, destLocalSlot, 0);
       const index_t destTokId = myPe * config.maxNumInpTokenPerRank + destLocalSlot;
       const index_t destLinearTok = localExpert * expertCapacity + destTokId;
 
       if (laneId == 0 && args.destPeTokenCounter) {
         args.destPeTokenCounter[destPe] += 1;
       }
-      if (!isRemote && args.destExpertTokenCounterMemObj.IsValid()) {
+      if (!isRemote && internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
         index_t* localExpertCounter =
             args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
         if (laneId == 0) {
@@ -415,7 +409,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       const index_t srcGlobalTok =
           myPe * config.maxNumInpTokenPerRank + tok;
-      if (laneId == 0 && args.dispTokIdToSrcTokIdMemObj.IsValid()) {
+      if (laneId == 0 && internode_ll::SymmMemIsValid(args.dispTokIdToSrcTokIdMemObj)) {
         if (isRemote && !isSameNode) {
           internode_ll::RdmaWriteScalar(args.dispTokIdToSrcTokIdMemObj,
                                         destLinearTok * sizeof(index_t),
@@ -446,7 +440,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   if (laneId == 0) {
     index_t* counterBase =
-        args.srcExpertTokenCounterMemObj.IsValid()
+        internode_ll::SymmMemIsValid(args.srcExpertTokenCounterMemObj)
             ? args.srcExpertTokenCounterMemObj->template GetAs<index_t*>()
             : nullptr;
     index_t* stagingRow = counterBase ? (counterBase + myPe * config.numExpertPerRank) : nullptr;
@@ -470,7 +464,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
                                      myPe * bytes,
                                      bytes,
                                      destPe);
-      } else if (stagingRow && args.destExpertTokenCounterMemObj.IsValid()) {
+      } else if (stagingRow && internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
         index_t* destCounter =
             args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
         for (int e = 0; e < config.numExpertPerRank; ++e) {
@@ -488,7 +482,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
       }
 
-      if (args.recvTokenNumMemObj.IsValid()) {
+      if (internode_ll::SymmMemIsValid(args.recvTokenNumMemObj)) {
         index_t signalValue = totalForDest + 1;
         if (isRemote && !isSameNode) {
           internode_ll::RdmaWriteScalar(args.recvTokenNumMemObj,
@@ -511,7 +505,7 @@ __device__ void AwaitIncomingSignals(EpDispatchCombineArgs<T>& args) {
   const int laneId = internode_ll::LaneId();
   const int worldSize = config.worldSize;
 
-  if (!args.recvTokenNumMemObj.IsValid()) {
+  if (!internode_ll::SymmMemIsValid(args.recvTokenNumMemObj)) {
     if (laneId == 0 && args.totalRecvTokenNum) {
       *args.totalRecvTokenNum = 0;
     }
@@ -523,7 +517,7 @@ __device__ void AwaitIncomingSignals(EpDispatchCombineArgs<T>& args) {
     index_t totalTokens = 0;
     index_t* signals = args.recvTokenNumMemObj->template GetAs<index_t*>();
     index_t* counterBase =
-        args.srcExpertTokenCounterMemObj.IsValid()
+        internode_ll::SymmMemIsValid(args.srcExpertTokenCounterMemObj)
             ? args.srcExpertTokenCounterMemObj->template GetAs<index_t*>()
             : nullptr;
     if (args.recvTokenCountPerExpert) {
@@ -565,7 +559,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   const index_t expertCapacity =
       static_cast<index_t>(config.worldSize) * config.maxNumInpTokenPerRank;
 
-  if (args.config.useExternalInpBuffer && args.inpTokenBuf && args.shmemCombineInpTokMemObj.IsValid()) {
+  if (args.config.useExternalInpBuffer && args.inpTokenBuf && internode_ll::SymmMemIsValid(args.shmemCombineInpTokMemObj)) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
       index_t recvCount = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
       for (index_t slot = globalWarpId; slot < recvCount; slot += globalWarpNum) {
@@ -578,7 +572,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  if (args.weightsBuf && args.shmemInpWeightsMemObj.IsValid()) {
+  if (args.weightsBuf && internode_ll::SymmMemIsValid(args.shmemInpWeightsMemObj)) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
       index_t recvCount = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
       for (index_t slot = globalWarpId; slot < recvCount; slot += globalWarpNum) {
@@ -652,7 +646,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       srcPtrs[j] =
           args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) + baseOffset;
       srcWeightsPtr[j] =
-          args.shmemInpWeightsMemObj.IsValid()
+          internode_ll::SymmMemIsValid(args.shmemInpWeightsMemObj)
               ? args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                     (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken
               : nullptr;
