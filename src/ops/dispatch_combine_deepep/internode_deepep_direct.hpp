@@ -153,7 +153,9 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   int myNode = myPe / gpuPerNode;
   int nNodes = args.config.worldSize / gpuPerNode;
 
-  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+  // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
+  // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
+  if (laneId == 0) core::AtomicAddRelaxedSystem(args.combineGridBarrier, 1u);
 
   // Step 1: Intra-node barrier - signal to all same-node ranks
   // Wait for all warps to arrive, then reset barrier (only thread 0 resets)
@@ -162,7 +164,7 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
   __syncthreads();
   if (globalThdId == 0) {
-    args.combineGridBarrier[0] = 0;
+    core::AtomicStoreRelaxedSystem(args.combineGridBarrier, 0u);
   }
   __syncthreads();
 
@@ -797,12 +799,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   __threadfence_system();
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
+  if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
 
   // Wait for all local warps to complete their count+signal puts.
   if (globalWarpId == 0 && laneId == 0) {
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    args.dispatchGridBarrier[0] = 0;
+    core::AtomicStoreRelaxedSystem(args.dispatchGridBarrier, 0u);
   }
   __syncthreads();
 
@@ -921,8 +924,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           break;  // Data is consistent, exit retry loop
         }
 
+        // Data not yet visible, fence and retry
+        __threadfence_system();
+        retryCount++;
+
+#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_COUNTS
         // Print first mismatch with per-srcPe breakdown to compare against sender
-        if (retryCount == 0) {
+        if (retryCount == 1) {
           printf("[DEBUG][Rank %d] FIRST READ MISMATCH: read=%d (sameNode=%d, remote=%d), expected=%d\n",
                  myPe, readTotal, sameNodeTotal, remoteTotal, expectedTotal);
           // Print per-srcPe totals for comparison with sender DEBUG_SEND_COUNTS
@@ -938,16 +946,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             }
           }
         }
-
-        // Data not yet visible, fence and retry
-        __threadfence_system();
-        retryCount++;
-
-        // Print progress on first retry and periodically
-        if (retryCount == 1 || retryCount % 100000 == 0) {
+        // Print progress periodically
+        if (retryCount % 100000 == 0) {
           printf("[DEBUG][Rank %d] Retry %d: read=%d (sameNode=%d, remote=%d), expected=%d, diff=%d\n",
                  myPe, retryCount, readTotal, sameNodeTotal, remoteTotal, expectedTotal, expectedTotal - readTotal);
         }
+#endif
 
         if (retryCount >= maxRetries) {
           printf("[ERROR][Rank %d] Count validation failed after %d retries: read=%d, expected=%d\n",
