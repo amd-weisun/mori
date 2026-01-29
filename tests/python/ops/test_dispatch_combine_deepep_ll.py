@@ -179,6 +179,59 @@ def dequant_input_like_fp8(inputs: torch.Tensor, data_type: torch.dtype) -> torc
     return dequant.view(inputs.size(0), inputs.size(1)).to(data_type)
 
 
+def create_op_for_setting(
+    rank: int,
+    world_size: int,
+    setting: dict,
+    gpu_per_node_override: int | None = None,
+    local_gpu_id: int | None = None,
+):
+    """Create EpDispatchCombineDeepepOp for the given setting.
+
+    This function is used to create the op ONCE before the iteration loop
+    to avoid repeated memory allocation/deallocation.
+    """
+    hidden_dim = setting["hidden_dim"]
+    max_num_inp_token_per_rank = setting["max_num_inp_token_per_rank"]
+    total_experts = setting["total_experts"]
+    num_experts_per_token = setting["num_experts_per_token"]
+    gpu_per_node = gpu_per_node_override or setting.get("gpu_per_node", world_size)
+    use_fp8 = setting.get("use_fp8", hidden_dim >= 128)
+    data_type = torch.bfloat16
+
+    assert total_experts % world_size == 0
+    num_experts_per_rank = total_experts // world_size
+
+    is_internode = world_size > gpu_per_node
+    kernel_type = (
+        mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
+        if is_internode
+        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
+    )
+
+    config = mori.ops.EpDispatchCombineDeepepConfig(
+        data_type=data_type,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        scale_dim=hidden_dim // 128,
+        scale_type_size=4,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        max_token_type_size=4,
+        block_num=40,
+        warp_num_per_block=8,
+        use_external_inp_buf=True,
+        use_fp8=use_fp8,
+        use_deepep_layout=True,
+        use_weighted_combine=True,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
+    )
+    return mori.ops.EpDispatchCombineDeepepOp(config)
+
+
 def run_test_worker(
     local_rank: int,
     num_local_ranks: int,
@@ -205,6 +258,9 @@ def run_test_worker(
         mori.shmem.shmem_torch_process_group_init("default")
 
         try:
+            # Create op ONCE outside the iteration loop to avoid memory accumulation
+            op = create_op_for_setting(rank, world_size, setting, gpu_per_node_override, local_gpu_id=local_rank)
+
             for iteration in range(iterations):
                 if iterations > 1 and rank == 0:
                     print(f"\n[DeepEP] Iteration {iteration + 1}/{iterations}", flush=True)
@@ -212,9 +268,14 @@ def run_test_worker(
                 # even when simulating multi-node topology (gpu_per_node < world_size)
                 run_test_impl(
                     rank, world_size, setting, gpu_per_node_override,
-                    local_gpu_id=local_rank, dispatch_only=dispatch_only
+                    local_gpu_id=local_rank, dispatch_only=dispatch_only, op=op
                 )
                 dist.barrier()  # Sync between iterations
+
+            # Cleanup op after all iterations
+            del op
+            gc.collect()
+            torch.cuda.empty_cache()
         finally:
             mori.shmem.shmem_finalize()
 
@@ -247,11 +308,20 @@ def run_test_multinode(setting: dict, iterations: int = 1, dispatch_only: bool =
     mori.shmem.shmem_torch_process_group_init("default")
 
     try:
+        # Create op ONCE outside the iteration loop to avoid memory accumulation.
+        # The op allocates symmetric memory which is expensive to allocate/free repeatedly.
+        op = create_op_for_setting(rank, world_size, setting, gpu_per_node)
+
         for iteration in range(iterations):
             if iterations > 1 and rank == 0:
                 print(f"\n[DeepEP] Iteration {iteration + 1}/{iterations}", flush=True)
-            run_test_impl(rank, world_size, setting, gpu_per_node, dispatch_only=dispatch_only)
+            run_test_impl(rank, world_size, setting, gpu_per_node, dispatch_only=dispatch_only, op=op)
             dist.barrier()  # Sync between iterations
+
+        # Cleanup op after all iterations
+        del op
+        gc.collect()
+        torch.cuda.empty_cache()
     finally:
         mori.shmem.shmem_finalize()
         dist.destroy_process_group()
@@ -267,6 +337,7 @@ def run_test_impl(
     gpu_per_node_override: int | None = None,
     local_gpu_id: int | None = None,
     dispatch_only: bool = False,
+    op: "mori.ops.EpDispatchCombineDeepepOp | None" = None,
 ):
     """Core test implementation shared by both single-node and multi-node modes.
 
@@ -276,7 +347,10 @@ def run_test_impl(
                       each process needs its own physical GPU regardless of virtual
                       node topology.
         dispatch_only: If True, skip the combine phase (for debugging dispatch).
+        op: Optional pre-created op to reuse across iterations. If None, a new op
+            is created (and cleaned up) within this function.
     """
+    owns_op = op is None  # Track if we created the op (and should clean it up)
     hidden_dim = setting["hidden_dim"]
     max_num_inp_token_per_rank = setting["max_num_inp_token_per_rank"]
     total_experts = setting["total_experts"]
@@ -314,28 +388,29 @@ def run_test_impl(
     rng = torch.Generator(device=device)
     rng.manual_seed(123)
 
-    # Create config
-    config = mori.ops.EpDispatchCombineDeepepConfig(
-        data_type=data_type,
-        rank=rank,
-        world_size=world_size,
-        hidden_dim=hidden_dim,
-        scale_dim=hidden_dim // 128,
-        scale_type_size=4,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        max_token_type_size=4,
-        block_num=40,
-        warp_num_per_block=8,
-        use_external_inp_buf=True,
-        use_fp8=use_fp8,
-        use_deepep_layout=True,
-        use_weighted_combine=True,
-        kernel_type=kernel_type,
-        gpu_per_node=gpu_per_node,
-    )
-    op = mori.ops.EpDispatchCombineDeepepOp(config)
+    # Create op if not provided (for single-iteration or backwards compatibility)
+    if op is None:
+        config = mori.ops.EpDispatchCombineDeepepConfig(
+            data_type=data_type,
+            rank=rank,
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            scale_dim=hidden_dim // 128,
+            scale_type_size=4,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+            max_token_type_size=4,
+            block_num=40,
+            warp_num_per_block=8,
+            use_external_inp_buf=True,
+            use_fp8=use_fp8,
+            use_deepep_layout=True,
+            use_weighted_combine=True,
+            kernel_type=kernel_type,
+            gpu_per_node=gpu_per_node,
+        )
+        op = mori.ops.EpDispatchCombineDeepepOp(config)
 
     # Generate test data (same RNG seed across all ranks for reproducibility)
     num_token = torch.tensor(
@@ -399,7 +474,7 @@ def run_test_impl(
     # Validate dispatch result
     if not SKIP_DISPATCH_CHECKS:
         validate_dispatch(
-            rank, config, recv_count, all_rank_indices
+            rank, num_experts_per_rank, world_size, recv_count, all_rank_indices
         )
 
     # Skip combine phase if dispatch-only mode
@@ -407,10 +482,11 @@ def run_test_impl(
         # Barrier to ensure all ranks complete validation before reset
         dist.barrier()
         op.reset()
-        # Explicit cleanup to prevent memory accumulation across iterations
-        del op
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Only cleanup if we created the op (not passed in from caller)
+        if owns_op:
+            del op
+            gc.collect()
+            torch.cuda.empty_cache()
         if rank == 0:
             print(f"[DeepEP] Dispatch-only test '{setting['name']}' PASSED", flush=True)
         return
@@ -437,23 +513,22 @@ def run_test_impl(
 
     op.reset()
 
-    # Explicit cleanup to prevent memory accumulation across iterations.
-    # Without this, symmetric memory from the op may not be freed until GC runs,
-    # causing OOM after many iterations.
-    del op
-    gc.collect()
-    torch.cuda.empty_cache()
+    # Only cleanup if we created the op (not passed in from caller)
+    if owns_op:
+        del op
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if rank == 0:
         print(f"[DeepEP] Test '{setting['name']}' PASSED", flush=True)
 
 
-def validate_dispatch(rank, config, recv_count, all_rank_indices):
+def validate_dispatch(rank, num_experts_per_rank, world_size, recv_count, all_rank_indices):
     """Validate dispatch results by checking token counts."""
     expected_from_indices = 0
-    rank_begin = rank * config.num_experts_per_rank
-    rank_end = rank_begin + config.num_experts_per_rank
-    for r in range(config.world_size):
+    rank_begin = rank * num_experts_per_rank
+    rank_end = rank_begin + num_experts_per_rank
+    for r in range(world_size):
         idx = all_rank_indices[r]
         expected_from_indices += int(((idx >= rank_begin) & (idx < rank_end)).sum().item())
 
