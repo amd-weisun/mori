@@ -835,7 +835,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Wait for all local warps to complete their count+signal puts.
   if (globalWarpId == 0 && laneId == 0) {
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    core::AtomicStoreRelaxedSystem(args.dispatchGridBarrier, 0u);
+
+    // Quiet ALL remote PEs to drain accumulated RDMA operations.
+    // This is called by a single thread (globalWarpId==0, laneId==0) which is safe
+    // because all other threads are blocked at syncthreads below.
+    // This prevents RDMA work queue exhaustion across multiple iterations.
+    for (int destPe = 0; destPe < npes; ++destPe) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        shmem::ShmemQuietThread(destPe);
+      }
+    }
+
+    core::AtomicStoreSeqCstSystem(args.dispatchGridBarrier, 0u);
   }
   __syncthreads();
 
