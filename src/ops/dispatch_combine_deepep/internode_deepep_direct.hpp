@@ -865,15 +865,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (isRemote) {
         // For remote ranks, use RDMA put for the signal (separate from count data)
         // NOTE: We cannot access remote symmetric memory directly - only via RDMA.
-        // We also cannot wait on remote memory - just send the signal and quiet.
+        // Don't call quiet per-destination - it blocks. We'll fence after all puts.
         shmem::ShmemPutTypeImmNbiThread<index_t>(
             args.recvTokenNumMemObj,
             myPe * sizeof(index_t),
             numTokenSignal,
             destPe);
-        printf("[DEBUG][Rank %d] RDMA put to destPe=%d complete, calling quiet...\n", myPe, destPe);
-        shmem::ShmemQuietThread(destPe);
-        printf("[DEBUG][Rank %d] Quiet to destPe=%d complete\n", myPe, destPe);
+        printf("[DEBUG][Rank %d] RDMA put to destPe=%d complete\n", myPe, destPe);
       } else {
         // For same-node ranks, we CAN access memory directly via P2P
         // NOTE: Do NOT wait for signal to be 0 - that would deadlock since
@@ -883,6 +881,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         printf("[DEBUG][Rank %d] P2P store to destPe=%d complete\n", myPe, destPe);
       }
     }
+    // Sync warp and fence to ensure all RDMA puts are visible
+    __syncwarp();
+    __threadfence_system();
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal send phase complete\n", myPe);
     }
