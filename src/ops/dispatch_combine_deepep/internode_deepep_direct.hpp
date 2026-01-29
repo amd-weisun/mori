@@ -186,7 +186,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         isDup = true;
       }
     }
-    isDup = __any_sync(0xffffffff, isDup);
+    isDup = __any_sync(0xffffffffffffffffull, isDup);
 
     if (isDup || destNode != myNode) {
       continue;  // Skip duplicates and inter-node for this phase
