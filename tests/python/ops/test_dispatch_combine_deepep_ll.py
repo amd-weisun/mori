@@ -31,14 +31,10 @@ Usage (multi-node with torchrun):
 
     --------------------------------
   # Node 0 (2 nodes, 1 GPUs per node, dispatch only):
-  torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 \
-      --master_addr=${MASTER_ADDR} --master_port=29500 \
-      tests/python/ops/test_dispatch_combine_deepep_ll.py --dispatch-only --iterations 5
+  torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
 
   # Node 1:
-  torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
-      --master_addr=${MASTER_ADDR} --master_port=29500 \
-      tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
+  torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
     -------------------------------
   # Override gpu_per_node (defaults to nproc_per_node):
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
