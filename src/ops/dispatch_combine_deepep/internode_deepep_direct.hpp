@@ -819,18 +819,6 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // All threads wait for count exchange to complete
   }
 
-  // Ensure all count data RDMA puts are complete before the barrier.
-  // NOTE: We use a spin delay instead of ShmemQuietThread because:
-  // 1. ShmemQuietThread(pe) blocks indefinitely when called from a single lane
-  // 2. ShmemQuietThread() without PE also blocks in this context
-  // 3. GPU lockstep execution means one blocked lane blocks the entire warp
-  // The delay gives RDMA operations time to complete without blocking.
-  // 100000 cycles ~= 50us at 2GHz, sufficient for RDMA completion.
-  if (globalWarpId == 0 && laneId == 0) {
-    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
-  }
-  __syncthreads();
-
   __threadfence_system();
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
@@ -847,6 +835,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
   __threadfence_system();
+
+  // Delay to ensure all RDMA count data puts are complete before sending signals.
+  // NOTE: We use a spin delay instead of ShmemQuietThread because:
+  // 1. ShmemQuietThread(pe) blocks indefinitely when called from a single lane
+  // 2. ShmemQuietThread() without PE also blocks in this context
+  // 3. GPU lockstep execution means one blocked lane blocks the entire warp
+  // The delay gives RDMA operations time to complete without blocking.
+  // 100000 cycles ~= 50us at 2GHz, sufficient for RDMA completion.
+  if (globalWarpId == 0 && laneId == 0) {
+    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
+  }
+  __syncthreads();
 
   // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
   // Use direct store for same-node, RDMA put for remote.
