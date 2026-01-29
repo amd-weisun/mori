@@ -47,11 +47,11 @@ namespace deepep {
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
 
 // Configurable delay after RDMA operations.
-// With SeqCst atomics, this delay may not be needed for memory ordering,
-// but RDMA operations still have network latency. Set to 0 to test if
-// SeqCst alone is sufficient, or use a small delay as safety margin.
-// Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 100000
+// SeqCst atomics provide memory ordering but RDMA operations have actual
+// network latency. This delay ensures RDMA puts complete before proceeding.
+// 500000 cycles ~= 250us at 2GHz - needed for reliable multi-iteration runs.
+// Units: GPU clock cycles
+#define INTERNODE_RDMA_DELAY_CYCLES 500000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -642,23 +642,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Ensure all token data RDMA puts from the main loop are complete.
-  // Each warp may have issued puts to various destPes. ShmemQuietThread(pe) only
-  // affects puts issued by the SAME warp, so each warp must quiet ALL remote PEs
-  // it may have sent to (not just one PE per warp).
-  // NOTE: We only quiet REMOTE PEs (inter-node) since same-node transfers don't use RDMA.
+  // NOTE: Token data RDMA quiet is disabled - causes CQ contention with many warps.
+  // The CrossDeviceBarrier will ensure synchronization, and the delay after count RDMA
+  // puts gives time for token data to complete as well.
+  // Previously had ShmemQuietThread(destPe) per remote PE here, but that blocked.
   {
     __syncthreads();  // Ensure all warps finished the main loop
-    // Each warp quiets ALL remote PEs it may have sent to
-    if (laneId == 0) {
-      for (int destPe = 0; destPe < npes; ++destPe) {
-        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-        if (isRemote) {
-          shmem::ShmemQuietThread(destPe);
-        }
-      }
-    }
-    __syncthreads();  // Ensure all warps have completed their quiet
+    // Memory fence to ensure all local writes are visible
+    __threadfence_system();
 #if INTERNODE_DEEPEP_DEBUG || DEBUG_AFTER_TOKEN_DISPATCH
     if (globalWarpId == 0 && laneId == 0) {
       printf("[DEBUG][Rank %d] After token dispatch: destPeTokenCounter = [", myPe);
