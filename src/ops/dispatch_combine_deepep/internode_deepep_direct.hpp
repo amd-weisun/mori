@@ -53,7 +53,7 @@ namespace deepep {
 // Configurable delay after RDMA operations (for debugging timing issues).
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 0
+#define INTERNODE_RDMA_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -820,16 +820,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // Ensure all count data RDMA puts are complete before the barrier.
-  // CRITICAL: ShmemQuietThread(pe) only affects puts issued by the SAME thread.
-  // Count data puts are issued by warp 0, lane 0, so only that thread should call quiet.
-  // (Following the token data quiet pattern at lines 632-638)
+  // NOTE: We use a spin delay instead of ShmemQuietThread because:
+  // 1. ShmemQuietThread(pe) blocks indefinitely when called from a single lane
+  // 2. ShmemQuietThread() without PE also blocks in this context
+  // 3. GPU lockstep execution means one blocked lane blocks the entire warp
+  // The delay gives RDMA operations time to complete without blocking.
+  // 100000 cycles ~= 50us at 2GHz, sufficient for RDMA completion.
   if (globalWarpId == 0 && laneId == 0) {
-    for (int destPe = 0; destPe < npes; ++destPe) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote) {
-        shmem::ShmemQuietThread(destPe);
-      }
-    }
+    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
   }
   __syncthreads();
 
