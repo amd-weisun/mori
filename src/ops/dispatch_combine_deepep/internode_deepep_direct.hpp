@@ -641,12 +641,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // NOTE: Token data RDMA quiet is disabled - causes CQ contention with many warps.
-  // The CrossDeviceBarrier will ensure synchronization, and the delay after count RDMA
-  // puts gives time for token data to complete as well.
-  // Previously had ShmemQuietThread(destPe) per remote PE here, but that blocked.
+  // Drain token RDMA operations before proceeding to count exchange.
+  // Each warp issued RDMA puts for its tokens, so lane 0 of each warp drains its queue.
+  // Using lane 0 only (320 threads) avoids CQ lock contention from all 20480 threads.
   {
     __syncthreads();  // Ensure all warps finished the main loop
+
+    // Lane 0 of each warp calls quiet to drain its token RDMA operations
+    if (laneId == 0) {
+      shmem::ShmemQuietThread();
+    }
+    __syncthreads();
+
     // Memory fence to ensure all local writes are visible
     __threadfence_system();
 #if INTERNODE_DEEPEP_DEBUG || DEBUG_AFTER_TOKEN_DISPATCH
