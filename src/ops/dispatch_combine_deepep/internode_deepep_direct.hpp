@@ -819,9 +819,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // All threads wait for count exchange to complete
   }
 
-  // Memory fence to ensure all RDMA puts are visible locally before barrier.
-  // NOTE: We don't call ShmemQuietThread here as it blocks indefinitely.
-  // The CrossDeviceBarrier and receiver retry loop handle synchronization.
+  // Ensure all count data RDMA puts are complete before the barrier.
+  // Following the legacy kernel pattern: ALL threads call ShmemQuietThread() without PE,
+  // then __syncthreads(). This ensures RDMA operations complete before proceeding.
+  shmem::ShmemQuietThread();
+  __syncthreads();
+
   __threadfence_system();
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
@@ -837,14 +840,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
 
   // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
-  // This is critical for correctness without debug prints.
   __threadfence_system();
-
-  // Ensure all RDMA puts are complete before sending signals.
-  // Following the legacy kernel pattern: ALL threads call ShmemQuietThread() without PE,
-  // then __syncthreads(). This is critical - calling quiet from only one thread blocks.
-  shmem::ShmemQuietThread();
-  __syncthreads();
 
   // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
   // Use direct store for same-node, RDMA put for remote.
