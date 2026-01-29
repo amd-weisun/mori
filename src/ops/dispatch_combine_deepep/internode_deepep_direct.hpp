@@ -820,9 +820,17 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // Ensure all count data RDMA puts are complete before the barrier.
-  // Following the legacy kernel pattern: ALL threads call ShmemQuietThread() without PE,
-  // then __syncthreads(). This ensures RDMA operations complete before proceeding.
-  shmem::ShmemQuietThread();
+  // CRITICAL: ShmemQuietThread(pe) only affects puts issued by the SAME thread.
+  // Count data puts are issued by warp 0, lane 0, so only that thread should call quiet.
+  // (Following the token data quiet pattern at lines 632-638)
+  if (globalWarpId == 0 && laneId == 0) {
+    for (int destPe = 0; destPe < npes; ++destPe) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        shmem::ShmemQuietThread(destPe);
+      }
+    }
+  }
   __syncthreads();
 
   __threadfence_system();
