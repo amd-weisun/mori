@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -221,14 +221,26 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   // Since each proxyPe slot is written by only one source rank (myPe), we can use put.
   if (globalThdId < nNodes && globalThdId != myNode) {
     int proxyPe = globalThdId * gpuPerNode + (myPe % gpuPerNode);
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: sending RDMA put to proxyPe=%d, flag=%u\n",
+           myPe, proxyPe, crossDeviceBarrierFlag);
+#endif
     // Use RDMA put to write the barrier flag value directly
     shmem::ShmemPutTypeImmNbiThread<uint32_t>(
         args.crossDeviceBarrierMemObj,
         myPe * sizeof(uint32_t),
         crossDeviceBarrierFlag,
         proxyPe);
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: RDMA put done, calling quiet to proxyPe=%d\n",
+           myPe, proxyPe);
+#endif
     // Must quiet to ensure the RDMA put is visible on remote rank before we poll
     shmem::ShmemQuietThread(proxyPe);
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: quiet to proxyPe=%d complete\n",
+           myPe, proxyPe);
+#endif
   }
 
   // Wait for all remote nodes to signal (via their proxy PEs)
@@ -238,9 +250,18 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   // Without this, RDMA-written data may not be visible due to GPU cache coherence issues.
   if (thdId < nNodes && thdId != myNode) {
     int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%u, current=%u\n",
+           myPe, proxyPe, crossDeviceBarrierFlag,
+           core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe));
+#endif
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
       __threadfence_system();  // Force cache invalidation to see RDMA writes
     }
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: proxyPe=%d signal received\n",
+           myPe, proxyPe);
+#endif
   }
   __syncthreads();
 
