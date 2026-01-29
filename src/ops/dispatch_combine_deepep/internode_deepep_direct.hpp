@@ -868,8 +868,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         shmem::ShmemQuietThread(destPe);
       } else {
         // For same-node ranks, we CAN access memory directly via P2P
+        // NOTE: Do NOT wait for signal to be 0 - that would deadlock since
+        // receivers are also in this sending phase and haven't cleared yet.
         index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-        shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
       }
     }
