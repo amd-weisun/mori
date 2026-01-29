@@ -57,7 +57,7 @@ namespace deepep {
 // ensures local completion but not remote visibility. This delay allows time
 // for data to propagate across the network.
 // Set to 0 for production after proper fix. Try 100000 (~50us) for testing.
-#define INTERNODE_POST_QUIET_DELAY_CYCLES 100000
+#define INTERNODE_POST_QUIET_DELAY_CYCLES 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -181,8 +181,15 @@ __device__ __forceinline__ T RdmaWaitUntilGreaterThan(T* addr, T val, int myPe =
 /*                          Inter-Node Barrier (uses RDMA for remote ranks)                       */
 /* ---------------------------------------------------------------------------------------------- */
 /*
+ * V1-style barrier using RDMA atomic ADD instead of PUT.
+ *
  * 1. Intra-node barrier: direct atomic stores/loads for same-node ranks
- * 2. Inter-node barrier: RDMA atomics via proxy PEs for cross-node synchronization
+ * 2. Inter-node barrier: RDMA atomic ADD via proxy PEs for cross-node synchronization
+ *
+ * Key difference from previous implementation:
+ * - Uses RDMA atomic ADD (accumulates 1 per QP) instead of PUT (overwrites value)
+ * - Waits for accumulated count (crossDeviceBarrierFlag * numQpPerPe) instead of single flag
+ * - This avoids issues with multiple barrier calls overwriting each other
  *
  * Proxy PE concept: Each rank communicates with its corresponding rank on other nodes.
  * E.g., rank 0 on node 0 <-> rank 8 on node 1 (if gpuPerNode=8)
@@ -200,6 +207,8 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   int gpuPerNode = args.config.gpuPerNode;
   int myNode = myPe / gpuPerNode;
   int nNodes = args.config.worldSize / gpuPerNode;
+  // Get numQpPerPe from shmem global state (not in DeepEP config)
+  int numQpPerPe = shmem::globalGpuStates->numQpPerPe;
 
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
@@ -212,10 +221,14 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
 #endif
 
-  // Step 1: Intra-node barrier - signal to all same-node ranks
-  // Wait for all warps to arrive, then reset barrier (only thread 0 resets)
+  // Step 1: Local grid barrier - wait for all warps to arrive
   if (globalThdId < gpuPerNode) {
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+  }
+  __syncthreads();
+
+  if (globalThdId == 0) {
+    core::AtomicStoreSeqCstSystem(args.combineGridBarrier, 0u);
   }
   __syncthreads();
 
@@ -225,17 +238,13 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
 #endif
 
-  if (globalThdId == 0) {
-    core::AtomicStoreSeqCstSystem(args.combineGridBarrier, 0u);
-  }
-  __syncthreads();
-
+  // Step 2: Intra-node barrier - signal to all same-node ranks
   if (globalThdId < gpuPerNode) {
     int destPe = myNode * gpuPerNode + globalThdId;
-    // Direct atomic store for same-node ranks - use SeqCst for barrier synchronization
-    core::AtomicStoreSeqCstSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe,
-        crossDeviceBarrierFlag);
+    // Direct atomic ADD for same-node ranks (accumulate, don't overwrite)
+    core::AtomicAddRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + myPe,
+        (uint64_t)1);
   }
 
 #if INTERNODE_DEEPEP_DEBUG
@@ -246,12 +255,13 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
-  // Wait for all same-node ranks to signal - use SeqCst for barrier synchronization
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  // Wait for all same-node ranks to signal
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < gpuPerNode) {
     int srcPe = myNode * gpuPerNode + thdId;
-    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + srcPe) != crossDeviceBarrierFlag) {
-      // SeqCst provides full barrier semantics
+    // Wait for accumulated count (each barrier call adds 1)
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + srcPe) < crossDeviceBarrierFlag) {
+      __threadfence_system();
     }
   }
   __syncthreads();
@@ -262,48 +272,38 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
 #endif
 
-  // Step 2: Inter-node barrier - use RDMA put instead of atomic (to avoid RDMA atomic issues)
-  // Each rank writes its barrier flag to all proxy PEs on other nodes via RDMA put.
-  // Since each proxyPe slot is written by only one source rank (myPe), we can use put.
-  if (globalThdId < nNodes && globalThdId != myNode) {
-    int proxyPe = globalThdId * gpuPerNode + (myPe % gpuPerNode);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: sending RDMA put to proxyPe=%d, flag=%u\n",
-           myPe, proxyPe, crossDeviceBarrierFlag);
-#endif
-    // Use RDMA put to write the barrier flag value directly
-    shmem::ShmemPutTypeImmNbiThread<uint32_t>(
-        args.crossDeviceBarrierMemObj,
-        myPe * sizeof(uint32_t),
-        crossDeviceBarrierFlag,
-        proxyPe);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: RDMA put done, calling quiet to proxyPe=%d\n",
-           myPe, proxyPe);
-#endif
-    // Must quiet to ensure the RDMA put is visible on remote rank before we poll
-    shmem::ShmemQuietThread(proxyPe);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: quiet to proxyPe=%d complete\n",
-           myPe, proxyPe);
-#endif
-  }
-
-  // Wait for all remote nodes to signal (via their proxy PEs)
-  // Each proxy PE slot is only written via RDMA add from the corresponding remote rank.
-  // After N barrier invocations, the slot has value N. So we wait for crossDeviceBarrierFlag.
-  // CRITICAL: Add __threadfence_system() inside the loop to force cache invalidation.
-  // Without this, RDMA-written data may not be visible due to GPU cache coherence issues.
-  if (thdId < nNodes && thdId != myNode) {
+  // Step 3: Inter-node barrier - use RDMA atomic ADD (V1 pattern)
+  // Each thread handles one remote node, sends atomic ADD via each QP
+  if ((thdId < nNodes) && (thdId != myNode)) {
     int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
 #if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%u, current=%u\n",
-           myPe, proxyPe, crossDeviceBarrierFlag,
-           core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe));
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: sending RDMA atomic ADD to proxyPe=%d, numQp=%d\n",
+           myPe, proxyPe, numQpPerPe);
 #endif
-    // Use SeqCst for waiting on RDMA-written data - provides full memory barrier
-    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
-      // SeqCst provides cache coherence, no extra fence needed
+    // V1 pattern: send atomic ADD via each QP for reliability
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+          args.crossDeviceBarrierMemObj,
+          myPe * sizeof(uint64_t),
+          1,
+          core::AMO_ADD,
+          proxyPe,
+          qp);
+    }
+  }
+  __syncthreads();
+
+  // Wait for all remote nodes to signal (via their proxy PEs)
+  // V1 pattern: expect crossDeviceBarrierFlag * numQpPerPe from each remote node
+  if ((thdId < nNodes) && (thdId != myNode)) {
+    int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
+    uint64_t expected = (uint64_t)crossDeviceBarrierFlag * numQpPerPe;
+#if INTERNODE_DEEPEP_DEBUG
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%lu, current=%lu\n",
+           myPe, proxyPe, expected, core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe));
+#endif
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < expected) {
+      __threadfence_system();
     }
 #if INTERNODE_DEEPEP_DEBUG
     printf("[DEBUG][Rank %d] CrossDeviceBarrier: proxyPe=%d signal received\n",
