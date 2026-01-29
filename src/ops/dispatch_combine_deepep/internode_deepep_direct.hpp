@@ -50,7 +50,10 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 0
+// Delay after RDMA operations to ensure completion before signal sending.
+// This is a workaround for ShmemQuietThread/ShmemFenceThread blocking issues.
+// 100000 cycles ~= 50us at 2GHz, which is enough for RDMA to complete.
+#define INTERNODE_RDMA_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -837,20 +840,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // This is critical for correctness without debug prints.
   __threadfence_system();
 
-  // CRITICAL: Fence to ensure all count data RDMA puts complete before signal puts.
-  // This provides ordering: count data will be visible before signal arrives at receiver.
-  // Only warp 0 needs to fence since it will send the signals.
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote) {
-        shmem::ShmemFenceThread(destPe);
-      }
-    }
-    __syncwarp();
-  }
-
-#if INTERNODE_RDMA_DELAY_CYCLES > 0
+  // NOTE: ShmemFenceThread and ShmemQuietThread both block indefinitely in this context.
+  // Use a spin delay instead to give RDMA operations time to complete.
+  // TODO: Investigate why fence/quiet block and find a proper solution.
+#if 1
   // Configurable delay after barrier (simulates printf timing effect for receiving)
   if (globalWarpId == 0 && laneId == 0) {
     internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
