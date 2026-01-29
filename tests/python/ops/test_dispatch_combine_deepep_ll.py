@@ -46,6 +46,7 @@ Usage (SLURM):
       python tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode
 """
 import argparse
+import gc
 import os
 import sys
 
@@ -406,6 +407,10 @@ def run_test_impl(
         # Barrier to ensure all ranks complete validation before reset
         dist.barrier()
         op.reset()
+        # Explicit cleanup to prevent memory accumulation across iterations
+        del op
+        gc.collect()
+        torch.cuda.empty_cache()
         if rank == 0:
             print(f"[DeepEP] Dispatch-only test '{setting['name']}' PASSED", flush=True)
         return
@@ -431,6 +436,13 @@ def run_test_impl(
         )
 
     op.reset()
+
+    # Explicit cleanup to prevent memory accumulation across iterations.
+    # Without this, symmetric memory from the op may not be freed until GC runs,
+    # causing OOM after many iterations.
+    del op
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if rank == 0:
         print(f"[DeepEP] Test '{setting['name']}' PASSED", flush=True)
