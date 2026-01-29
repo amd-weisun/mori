@@ -838,13 +838,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
   __syncthreads();
 
-  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
-  // NOTE: We only have warp 0 call quiet because:
-  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
-  // 2. ShmemQuietThread() is a blocking call that polls CQ for completion
-  // 3. Single-warp quiet avoids contention while still draining the queue
-  // All other threads wait at __syncthreads() below.
-  if (globalWarpId == 0) {
+  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
+  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
+  // puts in the token dispatch loop (lane 0), so each warp must drain its own queue.
+  // Using lane 0 only (320 threads) avoids the massive CQ lock contention that
+  // occurs when all 20480 threads call quiet simultaneously.
+  if (laneId == 0) {
     shmem::ShmemQuietThread();
   }
   __syncthreads();
@@ -1050,12 +1049,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
-  // NOTE: Using single-warp quiet instead of all-threads quiet because:
-  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
-  // 2. The CQ is shared, so one warp draining it ensures all RDMA completes
-  // 3. Other threads wait at __syncthreads() below
-  if (globalWarpId == 0) {
+  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
+  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
+  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
+  // avoids massive CQ lock contention from all 20480 threads calling quiet.
+  if (laneId == 0) {
     shmem::ShmemQuietThread();
   }
   __syncthreads();
@@ -1192,12 +1190,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
-  // NOTE: Using single-warp quiet instead of all-threads quiet because:
-  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
-  // 2. The CQ is shared, so one warp draining it ensures all RDMA completes
-  // 3. Other threads wait at __syncthreads() below
-  if (globalWarpId == 0) {
+  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
+  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
+  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
+  // avoids massive CQ lock contention from all 20480 threads calling quiet.
+  if (laneId == 0) {
     shmem::ShmemQuietThread();
   }
   __syncthreads();
