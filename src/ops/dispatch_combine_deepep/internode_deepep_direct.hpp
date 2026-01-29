@@ -105,6 +105,47 @@ __device__ __forceinline__ void SpinDelayCycles(long long cycles) {
   }
 }
 
+// Distributed quiet: each warp handles a different node's proxyPE to avoid CQ lock contention.
+// This follows V1's pattern from internode_v1.cpp:588-591.
+//
+// Problem with ShmemQuietThread() without args:
+//   - It loops over ALL remote PEs and ALL QPs
+//   - All 320 lane-0 threads compete for the same 16 CQ locks
+//   - Most threads fail AcquireLockOnce and return WITHOUT draining
+//   - CQ entries accumulate, eventually filling the CQ and causing hangs
+//
+// Solution:
+//   - Distribute work across warps by node
+//   - Each warp handles one node's proxyPE
+//   - With 2 nodes and 320 warps, only 2 warps do work - no contention
+//
+// Parameters:
+//   - globalWarpId: warp ID across all blocks (0 to globalWarpNum-1)
+//   - globalWarpNum: total number of warps in the grid
+//   - laneId: lane ID within warp (0 to warpSize-1)
+//   - myPe: current rank
+//   - nNodes: number of nodes
+//   - gpuPerNode: GPUs per node
+template <typename T>
+__device__ __forceinline__ void DistributedQuietByNode(
+    const EpDispatchCombineArgs<T>& args,
+    int globalWarpId, int globalWarpNum, int laneId,
+    int myPe, int nNodes, int gpuPerNode) {
+  // Distribute nodes across warps - each warp handles one node
+  for (int nodeId = globalWarpId; nodeId < nNodes; nodeId += globalWarpNum) {
+    // Skip my own node (no RDMA needed for same-node)
+    if (nodeId == myPe / gpuPerNode) continue;
+
+    // ProxyPE: the corresponding rank on the target node
+    int proxyPe = nodeId * gpuPerNode + (myPe % gpuPerNode);
+
+    // Only lane 0 of the warp calls quiet
+    if (laneId == 0) {
+      shmem::ShmemQuietThread(proxyPe);
+    }
+  }
+}
+
 // RDMA-aware polling: wait until value > threshold with memory fence and timeout.
 // Uses SeqCst (sequential consistency) atomic loads for strongest memory ordering.
 // SeqCst provides acquire semantics plus total ordering, ensuring we see all prior
@@ -642,15 +683,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // Drain token RDMA operations before proceeding to count exchange.
-  // Each warp issued RDMA puts for its tokens, so lane 0 of each warp drains its queue.
-  // Using lane 0 only (320 threads) avoids CQ lock contention from all 20480 threads.
+  // Use distributed quiet to avoid CQ lock contention (see DistributedQuietByNode comment).
   {
     __syncthreads();  // Ensure all warps finished the main loop
 
-    // Lane 0 of each warp calls quiet to drain its token RDMA operations
-    if (laneId == 0) {
-      shmem::ShmemQuietThread();
-    }
+    // Distributed quiet: each warp handles a different node to avoid lock contention
+    internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                          myPe, nNodes, config.gpuPerNode);
     __syncthreads();
 
     // Memory fence to ensure all local writes are visible
@@ -844,14 +883,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
   __syncthreads();
 
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts in the token dispatch loop (lane 0), so each warp must drain its own queue.
-  // Using lane 0 only (320 threads) avoids the massive CQ lock contention that
-  // occurs when all 20480 threads call quiet simultaneously.
-  if (laneId == 0) {
-    shmem::ShmemQuietThread();
-  }
+  // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
+  // See DistributedQuietByNode comment for details on why this is needed.
+  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                        myPe, nNodes, config.gpuPerNode);
   __syncthreads();
 
   // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
@@ -901,10 +936,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncwarp();
     __threadfence_system();
 
-    // Drain signal RDMA puts before waiting for incoming signals
-    // Each lane in warp 0 issued RDMA puts, so lane 0 drains
+    // Drain signal RDMA puts before waiting for incoming signals.
+    // Only warp 0 is executing here, so lane 0 drains all remote nodes sequentially.
+    // No lock contention since only 1 thread is calling quiet.
     if (laneId == 0) {
-      shmem::ShmemQuietThread();
+      for (int nodeId = 0; nodeId < nNodes; nodeId++) {
+        if (nodeId == myNode) continue;  // Skip my own node
+        int proxyPe = nodeId * config.gpuPerNode + (myPe % config.gpuPerNode);
+        shmem::ShmemQuietThread(proxyPe);
+      }
     }
     __syncwarp();
 
@@ -1063,13 +1103,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
-  // avoids massive CQ lock contention from all 20480 threads calling quiet.
-  if (laneId == 0) {
-    shmem::ShmemQuietThread();
-  }
+  // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
+  // See DistributedQuietByNode comment for details on why this is needed.
+  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                        myPe, nNodes, config.gpuPerNode);
   __syncthreads();
 
   // Final barrier to ensure all ranks have completed dispatch before kernel exits.
@@ -1204,13 +1241,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
-  // avoids massive CQ lock contention from all 20480 threads calling quiet.
-  if (laneId == 0) {
-    shmem::ShmemQuietThread();
-  }
+  // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
+  // See DistributedQuietByNode comment for details on why this is needed.
+  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                        myPe, nNodes, config.gpuPerNode);
   __syncthreads();
 
   // Step 2: Cross-rank barrier so all writes are visible
