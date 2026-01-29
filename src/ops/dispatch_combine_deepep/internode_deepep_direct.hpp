@@ -775,15 +775,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           size_t destOffset = myPe * config.numExpertPerRank * sizeof(index_t);
           size_t countBytes = config.numExpertPerRank * sizeof(index_t);
           // Send count data via RDMA put (signal will be sent separately after barrier)
+          // NOTE: Don't call ShmemQuietThread per-destination - it blocks and causes deadlock.
+          // The CrossDeviceBarrier after this loop ensures all RDMA puts complete.
           shmem::ShmemPutMemNbiThread(
               args.srcExpertTokenCounterMemObj, destOffset,
               args.srcExpertTokenCounterMemObj, srcOffset,
               countBytes, destPe, 0);
-
-          // Quiet to ensure the put is complete before reusing staging area
-          shmem::ShmemQuietThread(destPe);
-          // Memory fence to ensure RDMA completion is visible locally
-          __threadfence_system();
 
 #if INTERNODE_RDMA_DELAY_CYCLES > 0
           // Configurable delay after RDMA operations (simulates printf timing effect)
