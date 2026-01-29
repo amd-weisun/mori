@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -51,6 +51,13 @@ namespace deepep {
 // Set to 0 for production. Set to non-zero only for debugging timing issues.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
 #define INTERNODE_RDMA_DELAY_CYCLES 0
+
+// Delay after ShmemQuietThread calls to allow RDMA propagation on real network.
+// On real multi-node (vs simulated), RDMA has higher latency. ShmemQuietThread
+// ensures local completion but not remote visibility. This delay allows time
+// for data to propagate across the network.
+// Set to 0 for production after proper fix. Try 100000 (~50us) for testing.
+#define INTERNODE_POST_QUIET_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -691,6 +698,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     int nNodesForQuiet = npes / config.gpuPerNode;
     internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
                                           myPe, nNodesForQuiet, config.gpuPerNode);
+#if INTERNODE_POST_QUIET_DELAY_CYCLES > 0
+    // Delay to allow RDMA propagation on real network
+    if (laneId == 0) internode_ll::SpinDelayCycles(INTERNODE_POST_QUIET_DELAY_CYCLES);
+#endif
     __syncthreads();
 
     // Memory fence to ensure all local writes are visible
@@ -890,6 +901,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     int nNodesForQuiet = npes / config.gpuPerNode;
     internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
                                           myPe, nNodesForQuiet, config.gpuPerNode);
+#if INTERNODE_POST_QUIET_DELAY_CYCLES > 0
+    // Delay to allow RDMA propagation on real network
+    if (laneId == 0) internode_ll::SpinDelayCycles(INTERNODE_POST_QUIET_DELAY_CYCLES);
+#endif
   }
   __syncthreads();
 
@@ -1115,6 +1130,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     int nNodesForQuiet = npes / config.gpuPerNode;
     internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
                                           myPe, nNodesForQuiet, config.gpuPerNode);
+#if INTERNODE_POST_QUIET_DELAY_CYCLES > 0
+    // Delay to allow RDMA propagation on real network
+    if (laneId == 0) internode_ll::SpinDelayCycles(INTERNODE_POST_QUIET_DELAY_CYCLES);
+#endif
   }
   __syncthreads();
 
@@ -1256,6 +1275,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     int nNodesForQuiet = config.worldSize / config.gpuPerNode;
     internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
                                           myPe, nNodesForQuiet, config.gpuPerNode);
+#if INTERNODE_POST_QUIET_DELAY_CYCLES > 0
+    // Delay to allow RDMA propagation on real network
+    if (laneId == 0) internode_ll::SpinDelayCycles(INTERNODE_POST_QUIET_DELAY_CYCLES);
+#endif
   }
   __syncthreads();
 
