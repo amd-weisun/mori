@@ -50,10 +50,10 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-// Delay after RDMA operations to ensure completion before signal sending.
-// This is a workaround for ShmemQuietThread/ShmemFenceThread blocking issues.
-// 100000 cycles ~= 50us at 2GHz, which is enough for RDMA to complete.
-#define INTERNODE_RDMA_DELAY_CYCLES 100000
+// Configurable delay after RDMA operations (for debugging timing issues).
+// Set to non-zero to add a spin-wait after RDMA put+signal operations.
+// Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
+#define INTERNODE_RDMA_DELAY_CYCLES 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -840,16 +840,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // This is critical for correctness without debug prints.
   __threadfence_system();
 
-  // NOTE: ShmemFenceThread and ShmemQuietThread both block indefinitely in this context.
-  // Use a spin delay instead to give RDMA operations time to complete.
-  // TODO: Investigate why fence/quiet block and find a proper solution.
-#if 1
-  // Configurable delay after barrier (simulates printf timing effect for receiving)
-  if (globalWarpId == 0 && laneId == 0) {
-    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
-  }
+  // Ensure all RDMA puts are complete before sending signals.
+  // Following the legacy kernel pattern: ALL threads call ShmemQuietThread() without PE,
+  // then __syncthreads(). This is critical - calling quiet from only one thread blocks.
+  shmem::ShmemQuietThread();
   __syncthreads();
-#endif
 
   // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
   // Use direct store for same-node, RDMA put for remote.
