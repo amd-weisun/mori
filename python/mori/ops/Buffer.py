@@ -25,6 +25,8 @@ _printed_debug_msgs = set()
 # Set MORI_USE_INTERNODE_LL=1 to use the new DeepEP inter-node LL kernel.
 # Set MORI_USE_INTERNODE_LL=0 (default) to use legacy MORI ops for multi-node.
 USE_INTERNODE_LL = os.getenv("MORI_USE_INTERNODE_LL", "0") == "1"
+if ENABLE_DEBUG_INFO:
+    print(f"[Buffer DEBUG] USE_INTERNODE_LL={USE_INTERNODE_LL} (env={os.getenv('MORI_USE_INTERNODE_LL', 'not set')})", flush=True)
 
 def _debug_print(msg: str, once: bool = True):
     """Print debug message if ENABLE_DEBUG_INFO=1 and rank=0.
