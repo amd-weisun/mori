@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -848,7 +848,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // completed their count puts before signals are sent. The bundled put+signal
   // earlier was not reliable for multi-GPU per node configurations.
   if (globalWarpId == 0) {
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal send phase starting...\n", myPe);
     }
@@ -858,7 +858,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Use system-scope atomic read to see updates from ALL blocks
       index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
 
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Sending signal to destPe=%d (isRemote=%d, numTokenSignal=%d)\n",
              myPe, destPe, isRemote, numTokenSignal);
 #endif
@@ -883,7 +883,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // Sync warp and fence to ensure all RDMA puts are visible
     __syncwarp();
     __threadfence_system();
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal send phase complete\n", myPe);
     }
@@ -896,14 +896,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // below works around this by retrying until the data is consistent.
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal receive phase starting, waiting for %d source ranks...\n", myPe, npes);
     }
 #endif
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
       index_t* signal = recvTokenNums + srcPe;
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Waiting for signal from srcPe=%d (current value=%d)...\n",
              myPe, srcPe, core::AtomicLoadRelaxedSystem(signal));
 #endif
@@ -911,7 +911,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-#if DEBUG
+#if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
              myPe, srcPe, recvTokenNum);
 #endif
@@ -932,7 +932,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Expected total from signals (already accumulated in totalRecvTokenNum)
       index_t expectedTotal = *args.totalRecvTokenNum;
 
-#if DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Starting count validation: expectedTotal=%d (from signals)\n",
              myPe, expectedTotal);
 #endif
@@ -1010,7 +1010,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
       } while (true);
 
-#if DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
+#if INTERNODE_DEEPEP_DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] RECV COUNTS: read=%d, signal=%d, retries=%d\n",
              myPe, readTotal, expectedTotal, retryCount);
 #endif
