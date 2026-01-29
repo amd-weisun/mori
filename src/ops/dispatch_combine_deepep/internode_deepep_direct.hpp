@@ -268,7 +268,9 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
 #endif
 
-  if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+  // NOTE: With separate barrier regions (barrier_id 0-3), we no longer need to
+  // increment the global flag per barrier call. Each region accumulates independently.
+  // The crossDeviceBarrierFlag passed in represents the expected iteration count.
 
   // Wait for all same-node ranks to signal
   // Read from local barrier at offset [barrierBaseOffset + srcPe]

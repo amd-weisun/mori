@@ -511,8 +511,19 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
   assert(false && "DeepEP combine (non-LL) not implemented yet");
 }
 
-// no need for a separate reset kernel now
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
+// Increment crossDeviceBarrierFlag for next iteration.
+// With separate barrier regions, the flag represents the iteration count.
+// Each barrier region accumulates the flag value independently.
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
+  // Increment crossDeviceBarrierFlag by 1 for the next iteration
+  uint32_t flagValue = 0;
+  HIP_RUNTIME_CHECK(hipMemcpyAsync(&flagValue, crossDeviceBarrierFlag, sizeof(uint32_t),
+                                   hipMemcpyDeviceToHost, stream));
+  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  flagValue += 1;
+  HIP_RUNTIME_CHECK(hipMemcpyAsync(crossDeviceBarrierFlag, &flagValue, sizeof(uint32_t),
+                                   hipMemcpyHostToDevice, stream));
+}
 
 }  // namespace deepep
 }  // namespace moe
