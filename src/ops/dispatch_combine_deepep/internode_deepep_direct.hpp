@@ -851,10 +851,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // completed their count puts before signals are sent. The bundled put+signal
   // earlier was not reliable for multi-GPU per node configurations.
   if (globalWarpId == 0) {
+    if (laneId == 0) {
+      printf("[DEBUG][Rank %d] Signal send phase starting...\n", myPe);
+    }
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       // Use system-scope atomic read to see updates from ALL blocks
       index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
+
+      printf("[DEBUG][Rank %d] Sending signal to destPe=%d (isRemote=%d, numTokenSignal=%d)\n",
+             myPe, destPe, isRemote, numTokenSignal);
 
       if (isRemote) {
         // For remote ranks, use RDMA put for the signal (separate from count data)
@@ -865,14 +871,20 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             myPe * sizeof(index_t),
             numTokenSignal,
             destPe);
+        printf("[DEBUG][Rank %d] RDMA put to destPe=%d complete, calling quiet...\n", myPe, destPe);
         shmem::ShmemQuietThread(destPe);
+        printf("[DEBUG][Rank %d] Quiet to destPe=%d complete\n", myPe, destPe);
       } else {
         // For same-node ranks, we CAN access memory directly via P2P
         // NOTE: Do NOT wait for signal to be 0 - that would deadlock since
         // receivers are also in this sending phase and haven't cleared yet.
         index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+        printf("[DEBUG][Rank %d] P2P store to destPe=%d complete\n", myPe, destPe);
       }
+    }
+    if (laneId == 0) {
+      printf("[DEBUG][Rank %d] Signal send phase complete\n", myPe);
     }
   }
 
@@ -882,25 +894,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // below works around this by retrying until the data is consistent.
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
     if (laneId == 0) {
-      printf("[DEBUG][Rank %d] Waiting for signals from %d source ranks...\n", myPe, npes);
+      printf("[DEBUG][Rank %d] Signal receive phase starting, waiting for %d source ranks...\n", myPe, npes);
     }
-#endif
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
       index_t* signal = recvTokenNums + srcPe;
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
       printf("[DEBUG][Rank %d] Waiting for signal from srcPe=%d (current value=%d)...\n",
              myPe, srcPe, core::AtomicLoadRelaxedSystem(signal));
-#endif
       // Use RDMA-aware polling with memory fence to see remote RDMA writes
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_SIGNAL
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
              myPe, srcPe, recvTokenNum);
-#endif
     }
     // Ensure all lanes have received their signals before lane 0 reads counts.
     __syncwarp();
