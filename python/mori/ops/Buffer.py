@@ -21,6 +21,11 @@ if "MORI_SHMEM_MODE" not in os.environ:
 ENABLE_DEBUG_INFO = os.getenv("ENABLE_DEBUG_INFO", "0") == "1"
 _printed_debug_msgs = set()
 
+# Flag to enable the new inter-node low-latency kernel for multi-node dispatch/combine.
+# Set MORI_USE_INTERNODE_LL=1 to use the new DeepEP inter-node LL kernel.
+# Set MORI_USE_INTERNODE_LL=0 (default) to use legacy MORI ops for multi-node.
+USE_INTERNODE_LL = os.getenv("MORI_USE_INTERNODE_LL", "0") == "1"
+
 def _debug_print(msg: str, once: bool = True):
     """Print debug message if ENABLE_DEBUG_INFO=1 and rank=0.
 
@@ -175,9 +180,23 @@ class Buffer:
         return self.ops
 
     def _should_use_deepep_ll(self) -> bool:
-        result = self.gpu_per_node is not None and self.group_size <= self.gpu_per_node
-        _debug_print(f"_should_use_deepep_ll: {result} (gpu_per_node={self.gpu_per_node}, group_size={self.group_size})")
+        """Check if DeepEP low-latency kernel should be used.
+
+        Returns True for:
+        - Single-node (group_size <= gpu_per_node): Always use DeepEP LL
+        - Multi-node (group_size > gpu_per_node): Only if USE_INTERNODE_LL is enabled
+        """
+        if self.gpu_per_node is None:
+            return False
+        is_single_node = self.group_size <= self.gpu_per_node
+        is_multi_node_ll_enabled = USE_INTERNODE_LL and self.group_size > self.gpu_per_node
+        result = is_single_node or is_multi_node_ll_enabled
+        _debug_print(f"_should_use_deepep_ll: {result} (gpu_per_node={self.gpu_per_node}, group_size={self.group_size}, is_single_node={is_single_node}, USE_INTERNODE_LL={USE_INTERNODE_LL})")
         return result
+
+    def _is_multi_node(self) -> bool:
+        """Check if this is a multi-node configuration."""
+        return self.gpu_per_node is not None and self.group_size > self.gpu_per_node
 
     def _get_deepep_op(
         self,
@@ -190,6 +209,14 @@ class Buffer:
     ) -> EpDispatchCombineDeepepOp:
         if num_experts is not None and num_experts > 0 and num_experts % self.group_size == 0:
             self.num_qps_per_rank = num_experts // self.group_size
+
+        # Select kernel type based on single-node vs multi-node configuration
+        if self._is_multi_node():
+            kernel_type = EpDispatchCombineDeepepKernelType.InterNodeLL
+            _debug_print(f"Using InterNodeLL kernel for multi-node (gpu_per_node={self.gpu_per_node}, group_size={self.group_size})")
+        else:
+            kernel_type = EpDispatchCombineDeepepKernelType.IntraNode
+            _debug_print(f"Using IntraNode kernel for single-node (gpu_per_node={self.gpu_per_node}, group_size={self.group_size})")
 
         config = EpDispatchCombineDeepepConfig(
             data_type=dtype,
@@ -208,13 +235,13 @@ class Buffer:
             use_fp8=use_fp8,
             use_deepep_layout=True,
             use_weighted_combine=use_weighted_combine,
-            kernel_type=EpDispatchCombineDeepepKernelType.IntraNode,
+            kernel_type=kernel_type,
             gpu_per_node=self.gpu_per_node or 1,
             rdma_block_num=self.rdma_block_num,
         )
 
         if self.deepep_ops is None or self.deepep_config != config:
-            _debug_print(f"Creating EpDispatchCombineDeepepOp: dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, use_fp8={use_fp8}, use_weighted_combine={use_weighted_combine}")
+            _debug_print(f"Creating EpDispatchCombineDeepepOp: dtype={dtype}, hidden_dim={hidden_dim}, scale_dim={scale_dim}, use_fp8={use_fp8}, use_weighted_combine={use_weighted_combine}, kernel_type={kernel_type}")
             self.deepep_config = config
             self.deepep_ops = EpDispatchCombineDeepepOp(config)
 
@@ -490,7 +517,8 @@ class Buffer:
             raise NotImplementedError("MORI  async_finish/return_recv_hook is not supported yet.")
 
         if self._should_use_deepep_ll():
-            _debug_print(f"low_latency_dispatch: Using DeepEP LL path")
+            kernel_type_str = "InterNodeLL" if self._is_multi_node() else "IntraNode"
+            _debug_print(f"low_latency_dispatch: Using DeepEP LL path ({kernel_type_str})")
             self.max_num_inp_token_per_rank = max(num_max_dispatch_tokens_per_rank, x.size(0))
             self.num_experts_per_token = topk_idx.size(1)
             scale_dim = x.size(1) // 128 if use_fp8 else 0
@@ -515,7 +543,7 @@ class Buffer:
             new_handle = ("deepep_ll", deepep_op, dispatch_indices, dispatch_weights, use_fp8)
             return recv_x, recv_count, new_handle, EventOverlap(), None
 
-        _debug_print(f"low_latency_dispatch: Using standard dispatch path")
+        _debug_print(f"low_latency_dispatch: Using legacy MORI ops (multi-node with USE_INTERNODE_LL=0)")
         dispatch_input = Buffer._per_token_cast_to_fp8(x) if use_fp8 else x
 
         op, inp, inp_scales, dispatch_indices_arg = self._preprocess_dispatch(
@@ -551,7 +579,8 @@ class Buffer:
         Not fully supported with the same API.
         """
         if self._should_use_deepep_ll() and handle and len(handle) >= 4 and handle[0] == "deepep_ll":
-            _debug_print(f"low_latency_combine: Using DeepEP LL path")
+            kernel_type_str = "InterNodeLL" if self._is_multi_node() else "IntraNode"
+            _debug_print(f"low_latency_combine: Using DeepEP LL path ({kernel_type_str})")
             if len(handle) >= 5:
                 _, deepep_op, dispatch_indices, dispatch_weights, use_fp8 = handle
             else:
@@ -568,7 +597,7 @@ class Buffer:
             )
             return combine_output, EventOverlap(), None
 
-        _debug_print(f"low_latency_combine: Using standard combine path")
+        _debug_print(f"low_latency_combine: Using legacy MORI ops (multi-node with USE_INTERNODE_LL=0)")
         rec_output, dispatch_weights, dispatch_indices_arg = self._preprocess_low_latency_combine(
             x,
             handle,
