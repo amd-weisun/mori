@@ -769,30 +769,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
           }
 
-          // Use ShmemPutMemNbiSignalThread to send counts AND signal atomically.
-          // The RDMA hardware guarantees that when the signal arrives at destPe,
-          // the count data is also visible. This avoids the out-of-order issue.
-          // Use system-scope atomic read to see updates from ALL blocks
-          index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
-
           // Source: our local srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
           size_t srcOffset = myPe * config.numExpertPerRank * sizeof(index_t);
           // Dest: remote srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
           size_t destOffset = myPe * config.numExpertPerRank * sizeof(index_t);
           size_t countBytes = config.numExpertPerRank * sizeof(index_t);
-          // Signal dest: recvTokenNumMemObj[myPe] on destPe
-          size_t signalOffset = myPe * sizeof(index_t);
-
-          shmem::ShmemPutMemNbiSignalThread(
+          // Send count data via RDMA put (signal will be sent separately after barrier)
+          shmem::ShmemPutMemNbiThread(
               args.srcExpertTokenCounterMemObj, destOffset,
               args.srcExpertTokenCounterMemObj, srcOffset,
-              countBytes,
-              args.recvTokenNumMemObj, signalOffset,
-              static_cast<uint64_t>(numTokenSignal),
-              core::atomicType::SIGNAL_SET,  // Use SET to write the signal value
-              destPe);
+              countBytes, destPe, 0);
 
-          // Quiet to ensure the put+signal is complete before reusing staging area
+          // Quiet to ensure the put is complete before reusing staging area
           shmem::ShmemQuietThread(destPe);
           // Memory fence to ensure RDMA completion is visible locally
           __threadfence_system();
@@ -814,8 +802,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           }
           // Also read destPeTokenCounter with system-scope atomic for comparison
           index_t destPeTotal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe);
-          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d, signal=%d\n",
-                 myPe, destPe, localCounterTotal, stagedTotal, destPeTotal, numTokenSignal);
+          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d\n",
+                 myPe, destPe, localCounterTotal, stagedTotal, destPeTotal);
           if (stagedTotal != localCounterTotal) {
             printf("[DEBUG][Rank %d] STAGING BUG: staged=%d != localCounter=%d for destPe=%d\n",
                    myPe, stagedTotal, localCounterTotal, destPe);
@@ -857,17 +845,29 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __syncthreads();
 #endif
 
-  // Signal token counts to same-node destination ranks (direct store, not RDMA)
-  // Remote ranks already received their signals via the bundled put above.
+  // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
+  // Use direct store for same-node, RDMA put for remote.
+  // NOTE: We send signals AFTER the CrossDeviceBarrier to ensure all ranks have
+  // completed their count puts before signals are sent. The bundled put+signal
+  // earlier was not reliable for multi-GPU per node configurations.
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (!isRemote) {
+      // Use system-scope atomic read to see updates from ALL blocks
+      index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+
+      if (isRemote) {
+        // For remote ranks, use RDMA put for the signal (separate from count data)
+        shmem::ShmemPutTypeImmNbiThread<index_t>(
+            args.recvTokenNumMemObj,
+            myPe * sizeof(index_t),
+            numTokenSignal,
+            destPe);
+        shmem::ShmemQuietThread(destPe);
+      } else {
         // For same-node ranks, use direct store for the signal
-        // Use system-scope atomic read to see updates from ALL blocks
-        index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
-        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-        shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
       }
     }
