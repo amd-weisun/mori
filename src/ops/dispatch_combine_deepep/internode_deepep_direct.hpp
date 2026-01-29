@@ -50,7 +50,7 @@ namespace deepep {
 // With proper ShmemQuietThread() calls, this delay should not be needed.
 // Set to 0 for production. Set to non-zero only for debugging timing issues.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 100000
+#define INTERNODE_RDMA_DELAY_CYCLES 200000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -900,6 +900,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // Sync warp and fence to ensure all RDMA puts are visible
     __syncwarp();
     __threadfence_system();
+
+    // Drain signal RDMA puts before waiting for incoming signals
+    // Each lane in warp 0 issued RDMA puts, so lane 0 drains
+    if (laneId == 0) {
+      shmem::ShmemQuietThread();
+    }
+    __syncwarp();
+
 #if INTERNODE_DEEPEP_DEBUG
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal send phase complete\n", myPe);
