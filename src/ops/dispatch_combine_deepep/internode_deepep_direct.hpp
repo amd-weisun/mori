@@ -46,14 +46,12 @@ namespace deepep {
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
 
-// Configurable delay after RDMA operations to simulate printf timing effect.
-// Set to non-zero to add a spin-wait after RDMA put+signal operations.
-// This helps diagnose if the issue is purely timing-related.
-// Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-// Configurable delay after RDMA operations (for debugging timing issues).
-// Set to non-zero to add a spin-wait after RDMA put+signal operations.
+// Configurable delay after RDMA operations.
+// With SeqCst atomics, this delay may not be needed for memory ordering,
+// but RDMA operations still have network latency. Set to 0 to test if
+// SeqCst alone is sufficient, or use a small delay as safety margin.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 500000
+#define INTERNODE_RDMA_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -109,17 +107,17 @@ __device__ __forceinline__ void SpinDelayCycles(long long cycles) {
 }
 
 // RDMA-aware polling: wait until value > threshold with memory fence and timeout.
-// The __threadfence_system() inside the loop forces cache invalidation to
-// see RDMA-written data. Without this, the GPU cache may hold stale values
-// indefinitely, causing deadlocks when waiting for remote RDMA updates.
+// Uses SeqCst (sequential consistency) atomic loads for strongest memory ordering.
+// SeqCst provides acquire semantics plus total ordering, ensuring we see all prior
+// writes from other threads/GPUs before returning.
 // Returns the value read. If timeout occurs, prints debug info and returns the last value read.
 template <typename T>
 __device__ __forceinline__ T RdmaWaitUntilGreaterThan(T* addr, T val, int myPe = -1, int srcPe = -1) {
   T got;
   long long startCycle = clock64();
   do {
-    got = core::AtomicLoadRelaxedSystem(addr);
-    __threadfence_system();  // Force cache invalidation to see RDMA writes
+    // SeqCst provides full memory barrier semantics - no separate fence needed
+    got = core::AtomicLoadSeqCstSystem(addr);
     // Timeout check
     if (clock64() - startCycle > INTERNODE_TIMEOUT_CYCLES) {
       printf("[TIMEOUT][Rank %d] RdmaWaitUntilGreaterThan: waiting for srcPe=%d, expected>%d, got=%d\n",
@@ -181,14 +179,14 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 #endif
 
   if (globalThdId == 0) {
-    core::AtomicStoreRelaxedSystem(args.combineGridBarrier, 0u);
+    core::AtomicStoreSeqCstSystem(args.combineGridBarrier, 0u);
   }
   __syncthreads();
 
   if (globalThdId < gpuPerNode) {
     int destPe = myNode * gpuPerNode + globalThdId;
-    // Direct atomic store for same-node ranks
-    core::AtomicStoreRelaxedSystem(
+    // Direct atomic store for same-node ranks - use SeqCst for barrier synchronization
+    core::AtomicStoreSeqCstSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe,
         crossDeviceBarrierFlag);
   }
@@ -201,11 +199,12 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
-  // Wait for all same-node ranks to signal
+  // Wait for all same-node ranks to signal - use SeqCst for barrier synchronization
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < gpuPerNode) {
     int srcPe = myNode * gpuPerNode + thdId;
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + srcPe) != crossDeviceBarrierFlag) {
+    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + srcPe) != crossDeviceBarrierFlag) {
+      // SeqCst provides full barrier semantics
     }
   }
   __syncthreads();
@@ -253,10 +252,11 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 #if INTERNODE_DEEPEP_DEBUG
     printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%u, current=%u\n",
            myPe, proxyPe, crossDeviceBarrierFlag,
-           core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe));
+           core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe));
 #endif
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
-      __threadfence_system();  // Force cache invalidation to see RDMA writes
+    // Use SeqCst for waiting on RDMA-written data - provides full memory barrier
+    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
+      // SeqCst provides cache coherence, no extra fence needed
     }
 #if INTERNODE_DEEPEP_DEBUG
     printf("[DEBUG][Rank %d] CrossDeviceBarrier: proxyPe=%d signal received\n",
@@ -736,20 +736,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
 
     // Warp 0, lane 0 waits for all arrivals and sets release flag
+    // Use SeqCst for strongest memory ordering at barrier synchronization points
     if (globalWarpId == 0 && laneId == 0) {
-      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[0]) < globalWarpNum) {
-        __threadfence_system();
+      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[0]) < globalWarpNum) {
+        // SeqCst provides full barrier, no extra fence needed in loop
       }
-      __threadfence_system();
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 1u);  // Set release flag
-      __threadfence_system();
+      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[1], 1u);  // Set release flag
     }
 
     // All other lane 0s wait for release flag
-    // Use system-scope atomic read for consistency with system-scope writes
+    // Use SeqCst for consistency with SeqCst writes
     if (laneId == 0 && globalWarpId != 0) {
-      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[1]) == 0u) {
-        __threadfence_system();
+      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[1]) == 0u) {
+        // SeqCst provides full barrier, no extra fence needed in loop
       }
     }
     __syncwarp();  // All lanes wait for their lane 0
@@ -761,12 +760,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
     // Warp 0, lane 0 waits for all to pass, then resets
     if (globalWarpId == 0 && laneId == 0) {
-      while (core::AtomicLoadRelaxedSystem(&args.dispatchGridBarrier[0]) < 2 * globalWarpNum) {
-        __threadfence_system();
+      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[0]) < 2 * globalWarpNum) {
+        // SeqCst provides full barrier, no extra fence needed in loop
       }
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[0], 0u);
-      core::AtomicStoreRelaxedSystem(&args.dispatchGridBarrier[1], 0u);
-      __threadfence_system();
+      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[0], 0u);
+      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[1], 0u);
     }
     __syncthreads();  // Ensure reset is visible to all threads in block
 
@@ -787,9 +785,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           // Use slots [myPe * numExpertPerRank, myPe * numExpertPerRank + numExpertPerRank)
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             index_t localCounterIdx = destPe * config.numExpertPerRank + e;
-            // Use system-scope atomic read to see updates from ALL blocks
-            // (device-scope AtomicLoadRelaxed may not see updates from other blocks on AMD)
-            index_t count = core::AtomicLoadRelaxedSystem(args.localPeTokenCounter + localCounterIdx);
+            // Use SeqCst for strongest ordering - ensures we see updates from ALL blocks
+            index_t count = core::AtomicLoadSeqCstSystem(args.localPeTokenCounter + localCounterIdx);
             localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
           }
 
@@ -817,12 +814,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           index_t localCounterTotal = 0;
           for (int e = 0; e < config.numExpertPerRank; ++e) {
             stagedTotal += localSrcExpertCounter[myPe * config.numExpertPerRank + e];
-            // Use system-scope atomic read to see updates from ALL blocks
-            localCounterTotal += core::AtomicLoadRelaxedSystem(
+            // Use SeqCst for consistent reads
+            localCounterTotal += core::AtomicLoadSeqCstSystem(
                 args.localPeTokenCounter + destPe * config.numExpertPerRank + e);
           }
-          // Also read destPeTokenCounter with system-scope atomic for comparison
-          index_t destPeTotal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe);
+          // Also read destPeTokenCounter with SeqCst for comparison
+          index_t destPeTotal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe);
           printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d\n",
                  myPe, destPe, localCounterTotal, stagedTotal, destPeTotal);
           if (stagedTotal != localCounterTotal) {
@@ -885,8 +882,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 #endif
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      // Use system-scope atomic read to see updates from ALL blocks
-      index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
+      // Use SeqCst for strongest memory ordering - ensures all prior writes are visible
+      index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
 
 #if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Sending signal to destPe=%d (isRemote=%d, numTokenSignal=%d)\n",
@@ -904,10 +901,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             destPe);
       } else {
         // For same-node ranks, we CAN access memory directly via P2P
-        // NOTE: Do NOT wait for signal to be 0 - that would deadlock since
-        // receivers are also in this sending phase and haven't cleared yet.
+        // Use SeqCst for strongest memory ordering on signal writes
         index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-        core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+        core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
       }
     }
     // Sync warp and fence to ensure all RDMA puts are visible
@@ -935,11 +931,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t* signal = recvTokenNums + srcPe;
 #if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Waiting for signal from srcPe=%d (current value=%d)...\n",
-             myPe, srcPe, core::AtomicLoadRelaxedSystem(signal));
+             myPe, srcPe, core::AtomicLoadSeqCstSystem(signal));
 #endif
-      // Use RDMA-aware polling with memory fence to see remote RDMA writes
+      // Use RDMA-aware polling with SeqCst to see remote RDMA writes
       index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
+      // Use SeqCst when clearing signal to ensure proper ordering
+      core::AtomicStoreSeqCstSystem(signal, (index_t)0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 #if INTERNODE_DEEPEP_DEBUG
       printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
@@ -987,10 +984,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           index_t totalCount = localExpertCounter[e];
           sameNodeTotal += localExpertCounter[e];
           // Add remote counts from srcExpertTokenCounterMemObj
+          // Use SeqCst to ensure we see all RDMA-written data
           for (int srcPe = 0; srcPe < npes; ++srcPe) {
             bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
             if (isRemote) {
-              index_t srcCount = core::AtomicLoadRelaxedSystem(
+              index_t srcCount = core::AtomicLoadSeqCstSystem(
                   srcExpertCounter + srcPe * config.numExpertPerRank + e);
               totalCount += srcCount;
               remoteTotal += srcCount;
@@ -1019,7 +1017,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             if (isRemote) {
               index_t srcPeTotal = 0;
               for (int e = 0; e < config.numExpertPerRank; ++e) {
-                srcPeTotal += core::AtomicLoadRelaxedSystem(
+                srcPeTotal += core::AtomicLoadSeqCstSystem(
                     srcExpertCounter + srcPe * config.numExpertPerRank + e);
               }
               printf("[DEBUG][Rank %d] RECV from srcPe=%d: read=%d\n", myPe, srcPe, srcPeTotal);
