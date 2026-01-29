@@ -50,7 +50,7 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 0
+#define INTERNODE_RDMA_DELAY_CYCLES 100000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -816,20 +816,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // All threads wait for count exchange to complete
   }
 
-  // Ensure all count data RDMA puts are complete before the barrier.
-  // Each warp must quiet all remote destinations it may have sent to.
-  // NOTE: This is done ONCE per warp after all puts, not per-destination inside the loop.
-  // Only warp 0 does this to avoid contention from multiple warps quieting same destinations.
-  if (globalWarpId == 0 && laneId == 0) {
-    for (int destPe = 0; destPe < npes; ++destPe) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote) {
-        shmem::ShmemQuietThread(destPe);
-      }
-    }
-  }
-  __syncthreads();
-
+  // Memory fence to ensure all RDMA puts are visible locally before barrier.
+  // NOTE: We don't call ShmemQuietThread here as it blocks indefinitely.
+  // The CrossDeviceBarrier and receiver retry loop handle synchronization.
   __threadfence_system();
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
