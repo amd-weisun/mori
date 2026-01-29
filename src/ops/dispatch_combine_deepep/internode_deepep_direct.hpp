@@ -816,6 +816,20 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // All threads wait for count exchange to complete
   }
 
+  // Ensure all count data RDMA puts are complete before the barrier.
+  // Each warp must quiet all remote destinations it may have sent to.
+  // NOTE: This is done ONCE per warp after all puts, not per-destination inside the loop.
+  // Only warp 0 does this to avoid contention from multiple warps quieting same destinations.
+  if (globalWarpId == 0 && laneId == 0) {
+    for (int destPe = 0; destPe < npes; ++destPe) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        shmem::ShmemQuietThread(destPe);
+      }
+    }
+  }
+  __syncthreads();
+
   __threadfence_system();
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
