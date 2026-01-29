@@ -111,458 +111,225 @@ __device__ inline __hip_fp8_storage_t CastFloatToFp8(float v, float scale) {
 
 }  // namespace internode_detail
 
-template <typename T>
-__device__ void ResetDispatchCounters(EpDispatchCombineArgs<T>& args) {
-  const EpDispatchCombineDeepepConfig& config = args.config;
-  int laneId = internode_ll::LaneId();
-  int myPe = config.rank;
-
-  if (laneId == 0 && args.totalRecvTokenNum) {
-    *args.totalRecvTokenNum = 0;
-  }
-
-  __syncwarp();
-
-  if (laneId == 0) {
-    if (internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
-      index_t* localExpertCounter =
-          args.destExpertTokenCounterMemObj->template GetAs<index_t*>(myPe);
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        localExpertCounter[e] = 0;
-      }
-    }
-    if (args.destPeTokenCounter) {
-      for (int pe = 0; pe < config.worldSize; ++pe) {
-        args.destPeTokenCounter[pe] = 0;
-      }
-    }
-    if (args.destNodeTokenCounter) {
-      for (int node = 0; node < config.worldSize / config.gpuPerNode; ++node) {
-        args.destNodeTokenCounter[node] = 0;
-      }
-    }
-    if (args.localPeTokenCounter) {
-      size_t total = static_cast<size_t>(config.worldSize) * config.numExpertPerRank;
-      for (size_t i = 0; i < total; ++i) {
-        args.localPeTokenCounter[i] = 0;
-      }
-    }
-    if (args.recvTokenCountPerExpert) {
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        args.recvTokenCountPerExpert[e] = 0;
-      }
-    }
-  }
-
-  __syncwarp();
-
-  if (laneId == 0 && internode_ll::SymmMemIsValid(args.dispTokIdToSrcTokIdMemObj)) {
-    index_t* localMap = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
-    size_t totalTokenSlots =
-        static_cast<size_t>(config.numExpertPerRank) * config.worldSize * config.maxNumInpTokenPerRank;
-    for (size_t i = 0; i < totalTokenSlots; ++i) {
-      localMap[i] = static_cast<index_t>(-1);
-    }
-  }
-}
-
-template <typename T, bool kUseFP8>
-__device__ void CopyTokenToDest(EpDispatchCombineArgs<T>& args,
-                                int destPe,
-                                index_t destLinearTok,
-                                const T* tokenPtr,
-                                const float* fp8ScalePtr,
-                                const uint8_t* genericScalePtr,
-                                const float* weightPtr,
-                                const index_t* indexPtr,
-                                int laneId) {
-  const EpDispatchCombineDeepepConfig& config = args.config;
-  bool isRemote = internode_ll::IsRemoteRank(config.rank, destPe, config.gpuPerNode);
-  size_t hiddenBytes = static_cast<size_t>(config.hiddenDim) * sizeof(T);
-  size_t indicesBytes =
-      static_cast<size_t>(config.numExpertPerToken) * sizeof(index_t);
-  size_t weightsBytes =
-      static_cast<size_t>(config.numExpertPerToken) * sizeof(float);
-  size_t scalesBytes =
-      static_cast<size_t>(config.scaleDim) * config.scaleTypeSize;
-
-  if (!isRemote) {
-    T* destTok =
-        args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) +
-        destLinearTok * config.hiddenDim;
-    for (int i = laneId; i < config.hiddenDim; i += warpSize) {
-      destTok[i] = tokenPtr[i];
-    }
-    if (internode_ll::SymmMemIsValid(args.shmemOutIndicesMemObj)) {
-      index_t* destIdx =
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
-          destLinearTok * config.numExpertPerToken;
-      if (indexPtr) {
-        for (int i = laneId; i < config.numExpertPerToken; i += warpSize) {
-          destIdx[i] = indexPtr[i];
-        }
-      }
-    }
-    if (internode_ll::SymmMemIsValid(args.shmemDispatchOutWeightsMemObj) && weightPtr) {
-      float* destWeight =
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
-          destLinearTok * config.numExpertPerToken;
-      for (int i = laneId; i < config.numExpertPerToken; i += warpSize) {
-        destWeight[i] = weightPtr[i];
-      }
-    }
-    if constexpr (kUseFP8) {
-      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
-      float* destScales =
-          args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
-          destLinearTok * numScales;
-      if (fp8ScalePtr) {
-        for (int i = laneId; i < numScales; i += warpSize) {
-          destScales[i] = fp8ScalePtr[i];
-        }
-      }
-    } else if (internode_ll::SymmMemIsValid(args.shmemOutScalesMemObj) && scalesBytes > 0 && genericScalePtr) {
-      uint8_t* destScales =
-          args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
-          destLinearTok * scalesBytes;
-      for (size_t offset = laneId; offset < scalesBytes; offset += warpSize) {
-        destScales[offset] = genericScalePtr[offset];
-      }
-    }
-  } else {
-    size_t destOffsetBytes = static_cast<size_t>(destLinearTok) * hiddenBytes;
-    size_t srcOffsetBytes = destOffsetBytes;
-    T* staging =
-        args.shmemStagingTokMemObj->template GetAs<T*>() +
-        destLinearTok * config.hiddenDim;
-    for (int i = laneId; i < config.hiddenDim; i += warpSize) {
-      staging[i] = tokenPtr[i];
-    }
-    __syncwarp();
-    if (laneId == 0) {
-      internode_ll::RdmaWriteBlock(args.shmemDispatchOutTokMemObj,
-                                   destOffsetBytes,
-                                   args.shmemStagingTokMemObj,
-                                   srcOffsetBytes,
-                                   hiddenBytes,
-                                   destPe);
-    }
-    if (internode_ll::SymmMemIsValid(args.shmemOutIndicesMemObj)) {
-      size_t elemOffset =
-          static_cast<size_t>(destLinearTok) * config.numExpertPerToken;
-      index_t* stagingIdx =
-          args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-          elemOffset;
-      if (indexPtr) {
-        for (int i = laneId; i < config.numExpertPerToken; i += warpSize) {
-          stagingIdx[i] = indexPtr[i];
-        }
-      }
-      __syncwarp();
-      if (laneId == 0) {
-        internode_ll::RdmaWriteBlock(args.shmemOutIndicesMemObj,
-                                     elemOffset * sizeof(index_t),
-                                     args.shmemInpIndicesMemObj,
-                                     elemOffset * sizeof(index_t),
-                                     indicesBytes,
-                                     destPe);
-      }
-    }
-    if (internode_ll::SymmMemIsValid(args.shmemDispatchOutWeightsMemObj) && weightPtr) {
-      size_t elemOffset =
-          static_cast<size_t>(destLinearTok) * config.numExpertPerToken;
-      float* stagingWeight =
-          args.shmemInpWeightsMemObj->template GetAs<float*>() +
-          elemOffset;
-      for (int i = laneId; i < config.numExpertPerToken; i += warpSize) {
-        stagingWeight[i] = weightPtr[i];
-      }
-      __syncwarp();
-      if (laneId == 0) {
-        internode_ll::RdmaWriteBlock(args.shmemDispatchOutWeightsMemObj,
-                                     elemOffset * sizeof(float),
-                                     args.shmemInpWeightsMemObj,
-                                     elemOffset * sizeof(float),
-                                     weightsBytes,
-                                     destPe);
-      }
-    }
-    if constexpr (kUseFP8) {
-      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
-      size_t elemOffset =
-          static_cast<size_t>(destLinearTok) * numScales;
-      float* stagingScale =
-          args.shmemInpScalesMemObj->template GetAs<float*>() +
-          elemOffset;
-      if (fp8ScalePtr) {
-        for (int i = laneId; i < numScales; i += warpSize) {
-          stagingScale[i] = fp8ScalePtr[i];
-        }
-      }
-      __syncwarp();
-      if (laneId == 0) {
-        internode_ll::RdmaWriteBlock(args.shmemOutScalesMemObj,
-                                     elemOffset * sizeof(float),
-                                     args.shmemInpScalesMemObj,
-                                     elemOffset * sizeof(float),
-                                     numScales * sizeof(float),
-                                     destPe);
-      }
-    } else if (internode_ll::SymmMemIsValid(args.shmemOutScalesMemObj) && scalesBytes > 0 && genericScalePtr) {
-      size_t elemOffset =
-          static_cast<size_t>(destLinearTok) * scalesBytes;
-      uint8_t* stagingScale =
-          args.shmemInpScalesMemObj->template GetAs<uint8_t*>() +
-          elemOffset;
-      for (size_t offset = laneId; offset < scalesBytes; offset += warpSize) {
-        stagingScale[offset] = genericScalePtr[offset];
-      }
-      __syncwarp();
-      if (laneId == 0) {
-        internode_ll::RdmaWriteBlock(args.shmemOutScalesMemObj,
-                                     elemOffset,
-                                     args.shmemInpScalesMemObj,
-                                     elemOffset,
-                                     scalesBytes,
-                                     destPe);
-      }
-    }
-  }
-}
-
+// Dispatch kernel implementation - parallel warp-based approach following V1 pattern
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
-  if (!internode_ll::IsControlWarp()) {
-    return;
+  const EpDispatchCombineDeepepConfig& config = args.config;
+  int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
+  
+  int myPe = config.rank;
+  int npes = config.worldSize;
+  int myNode = myPe / config.gpuPerNode;
+  int nNodes = npes / config.gpuPerNode;
+  int numExpertPerToken = config.numExpertPerToken;
+  const index_t expertCapacity = static_cast<index_t>(config.worldSize) * config.maxNumInpTokenPerRank;
+  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+
+  // Reset local counters - only control warp does this
+  if (globalWarpId == 0 && laneId == 0) {
+    index_t* localExpertCounter =
+        args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
+    for (int e = 0; e < config.numExpertPerRank; ++e) {
+      localExpertCounter[e] = 0;
+    }
+    for (int pe = 0; pe < npes; ++pe) {
+      args.destPeTokenCounter[pe] = 0;
+    }
   }
 
-  const EpDispatchCombineDeepepConfig& config = args.config;
-  const int laneId = internode_ll::LaneId();
-  const int myPe = config.rank;
-  const int gpuPerNode = config.gpuPerNode;
-  const int worldSize = config.worldSize;
-  const index_t expertCapacity =
-      static_cast<index_t>(config.worldSize) * config.maxNumInpTokenPerRank;
+  // Barrier to sync all ranks before dispatch
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+  if (globalWarpId == 0) {
+    if (laneId < args.config.worldSize) {
+      shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+      args.combineGridBarrier[0] = 0;
+      core::AtomicStoreRelaxedSystem(
+          args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(laneId) + args.config.rank,
+          crossDeviceBarrierFlag);
+    }
+  }
+  
+  if (globalWarpId == 0 && laneId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
-  ResetDispatchCounters(args);
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
 
   if (args.curRankNumToken == 0) {
     return;
   }
 
-  for (index_t tok = 0; tok < args.curRankNumToken; ++tok) {
-    const index_t tokenOffset = tok * config.hiddenDim;
-    const T* tokenPtr = args.inpTokenBuf ? (args.inpTokenBuf + tokenOffset) : nullptr;
-    const float* fp8ScalePtr = nullptr;
-    const uint8_t* genericScalePtr = nullptr;
+  // Phase 1: Intra-node dispatch (XGMI)
+  for (int i = globalWarpId; i < args.curRankNumToken * numExpertPerToken; i += globalWarpNum) {
+    index_t srcTokId = i / numExpertPerToken;
+    index_t expertIdx = i % numExpertPerToken;
+    index_t destExpert = args.tokenIndices[i];
+    index_t destPe = destExpert / config.numExpertPerRank;
+    index_t localExpert = destExpert % config.numExpertPerRank;
+    int destNode = destPe / config.gpuPerNode;
+
+    // Check for duplicates within this token's experts
+    bool isDup = false;
+    if (laneId < numExpertPerToken) {
+      index_t laneExpert = args.tokenIndices[srcTokId * numExpertPerToken + laneId];
+      index_t lanePe = laneExpert / config.numExpertPerRank;
+      int laneNode = lanePe / config.gpuPerNode;
+      if (destNode == myNode && laneNode == myNode && laneId < expertIdx && lanePe == destPe) {
+        isDup = true;
+      }
+    }
+    isDup = __any_sync(0xffffffff, isDup);
+
+    if (isDup || destNode != myNode) {
+      continue;  // Skip duplicates and inter-node for this phase
+    }
+
+    // Allocate slot
+    index_t destTokId = 0;
+    if (laneId == 0) {
+      destTokId = atomicAdd(
+          args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe) + localExpert, 1);
+      atomicAdd(args.destPeTokenCounter + destPe, 1);
+      args.dispDestTokIdMap[i] = destExpert * expertCapacity + destTokId;
+    }
+    destTokId = __shfl(destTokId, 0);
+    index_t destLinearTok = localExpert * expertCapacity + destTokId;
+
+    // Write src token ID mapping
+    if (laneId == 0) {
+      core::AtomicStoreRelaxedSystem(
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
+          static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId));
+    }
+
+    // Write weights and indices
+    if (laneId < numExpertPerToken) {
+      if (args.weightsBuf) {
+        args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)
+            [destLinearTok * numExpertPerToken + laneId] =
+            args.weightsBuf[srcTokId * numExpertPerToken + laneId];
+      }
+      args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe)
+          [destLinearTok * numExpertPerToken + laneId] =
+          args.tokenIndices[srcTokId * numExpertPerToken + laneId];
+    }
+
+    size_t baseOffset = destLinearTok * config.hiddenDim;
+    index_t srcTokOffset = srcTokId * config.hiddenDim;
+
+    // Write hidden states (FP8 or BF16)
     if constexpr (kUseFP8) {
-      if (args.scalesBuf) {
-        int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
-        fp8ScalePtr =
-            reinterpret_cast<const float*>(args.scalesBuf + tok * numScales * sizeof(float));
-      }
-    } else if (args.scalesBuf && config.scaleDim > 0 && config.scaleTypeSize > 0) {
-      genericScalePtr =
-          args.scalesBuf + tok * config.scaleDim * config.scaleTypeSize;
-    }
-    const float* weightPtr =
-        args.weightsBuf ? (args.weightsBuf + tok * config.numExpertPerToken) : nullptr;
-    const index_t* indexPtr =
-        args.tokenIndices ? (args.tokenIndices + tok * config.numExpertPerToken) : nullptr;
-
-    for (int expertIdx = 0; expertIdx < config.numExpertPerToken; ++expertIdx) {
-      if (!args.tokenIndices) {
-        continue;
-      }
-      const index_t destExpert = args.tokenIndices[tok * config.numExpertPerToken + expertIdx];
-      const index_t destPe = destExpert / config.numExpertPerRank;
-      const index_t localExpert = destExpert % config.numExpertPerRank;
-      const bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      const bool isSameNode = (myPe / gpuPerNode) == (destPe / gpuPerNode);
-      const index_t localCounterIdx = destPe * config.numExpertPerRank + localExpert;
-
-      index_t destLocalSlot = args.localPeTokenCounter
-                                  ? args.localPeTokenCounter[localCounterIdx]
-                                  : 0;
-      if (laneId == 0 && args.localPeTokenCounter) {
-        args.localPeTokenCounter[localCounterIdx] = destLocalSlot + 1;
-      }
-      destLocalSlot = __shfl_sync(0xffffffffffffffffull, destLocalSlot, 0);
-      const index_t destTokId = myPe * config.maxNumInpTokenPerRank + destLocalSlot;
-      const index_t destLinearTok = localExpert * expertCapacity + destTokId;
-
-      if (laneId == 0 && args.destPeTokenCounter) {
-        args.destPeTokenCounter[destPe] += 1;
-      }
-      if (!isRemote && internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
-        index_t* localExpertCounter =
-            args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
+      auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
+          args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
+      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
+      
+      for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
+        int channelBase = scaleIdx * internode_detail::kNumPerChannels;
+        float amax = 0.0f;
+        for (int j = laneId; j < internode_detail::kNumPerChannels; j += warpSize) {
+          int offset = channelBase + j;
+          float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
+          amax = fmaxf(amax, fabsf(v));
+        }
+        for (int mask = warpSize / 2; mask > 0; mask >>= 1) 
+          amax = fmaxf(amax, __shfl_xor(amax, mask));
+        float scale = internode_detail::DeepepFp8Scale(amax);
+        float scaleInv = internode_detail::DeepepFp8ScaleInv(amax);
         if (laneId == 0) {
-          localExpertCounter[localExpert] += 1;
+          args.shmemOutScalesMemObj->template GetAs<float*>(destPe)
+              [destLinearTok * numScales + scaleIdx] = scaleInv;
+        }
+        for (int j = laneId; j < internode_detail::kNumPerChannels; j += warpSize) {
+          int offset = channelBase + j;
+          float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
+          destFp8[offset] = internode_detail::CastFloatToFp8(v, scale);
         }
       }
-
-      if (args.dispDestTokIdMap) {
-        args.dispDestTokIdMap[tok * config.numExpertPerToken + expertIdx] =
-            destExpert * expertCapacity + destTokId;
-      }
-
-      const index_t srcGlobalTok =
-          myPe * config.maxNumInpTokenPerRank + tok;
-      if (laneId == 0 && internode_ll::SymmMemIsValid(args.dispTokIdToSrcTokIdMemObj)) {
-        if (isRemote && !isSameNode) {
-          internode_ll::RdmaWriteScalar(args.dispTokIdToSrcTokIdMemObj,
-                                        destLinearTok * sizeof(index_t),
-                                        srcGlobalTok,
-                                        destPe);
-        } else {
-          index_t* destPtr =
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe);
-          destPtr[destLinearTok] = srcGlobalTok;
-        }
-      }
-
-      if (tokenPtr) {
-        CopyTokenToDest<T, kUseFP8>(args,
-                                    destPe,
-                                    destLinearTok,
-                                    tokenPtr,
-                                    fp8ScalePtr,
-                                    genericScalePtr,
-                                    weightPtr,
-                                    indexPtr,
-                                    laneId);
+    } else {
+      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
+                     args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+        index_t destScaleOffset = destLinearTok * config.scaleDim * config.scaleTypeSize;
+        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+        core::WarpCopy(
+            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
     }
   }
 
-  __syncwarp();
+  __threadfence_system();
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  if (laneId == 0) {
-    index_t* counterBase =
-        internode_ll::SymmMemIsValid(args.srcExpertTokenCounterMemObj)
-            ? args.srcExpertTokenCounterMemObj->template GetAs<index_t*>()
-            : nullptr;
-    index_t* stagingRow = counterBase ? (counterBase + myPe * config.numExpertPerRank) : nullptr;
-    for (int destPe = 0; destPe < worldSize; ++destPe) {
-      const bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      const bool isSameNode = (myPe / gpuPerNode) == (destPe / gpuPerNode);
-      index_t totalForDest = args.destPeTokenCounter ? args.destPeTokenCounter[destPe] : 0;
+  // Phase 2: Send signals to intra-node peers
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      int destNode = destPe / config.gpuPerNode;
+      if (destNode != myNode) continue;  // Only intra-node in this phase
+      
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      args.dispatchGridBarrier[0] = 0;
 
-      if (stagingRow) {
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          const index_t idx = destPe * config.numExpertPerRank + e;
-          stagingRow[e] = args.localPeTokenCounter ? args.localPeTokenCounter[idx] : 0;
-        }
-      }
-
-      if (isRemote && stagingRow) {
-        const size_t bytes = static_cast<size_t>(config.numExpertPerRank) * sizeof(index_t);
-        internode_ll::RdmaWriteBlock(args.srcExpertTokenCounterMemObj,
-                                     myPe * bytes,
-                                     args.srcExpertTokenCounterMemObj,
-                                     myPe * bytes,
-                                     bytes,
-                                     destPe);
-      } else if (stagingRow && internode_ll::SymmMemIsValid(args.destExpertTokenCounterMemObj)) {
-        index_t* destCounter =
-            args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          destCounter[e] = stagingRow[e];
-        }
-      }
-
-      if (args.destPeTokenCounter) {
-        args.destPeTokenCounter[destPe] = 0;
-      }
-
-      if (args.localPeTokenCounter) {
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          args.localPeTokenCounter[destPe * config.numExpertPerRank + e] = 0;
-        }
-      }
-
-      if (internode_ll::SymmMemIsValid(args.recvTokenNumMemObj)) {
-        index_t signalValue = totalForDest + 1;
-        if (isRemote && !isSameNode) {
-          internode_ll::RdmaWriteScalar(args.recvTokenNumMemObj,
-                                        myPe * sizeof(index_t),
-                                        signalValue,
-                                        destPe);
-        } else {
-          index_t* signal =
-              args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-          *signal = signalValue;
-        }
-      }
+      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
-}
 
-template <typename T>
-__device__ void AwaitIncomingSignals(EpDispatchCombineArgs<T>& args) {
-  const EpDispatchCombineDeepepConfig& config = args.config;
-  const int laneId = internode_ll::LaneId();
-  const int worldSize = config.worldSize;
-
-  if (!internode_ll::SymmMemIsValid(args.recvTokenNumMemObj)) {
-    if (laneId == 0 && args.totalRecvTokenNum) {
-      *args.totalRecvTokenNum = 0;
+  // Phase 3: Wait for intra-node signals and accumulate
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  if (globalWarpId == 0) {
+    for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
+      int srcNode = srcPe / config.gpuPerNode;
+      if (srcNode != myNode) continue;  // Only intra-node
+      
+      index_t* signal = recvTokenNums + srcPe;
+      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      core::AtomicStoreRelaxedSystem(signal, 0);
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      args.destPeTokenCounter[srcPe] = 0;
     }
-    __syncwarp();
-    return;
-  }
-
-  if (laneId == 0) {
-    index_t totalTokens = 0;
-    index_t* signals = args.recvTokenNumMemObj->template GetAs<index_t*>();
-    index_t* counterBase =
-        internode_ll::SymmMemIsValid(args.srcExpertTokenCounterMemObj)
-            ? args.srcExpertTokenCounterMemObj->template GetAs<index_t*>()
-            : nullptr;
-    if (args.recvTokenCountPerExpert) {
+    
+    if (laneId == 0) {
+      index_t* localExpertCounter =
+          args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
       for (int e = 0; e < config.numExpertPerRank; ++e) {
-        args.recvTokenCountPerExpert[e] = 0;
+        args.recvTokenCountPerExpert[e] = localExpertCounter[e];
+        localExpertCounter[e] = 0;
       }
-    }
-    for (int srcPe = 0; srcPe < worldSize; ++srcPe) {
-      index_t value = signals[srcPe];
-      while (value == 0) {
-        value = core::AtomicLoadRelaxedSystem(signals + srcPe);
-      }
-      signals[srcPe] = 0;
-      totalTokens += (value - 1);
-      if (args.recvTokenCountPerExpert && counterBase) {
-        const index_t* srcCounters = counterBase + srcPe * config.numExpertPerRank;
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          args.recvTokenCountPerExpert[e] += srcCounters[e];
-        }
-      }
-    }
-    if (args.totalRecvTokenNum) {
-      *args.totalRecvTokenNum = totalTokens;
     }
   }
-  __syncwarp();
 }
 
+// Combine kernel implementation - follows intranode pattern but with inter-node awareness
 template <typename T, bool kUseFP8, bool kUseWeights>
 __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
-  AwaitIncomingSignals(args);
-
   const EpDispatchCombineDeepepConfig& config = args.config;
-  const int laneId = internode_ll::LaneId();
-  const int warpId = threadIdx.x / warpSize;
-  const int warpNum = blockDim.x / warpSize;
-  const int globalWarpId = blockIdx.x * warpNum + warpId;
-  const int globalWarpNum = gridDim.x * warpNum;
-  const index_t expertCapacity =
-      static_cast<index_t>(config.worldSize) * config.maxNumInpTokenPerRank;
+  int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
 
-  if (args.config.useExternalInpBuffer && args.inpTokenBuf && internode_ll::SymmMemIsValid(args.shmemCombineInpTokMemObj)) {
+  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+
+  // Step 1: Copy valid expert slots into symmetric combine buffer
+  if (args.config.useExternalInpBuffer) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
-      index_t recvCount = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
-      for (index_t slot = globalWarpId; slot < recvCount; slot += globalWarpNum) {
+      index_t count = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
+      for (int slot = globalWarpId; slot < count; slot += globalWarpNum) {
         index_t linear = e * expertCapacity + slot;
         core::WarpCopy(
             args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim,
@@ -572,10 +339,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  if (args.weightsBuf && internode_ll::SymmMemIsValid(args.shmemInpWeightsMemObj)) {
+  if (args.weightsBuf) {
     for (int e = 0; e < config.numExpertPerRank; ++e) {
-      index_t recvCount = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
-      for (index_t slot = globalWarpId; slot < recvCount; slot += globalWarpNum) {
+      index_t count = args.recvTokenCountPerExpert ? args.recvTokenCountPerExpert[e] : 0;
+      for (int slot = globalWarpId; slot < count; slot += globalWarpNum) {
         index_t linear = e * expertCapacity + slot;
         core::WarpCopy(
             args.shmemInpWeightsMemObj->template GetAs<float*>() + linear * config.numExpertPerToken,
@@ -585,12 +352,29 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  __syncthreads();
-
-  if (args.curRankNumToken == 0) {
-    if (laneId == 0 && args.totalRecvTokenNum) {
-      *args.totalRecvTokenNum = 0;
+  // Step 2: Cross-rank barrier
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+  if (globalWarpId == 0) {
+    if (laneId < args.config.worldSize) {
+      shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+      args.combineGridBarrier[0] = 0;
+      core::AtomicStoreRelaxedSystem(
+          args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(laneId) + args.config.rank,
+          crossDeviceBarrierFlag);
     }
+  }
+  
+  if (globalWarpId == 0 && laneId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+  
+  *args.totalRecvTokenNum = 0;
+  if (args.curRankNumToken == 0) {
     return;
   }
 
@@ -607,75 +391,55 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
   T** srcPtrs = srcPtrsBase + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = srcWeightsPtrBase + warpId * config.numExpertPerToken;
-  float* srcWeightScales = kUseWeights ? (srcWeightScalesBase + warpId * config.numExpertPerToken)
-                                       : nullptr;
+  float* srcWeightScales = kUseWeights ? (srcWeightScalesBase + warpId * config.numExpertPerToken) : nullptr;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
+  assert(config.numExpertPerToken < warpSize);
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
     index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        max<index_t>(0, min(static_cast<index_t>(config.hiddenDim) - hiddenDimOffset,
-                            static_cast<index_t>(hiddenDimPerWarp)));
+    index_t hiddenDimSize = max(0, min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      index_t destTokId =
-          args.dispDestTokIdMap ? args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j]
-                                : static_cast<index_t>(-1);
+      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destExpert = destTokId / expertCapacity;
       index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = (config.numExpertPerRank == 0)
-                           ? 0
-                           : destExpert / config.numExpertPerRank;
-      index_t localExpert = (config.numExpertPerRank == 0)
-                                ? 0
-                                : destExpert % config.numExpertPerRank;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t localExpert = destExpert % config.numExpertPerRank;
 
-      if (destTokId == static_cast<index_t>(-1)) {
+      if (destPe < config.worldSize) {
+        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                     baseOffset + hiddenDimOffset;
+        srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                           (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
+      } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
-        if constexpr (kUseWeights) srcWeightScales[j] = 0.0f;
-        continue;
       }
-
-      size_t baseOffset =
-          (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim + hiddenDimOffset;
-      srcPtrs[j] =
-          args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) + baseOffset;
-      srcWeightsPtr[j] =
-          internode_ll::SymmMemIsValid(args.shmemInpWeightsMemObj)
-              ? args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                    (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken
-              : nullptr;
 
       if constexpr (kUseWeights) {
         float w = 1.0f;
-        if (srcWeightsPtr[j] != nullptr) {
+        if (args.weightsBuf && srcWeightsPtr[j] != nullptr) {
           w = srcWeightsPtr[j][j];
         }
         srcWeightScales[j] = w;
       }
     }
 
-    core::WarpAccum<T, 4>(
-        args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-            tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs,
-        kUseWeights ? srcWeightScales : nullptr,
-        config.numExpertPerToken,
-        hiddenDimSize);
+    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                              tokenId * config.hiddenDim + hiddenDimOffset,
+                          srcPtrs, kUseWeights ? srcWeightScales : nullptr,
+                          config.numExpertPerToken, hiddenDimSize);
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(
-          args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-              tokenId * config.numExpertPerToken,
-          srcWeightsPtr,
-          nullptr,
-          config.numExpertPerToken,
-          config.numExpertPerToken);
+      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                    tokenId * config.numExpertPerToken,
+                                srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                config.numExpertPerToken);
     }
   }
 }
