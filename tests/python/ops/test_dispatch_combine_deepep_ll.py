@@ -388,28 +388,30 @@ def run_test_impl(
     rng = torch.Generator(device=device)
     rng.manual_seed(123)
 
+    # Always create config (needed for validation even when op is provided)
+    config = mori.ops.EpDispatchCombineDeepepConfig(
+        data_type=data_type,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        scale_dim=hidden_dim // 128,
+        scale_type_size=4,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        max_token_type_size=4,
+        block_num=40,
+        warp_num_per_block=8,
+        use_external_inp_buf=True,
+        use_fp8=use_fp8,
+        use_deepep_layout=True,
+        use_weighted_combine=True,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
+    )
+
     # Create op if not provided (for single-iteration or backwards compatibility)
     if op is None:
-        config = mori.ops.EpDispatchCombineDeepepConfig(
-            data_type=data_type,
-            rank=rank,
-            world_size=world_size,
-            hidden_dim=hidden_dim,
-            scale_dim=hidden_dim // 128,
-            scale_type_size=4,
-            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-            num_experts_per_rank=num_experts_per_rank,
-            num_experts_per_token=num_experts_per_token,
-            max_token_type_size=4,
-            block_num=40,
-            warp_num_per_block=8,
-            use_external_inp_buf=True,
-            use_fp8=use_fp8,
-            use_deepep_layout=True,
-            use_weighted_combine=True,
-            kernel_type=kernel_type,
-            gpu_per_node=gpu_per_node,
-        )
         op = mori.ops.EpDispatchCombineDeepepOp(config)
 
     # Generate test data (same RNG seed across all ranks for reproducibility)
