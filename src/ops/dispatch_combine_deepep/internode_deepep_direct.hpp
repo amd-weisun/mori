@@ -276,8 +276,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Phase 2: Inter-node dispatch using same-node proxies (treat as if on same node for now)
-  // For each token destined to another node, send via direct symmetric memory
+  // Phase 2: Inter-node dispatch using symmetric memory
+  // For each token destined to another node, write via symmetric memory
   for (int i = globalWarpId; i < args.curRankNumToken * numExpertPerToken; i += globalWarpNum) {
     if (args.dispDestTokIdMap[i] != static_cast<index_t>(-1)) {
       continue;  // Already processed in intra-node phase
@@ -302,7 +302,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     destTokId = __shfl(destTokId, 0);
     index_t destLinearTok = localExpert * expertCapacity + destTokId;
 
-    // Write to remote PE via symmetric memory (works cross-node with shmem)
+    // Write to remote PE via symmetric memory
     if (laneId == 0) {
       index_t srcGlobalTok = myPe * config.maxNumInpTokenPerRank + srcTokId;
       core::AtomicStoreRelaxedSystem(
@@ -310,18 +310,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           srcGlobalTok);
     }
 
-    // Write weights and indices
+    // Write weights and indices using warp copy
     if (laneId < numExpertPerToken) {
       if (args.weightsBuf) {
-        core::AtomicStoreRelaxedSystem(
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
-                destLinearTok * numExpertPerToken + laneId,
-            args.weightsBuf[srcTokId * numExpertPerToken + laneId]);
+        args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)
+            [destLinearTok * numExpertPerToken + laneId] =
+            args.weightsBuf[srcTokId * numExpertPerToken + laneId];
       }
-      core::AtomicStoreRelaxedSystem(
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
-              destLinearTok * numExpertPerToken + laneId,
-          args.tokenIndices[srcTokId * numExpertPerToken + laneId]);
+      args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe)
+          [destLinearTok * numExpertPerToken + laneId] =
+          args.tokenIndices[srcTokId * numExpertPerToken + laneId];
     }
 
     size_t baseOffset = destLinearTok * config.hiddenDim;
@@ -346,32 +344,24 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         float scale = internode_detail::DeepepFp8Scale(amax);
         float scaleInv = internode_detail::DeepepFp8ScaleInv(amax);
         if (laneId == 0) {
-          core::AtomicStoreRelaxedSystem(
-              args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
-                  destLinearTok * numScales + scaleIdx,
-              scaleInv);
+          args.shmemOutScalesMemObj->template GetAs<float*>(destPe)
+              [destLinearTok * numScales + scaleIdx] = scaleInv;
         }
         for (int j = laneId; j < internode_detail::kNumPerChannels; j += warpSize) {
           int offset = channelBase + j;
           float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-          core::AtomicStoreRelaxedSystem(destFp8 + offset,
-                                        internode_detail::CastFloatToFp8(v, scale));
+          destFp8[offset] = internode_detail::CastFloatToFp8(v, scale);
         }
       }
     } else {
-      for (int j = laneId; j < config.hiddenDim; j += warpSize) {
-        core::AtomicStoreRelaxedSystem(
-            args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset + j,
-            args.inpTokenBuf[srcTokOffset + j]);
-      }
+      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
+                     args.inpTokenBuf + srcTokOffset, config.hiddenDim);
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         index_t destScaleOffset = destLinearTok * config.scaleDim * config.scaleTypeSize;
         index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
-        for (size_t j = laneId; j < config.scaleDim * config.scaleTypeSize; j += warpSize) {
-          core::AtomicStoreRelaxedSystem(
-              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset + j,
-              args.scalesBuf[srcScaleOffset + j]);
-        }
+        core::WarpCopy(
+            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
     }
   }
@@ -379,12 +369,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
+  // Wait for all warps to finish inter-node dispatch
+  if (globalWarpId == 0 && laneId == 0) {
+    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+    args.dispatchGridBarrier[0] = 0;
+  }
+  __syncthreads();
+
   // Phase 3: Send signals to all peers (intra-node and inter-node)
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-      args.dispatchGridBarrier[0] = 0;
-
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
