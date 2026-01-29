@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -157,12 +157,26 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
   if (laneId == 0) core::AtomicAddRelaxedSystem(args.combineGridBarrier, 1u);
 
+#if INTERNODE_DEEPEP_DEBUG
+  if (globalThdId == 0) {
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: entering grid barrier, flag=%u, globalWarpNum=%d\n",
+           myPe, crossDeviceBarrierFlag, globalWarpNum);
+  }
+#endif
+
   // Step 1: Intra-node barrier - signal to all same-node ranks
   // Wait for all warps to arrive, then reset barrier (only thread 0 resets)
   if (globalThdId < gpuPerNode) {
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
   }
   __syncthreads();
+
+#if INTERNODE_DEEPEP_DEBUG
+  if (globalThdId == 0) {
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: grid barrier complete\n", myPe);
+  }
+#endif
+
   if (globalThdId == 0) {
     core::AtomicStoreRelaxedSystem(args.combineGridBarrier, 0u);
   }
@@ -176,6 +190,12 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
         crossDeviceBarrierFlag);
   }
 
+#if INTERNODE_DEEPEP_DEBUG
+  if (globalThdId == 0) {
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node signal sent\n", myPe);
+  }
+#endif
+
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   // Wait for all same-node ranks to signal
@@ -186,6 +206,12 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
     }
   }
   __syncthreads();
+
+#if INTERNODE_DEEPEP_DEBUG
+  if (globalThdId == 0) {
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node barrier complete\n", myPe);
+  }
+#endif
 
   // Step 2: Inter-node barrier - use RDMA put instead of atomic (to avoid RDMA atomic issues)
   // Each rank writes its barrier flag to all proxy PEs on other nodes via RDMA put.
@@ -214,6 +240,13 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
     }
   }
   __syncthreads();
+
+#if INTERNODE_DEEPEP_DEBUG
+  if (globalThdId == 0) {
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier: inter-node barrier complete, flag=%u\n",
+           myPe, crossDeviceBarrierFlag);
+  }
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */
