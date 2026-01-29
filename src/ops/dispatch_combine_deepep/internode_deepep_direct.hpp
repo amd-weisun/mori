@@ -367,34 +367,33 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   __threadfence_system();
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Wait for all warps to finish inter-node dispatch
-  if (globalWarpId == 0 && laneId == 0) {
-    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    args.dispatchGridBarrier[0] = 0;
-  }
-  __syncthreads();
-
-  // Phase 3: Send signals to all peers (intra-node and inter-node)
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+  // Phase 3: Synchronize all warps and send signals (V1 pattern)
+  int nodePeOffset = myNode * config.gpuPerNode;
+  int finishedWarp = 0;
+  if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
+  finishedWarp = __shfl(finishedWarp, 0);
+  
+  if ((finishedWarp + 1) == globalWarpNum) {
+    // Only the last warp to arrive sends signals
+    if (laneId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + laneId;
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
-  }
+    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
 
-  // Phase 4: Wait for all signals and accumulate
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
+    // Phase 4: Wait for signals from intra-node peers only
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    for (int srcPe = nodePeOffset + laneId; srcPe < (nodePeOffset + config.gpuPerNode);
+         srcPe += warpSize) {
       index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[srcPe] = 0;
+      __threadfence_system();
+      core::AtomicStoreRelaxedSystem(signal, 0);
+      core::AtomicStoreRelaxedSystem(args.destPeTokenCounter + srcPe, 0);
     }
     
     if (laneId == 0) {
