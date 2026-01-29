@@ -855,11 +855,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
       // Use system-scope atomic read to see updates from ALL blocks
       index_t numTokenSignal = core::AtomicLoadRelaxedSystem(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
 
       if (isRemote) {
         // For remote ranks, use RDMA put for the signal (separate from count data)
+        // NOTE: We cannot access remote symmetric memory directly - only via RDMA.
+        // We also cannot wait on remote memory - just send the signal and quiet.
         shmem::ShmemPutTypeImmNbiThread<index_t>(
             args.recvTokenNumMemObj,
             myPe * sizeof(index_t),
@@ -867,7 +867,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             destPe);
         shmem::ShmemQuietThread(destPe);
       } else {
-        // For same-node ranks, use direct store for the signal
+        // For same-node ranks, we CAN access memory directly via P2P
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+        shmem::ShmemInt32WaitUntilEquals(signal, 0);
         core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
       }
     }
