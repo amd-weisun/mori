@@ -306,6 +306,8 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
         core::AMO_ADD,
         proxyPe,
         0);  // Use QP 0
+    // CRITICAL: Quiet to ensure RDMA atomic ADD completes before remote reads
+    shmem::ShmemQuietThread(proxyPe);
   }
   __syncthreads();
 
