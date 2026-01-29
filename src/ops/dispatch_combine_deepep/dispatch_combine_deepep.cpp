@@ -235,8 +235,14 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemsetD32(crossDeviceBarrierFlag, 1, 1));
+  // Allocate 4 separate barrier regions for inter-node dispatch/combine:
+  // - Region 0: dispatch barrier #1 (initial sync)
+  // - Region 1: dispatch barrier #2 (count sync)
+  // - Region 2: dispatch barrier #3 (final sync)
+  // - Region 3: combine barrier
+  // Each region has worldSize entries of uint64_t.
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
-      barrierSize * 2 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
+      barrierSize * 4 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
 
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =

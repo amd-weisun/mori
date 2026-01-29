@@ -181,22 +181,32 @@ __device__ __forceinline__ T RdmaWaitUntilGreaterThan(T* addr, T val, int myPe =
 /*                          Inter-Node Barrier (uses RDMA for remote ranks)                       */
 /* ---------------------------------------------------------------------------------------------- */
 /*
- * V1-style barrier using RDMA atomic ADD instead of PUT.
+ * Inter-node barrier with separate memory regions for each barrier call.
  *
- * 1. Intra-node barrier: direct atomic stores/loads for same-node ranks
+ * 1. Intra-node barrier: direct atomic ADD for same-node ranks
  * 2. Inter-node barrier: RDMA atomic ADD via proxy PEs for cross-node synchronization
  *
- * Key difference from previous implementation:
- * - Uses RDMA atomic ADD (accumulates 1 per QP) instead of PUT (overwrites value)
- * - Waits for accumulated count (crossDeviceBarrierFlag * numQpPerPe) instead of single flag
- * - This avoids issues with multiple barrier calls overwriting each other
+ * Key features:
+ * - Uses barrier_id (0-3) to select a separate memory region for each barrier call
+ * - Each region has worldSize entries of uint64_t
+ * - Region offset = barrier_id * worldSize
+ * - This ensures different barrier calls don't interfere with each other
+ * - Uses single RDMA atomic ADD (value=1) for inter-node sync
+ * - Waits for accumulated count (crossDeviceBarrierFlag)
+ *
+ * Barrier IDs:
+ * - 0: Dispatch initial sync (before token dispatch)
+ * - 1: Dispatch count sync (after RDMA count puts)
+ * - 2: Dispatch final sync (before kernel exit)
+ * - 3: Combine sync (before accumulation)
  *
  * Proxy PE concept: Each rank communicates with its corresponding rank on other nodes.
  * E.g., rank 0 on node 0 <-> rank 8 on node 1 (if gpuPerNode=8)
  */
 template <typename T>
 inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args,
-                                                          const uint32_t crossDeviceBarrierFlag) {
+                                                          const uint32_t crossDeviceBarrierFlag,
+                                                          const int barrier_id) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -205,10 +215,13 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   int globalWarpNum = gridDim.x * warpNum;
   int myPe = args.config.rank;
   int gpuPerNode = args.config.gpuPerNode;
+  int worldSize = args.config.worldSize;
   int myNode = myPe / gpuPerNode;
-  int nNodes = args.config.worldSize / gpuPerNode;
-  // Get numQpPerPe from shmem global state (not in DeepEP config)
-  int numQpPerPe = shmem::globalGpuStates.numQpPerPe;
+  int nNodes = worldSize / gpuPerNode;
+
+  // Each barrier_id uses a separate region of worldSize entries.
+  // Offset in elements (uint64_t): barrier_id * worldSize
+  int barrierBaseOffset = barrier_id * worldSize;
 
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
@@ -216,8 +229,8 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 
 #if INTERNODE_DEEPEP_DEBUG
   if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: entering grid barrier, flag=%u, globalWarpNum=%d\n",
-           myPe, crossDeviceBarrierFlag, globalWarpNum);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: entering grid barrier, flag=%u, globalWarpNum=%d\n",
+           myPe, barrier_id, crossDeviceBarrierFlag, globalWarpNum);
   }
 #endif
 
@@ -234,33 +247,36 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 
 #if INTERNODE_DEEPEP_DEBUG
   if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: grid barrier complete\n", myPe);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: grid barrier complete\n", myPe, barrier_id);
   }
 #endif
 
   // Step 2: Intra-node barrier - signal to all same-node ranks
+  // Each rank writes to all same-node destination ranks at slot [barrierBaseOffset + myPe]
   if (globalThdId < gpuPerNode) {
     int destPe = myNode * gpuPerNode + globalThdId;
     // Direct atomic ADD for same-node ranks (accumulate, don't overwrite)
+    // Write to destPe's barrier memory at offset [barrierBaseOffset + myPe]
     core::AtomicAddRelaxedSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + myPe,
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + barrierBaseOffset + myPe,
         (uint64_t)1);
   }
 
 #if INTERNODE_DEEPEP_DEBUG
   if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node signal sent\n", myPe);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: intra-node signal sent\n", myPe, barrier_id);
   }
 #endif
 
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   // Wait for all same-node ranks to signal
+  // Read from local barrier at offset [barrierBaseOffset + srcPe]
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < gpuPerNode) {
     int srcPe = myNode * gpuPerNode + thdId;
     // Wait for accumulated count (each barrier call adds 1)
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + srcPe) < crossDeviceBarrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + barrierBaseOffset + srcPe) < crossDeviceBarrierFlag) {
       __threadfence_system();
     }
   }
@@ -268,54 +284,55 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
 
 #if INTERNODE_DEEPEP_DEBUG
   if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node barrier complete\n", myPe);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: intra-node barrier complete\n", myPe, barrier_id);
   }
 #endif
 
-  // Step 3: Inter-node barrier - use RDMA atomic ADD (V1 pattern)
-  // Each thread handles one remote node, sends atomic ADD via each QP
+  // Step 3: Inter-node barrier - use RDMA atomic ADD
+  // Each thread handles one remote node, sends single atomic ADD
+  // Write to proxyPe's barrier memory at offset [barrierBaseOffset + myPe]
   if ((thdId < nNodes) && (thdId != myNode)) {
     int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
+    size_t rdmaOffset = (barrierBaseOffset + myPe) * sizeof(uint64_t);
 #if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: sending RDMA atomic ADD to proxyPe=%d, numQp=%d\n",
-           myPe, proxyPe, numQpPerPe);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: sending RDMA atomic ADD to proxyPe=%d, offset=%zu\n",
+           myPe, barrier_id, proxyPe, rdmaOffset);
 #endif
-    // V1 pattern: send atomic ADD via each QP for reliability
-    for (int qp = 0; qp < numQpPerPe; qp++) {
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-          args.crossDeviceBarrierMemObj,
-          myPe * sizeof(uint64_t),
-          1,
-          core::AMO_ADD,
-          proxyPe,
-          qp);
-    }
+    // Single RDMA atomic ADD with value 1
+    shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+        args.crossDeviceBarrierMemObj,
+        rdmaOffset,
+        1,
+        core::AMO_ADD,
+        proxyPe,
+        0);  // Use QP 0
   }
   __syncthreads();
 
   // Wait for all remote nodes to signal (via their proxy PEs)
-  // V1 pattern: expect crossDeviceBarrierFlag * numQpPerPe from each remote node
+  // Expect crossDeviceBarrierFlag (accumulated count) from each remote node
+  // Read from local barrier at offset [barrierBaseOffset + proxyPe]
   if ((thdId < nNodes) && (thdId != myNode)) {
     int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
-    uint64_t expected = (uint64_t)crossDeviceBarrierFlag * numQpPerPe;
+    uint64_t expected = (uint64_t)crossDeviceBarrierFlag;
 #if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%lu, current=%lu\n",
-           myPe, proxyPe, expected, core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe));
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: waiting for proxyPe=%d, expected=%lu, current=%lu\n",
+           myPe, barrier_id, proxyPe, expected, core::AtomicLoadRelaxedSystem(localBarrierPtr + barrierBaseOffset + proxyPe));
 #endif
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) < expected) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + barrierBaseOffset + proxyPe) < expected) {
       __threadfence_system();
     }
 #if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: proxyPe=%d signal received\n",
-           myPe, proxyPe);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: proxyPe=%d signal received\n",
+           myPe, barrier_id, proxyPe);
 #endif
   }
   __syncthreads();
 
 #if INTERNODE_DEEPEP_DEBUG
   if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: inter-node barrier complete, flag=%u\n",
-           myPe, crossDeviceBarrierFlag);
+    printf("[DEBUG][Rank %d] CrossDeviceBarrier[%d]: inter-node barrier complete, flag=%u\n",
+           myPe, barrier_id, crossDeviceBarrierFlag);
   }
 #endif
 }
@@ -451,7 +468,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
            args.curRankNumToken * config.numExpertPerToken);
 #endif
   }
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
+  // Dispatch barrier #1: initial sync before token dispatch (barrier_id=0)
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag, 0);
 
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += globalWarpNum) {
@@ -908,8 +926,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
   __syncthreads();
 
-  // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
+  // Dispatch barrier #2: count sync after RDMA count puts (barrier_id=1)
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag, 1);
 
   // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
   // Use direct store for same-node, RDMA put for remote.
@@ -1137,11 +1155,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
   __syncthreads();
 
-  // Final barrier to ensure all ranks have completed dispatch before kernel exits.
+  // Dispatch barrier #3: final sync before kernel exit (barrier_id=2)
   // This prevents race conditions where one rank starts validation while another
   // is still processing RDMA operations.
-  // Note: We use +2 because +1 was used for the mid-dispatch count sync barrier.
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 2);
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag, 2);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -1282,8 +1299,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
   __syncthreads();
 
-  // Step 2: Cross-rank barrier so all writes are visible
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
+  // Combine barrier: sync before accumulation (barrier_id=3)
+  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag, 3);
   *args.totalRecvTokenNum = 0;
 
   if (args.curRankNumToken == 0) {
