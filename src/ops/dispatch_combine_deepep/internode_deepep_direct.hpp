@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
+#define INTERNODE_DEEPEP_DEBUG 1
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
