@@ -50,7 +50,7 @@ namespace deepep {
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // This helps diagnose if the issue is purely timing-related.
 // Units: GPU clock cycles (e.g., 1000000 ~= 0.5ms at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 100000
+#define INTERNODE_RDMA_DELAY_CYCLES 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -836,6 +836,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
   // This is critical for correctness without debug prints.
   __threadfence_system();
+
+  // CRITICAL: Fence to ensure all count data RDMA puts complete before signal puts.
+  // This provides ordering: count data will be visible before signal arrives at receiver.
+  // Only warp 0 needs to fence since it will send the signals.
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        shmem::ShmemFenceThread(destPe);
+      }
+    }
+    __syncwarp();
+  }
 
 #if INTERNODE_RDMA_DELAY_CYCLES > 0
   // Configurable delay after barrier (simulates printf timing effect for receiving)
