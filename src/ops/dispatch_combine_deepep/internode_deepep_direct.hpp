@@ -32,7 +32,7 @@ namespace moe {
 namespace deepep {
 
 // Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 1
+#define INTERNODE_DEEPEP_DEBUG 0
 
 // Individual debug flags to isolate which print provides synchronization
 // Enable one at a time to find the critical one
@@ -53,7 +53,7 @@ namespace deepep {
 // Configurable delay after RDMA operations (for debugging timing issues).
 // Set to non-zero to add a spin-wait after RDMA put+signal operations.
 // Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 100000
+#define INTERNODE_RDMA_DELAY_CYCLES 500000
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -875,6 +875,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // completed their count puts before signals are sent. The bundled put+signal
   // earlier was not reliable for multi-GPU per node configurations.
   if (globalWarpId == 0) {
+    // Ensure all lanes are synchronized before signal sending
+    __syncwarp();
+    __threadfence_system();
 #if INTERNODE_DEEPEP_DEBUG
     if (laneId == 0) {
       printf("[DEBUG][Rank %d] Signal send phase starting...\n", myPe);
