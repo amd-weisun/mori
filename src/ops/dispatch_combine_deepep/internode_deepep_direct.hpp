@@ -208,7 +208,7 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   int myNode = myPe / gpuPerNode;
   int nNodes = args.config.worldSize / gpuPerNode;
   // Get numQpPerPe from shmem global state (not in DeepEP config)
-  int numQpPerPe = shmem::globalGpuStates->numQpPerPe;
+  int numQpPerPe = shmem::globalGpuStates.numQpPerPe;
 
   // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
   // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
