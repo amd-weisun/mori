@@ -46,12 +46,11 @@ namespace deepep {
 // Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
 #define INTERNODE_TIMEOUT_CYCLES 200000000000ll
 
-// Configurable delay after RDMA operations.
-// SeqCst atomics provide memory ordering but RDMA operations have actual
-// network latency. This delay ensures RDMA puts complete before proceeding.
-// 500000 cycles ~= 250us at 2GHz - needed for reliable multi-iteration runs.
-// Units: GPU clock cycles
-#define INTERNODE_RDMA_DELAY_CYCLES 500000
+// Configurable delay after RDMA operations (for debugging only).
+// With proper ShmemQuietThread() calls, this delay should not be needed.
+// Set to 0 for production. Set to non-zero only for debugging timing issues.
+// Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
+#define INTERNODE_RDMA_DELAY_CYCLES 0
 
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
@@ -835,39 +834,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Wait for all local warps to complete their count+signal puts.
   if (globalWarpId == 0 && laneId == 0) {
     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-
-    // Quiet ALL remote PEs to drain accumulated RDMA operations.
-    // This is called by a single thread (globalWarpId==0, laneId==0) which is safe
-    // because all other threads are blocked at syncthreads below.
-    // This prevents RDMA work queue exhaustion across multiple iterations.
-    for (int destPe = 0; destPe < npes; ++destPe) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      if (isRemote) {
-        shmem::ShmemQuietThread(destPe);
-      }
-    }
-
     core::AtomicStoreSeqCstSystem(args.dispatchGridBarrier, 0u);
   }
   __syncthreads();
 
+  // ALL threads call ShmemQuietThread() to drain RDMA operations.
+  // This is the proper pattern from legacy MORI internode kernel (line 325).
+  // The shmem library handles internal coordination via locking.
+  // This replaces the single-thread quiet loop and delay workaround.
+  shmem::ShmemQuietThread();
+  __syncthreads();
+
   // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
   CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
-
-  // Memory fence after barrier to ensure all RDMA writes from all ranks are visible.
-  __threadfence_system();
-
-  // Delay to ensure all RDMA count data puts are complete before sending signals.
-  // NOTE: We use a spin delay instead of ShmemQuietThread because:
-  // 1. ShmemQuietThread(pe) blocks indefinitely when called from a single lane
-  // 2. ShmemQuietThread() without PE also blocks in this context
-  // 3. GPU lockstep execution means one blocked lane blocks the entire warp
-  // The delay gives RDMA operations time to complete without blocking.
-  // 100000 cycles ~= 50us at 2GHz, sufficient for RDMA completion.
-  if (globalWarpId == 0 && laneId == 0) {
-    internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
-  }
-  __syncthreads();
 
   // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
   // Use direct store for same-node, RDMA put for remote.
@@ -1067,6 +1046,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
+  // ALL threads quiet to drain any remaining RDMA operations before barrier.
+  // This is the proper pattern from legacy MORI internode kernel.
+  shmem::ShmemQuietThread();
+  __syncthreads();
+
   // Final barrier to ensure all ranks have completed dispatch before kernel exits.
   // This prevents race conditions where one rank starts validation while another
   // is still processing RDMA operations.
@@ -1199,11 +1183,9 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Synchronize all threads before barrier.
-  // Note: We don't call ShmemQuietThread here like the legacy kernel doesn't.
-  // The warp-level RDMA puts and the cross-device barrier handle synchronization.
-  // Calling quiet after warp-level puts can cause issues.
-  __threadfence_system();
+  // ALL threads quiet to drain RDMA operations before barrier.
+  // This is the proper pattern from legacy MORI internode kernel (line 508).
+  shmem::ShmemQuietThread();
   __syncthreads();
 
   // Step 2: Cross-rank barrier so all writes are visible
