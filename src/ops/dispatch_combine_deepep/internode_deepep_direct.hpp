@@ -838,11 +838,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
   __syncthreads();
 
-  // ALL threads call ShmemQuietThread() to drain RDMA operations.
-  // This is the proper pattern from legacy MORI internode kernel (line 325).
-  // The shmem library handles internal coordination via locking.
-  // This replaces the single-thread quiet loop and delay workaround.
-  shmem::ShmemQuietThread();
+  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
+  // NOTE: We only have warp 0 call quiet because:
+  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
+  // 2. ShmemQuietThread() is a blocking call that polls CQ for completion
+  // 3. Single-warp quiet avoids contention while still draining the queue
+  // All other threads wait at __syncthreads() below.
+  if (globalWarpId == 0) {
+    shmem::ShmemQuietThread();
+  }
   __syncthreads();
 
   // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
@@ -1046,9 +1050,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // ALL threads quiet to drain any remaining RDMA operations before barrier.
-  // This is the proper pattern from legacy MORI internode kernel.
-  shmem::ShmemQuietThread();
+  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
+  // NOTE: Using single-warp quiet instead of all-threads quiet because:
+  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
+  // 2. The CQ is shared, so one warp draining it ensures all RDMA completes
+  // 3. Other threads wait at __syncthreads() below
+  if (globalWarpId == 0) {
+    shmem::ShmemQuietThread();
+  }
   __syncthreads();
 
   // Final barrier to ensure all ranks have completed dispatch before kernel exits.
@@ -1183,9 +1192,14 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // ALL threads quiet to drain RDMA operations before barrier.
-  // This is the proper pattern from legacy MORI internode kernel (line 508).
-  shmem::ShmemQuietThread();
+  // Warp 0 calls ShmemQuietThread() to drain accumulated RDMA operations.
+  // NOTE: Using single-warp quiet instead of all-threads quiet because:
+  // 1. All-threads quiet causes massive CQ lock contention with 320+ warps
+  // 2. The CQ is shared, so one warp draining it ensures all RDMA completes
+  // 3. Other threads wait at __syncthreads() below
+  if (globalWarpId == 0) {
+    shmem::ShmemQuietThread();
+  }
   __syncthreads();
 
   // Step 2: Cross-rank barrier so all writes are visible
