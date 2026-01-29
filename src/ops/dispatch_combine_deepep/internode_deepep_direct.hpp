@@ -688,8 +688,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();  // Ensure all warps finished the main loop
 
     // Distributed quiet: each warp handles a different node to avoid lock contention
+    int nNodesForQuiet = npes / config.gpuPerNode;
     internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
-                                          myPe, nNodes, config.gpuPerNode);
+                                          myPe, nNodesForQuiet, config.gpuPerNode);
     __syncthreads();
 
     // Memory fence to ensure all local writes are visible
@@ -885,8 +886,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
   // See DistributedQuietByNode comment for details on why this is needed.
-  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
-                                        myPe, nNodes, config.gpuPerNode);
+  {
+    int nNodesForQuiet = npes / config.gpuPerNode;
+    internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                          myPe, nNodesForQuiet, config.gpuPerNode);
+  }
   __syncthreads();
 
   // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
@@ -940,7 +944,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     // Only warp 0 is executing here, so lane 0 drains all remote nodes sequentially.
     // No lock contention since only 1 thread is calling quiet.
     if (laneId == 0) {
-      for (int nodeId = 0; nodeId < nNodes; nodeId++) {
+      int nNodesForQuiet = npes / config.gpuPerNode;
+      int myNode = myPe / config.gpuPerNode;
+      for (int nodeId = 0; nodeId < nNodesForQuiet; nodeId++) {
         if (nodeId == myNode) continue;  // Skip my own node
         int proxyPe = nodeId * config.gpuPerNode + (myPe % config.gpuPerNode);
         shmem::ShmemQuietThread(proxyPe);
@@ -1105,8 +1111,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
   // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
   // See DistributedQuietByNode comment for details on why this is needed.
-  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
-                                        myPe, nNodes, config.gpuPerNode);
+  {
+    int nNodesForQuiet = npes / config.gpuPerNode;
+    internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                          myPe, nNodesForQuiet, config.gpuPerNode);
+  }
   __syncthreads();
 
   // Final barrier to ensure all ranks have completed dispatch before kernel exits.
@@ -1243,8 +1252,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
   // Distributed quiet: each warp handles a different node to avoid CQ lock contention.
   // See DistributedQuietByNode comment for details on why this is needed.
-  internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
-                                        myPe, nNodes, config.gpuPerNode);
+  {
+    int nNodesForQuiet = config.worldSize / config.gpuPerNode;
+    internode_ll::DistributedQuietByNode(args, globalWarpId, globalWarpNum, laneId,
+                                          myPe, nNodesForQuiet, config.gpuPerNode);
+  }
   __syncthreads();
 
   // Step 2: Cross-rank barrier so all writes are visible
