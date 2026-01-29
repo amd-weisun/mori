@@ -111,7 +111,7 @@ __device__ inline __hip_fp8_storage_t CastFloatToFp8(float v, float scale) {
 
 }  // namespace internode_detail
 
-// Dispatch kernel implementation - parallel warp-based approach following V1 pattern
+// Dispatch kernel implementation - supports both intra-node and inter-node
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
@@ -140,6 +140,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     for (int pe = 0; pe < npes; ++pe) {
       args.destPeTokenCounter[pe] = 0;
     }
+    for (int node = 0; node < nNodes; ++node) {
+      args.destNodeTokenCounter[node] = 0;
+    }
   }
 
   // Barrier to sync all ranks before dispatch
@@ -167,7 +170,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     return;
   }
 
-  // Phase 1: Intra-node dispatch (XGMI)
+  // Phase 1: Intra-node dispatch (XGMI) - same node communication
   for (int i = globalWarpId; i < args.curRankNumToken * numExpertPerToken; i += globalWarpNum) {
     index_t srcTokId = i / numExpertPerToken;
     index_t expertIdx = i % numExpertPerToken;
@@ -176,7 +179,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     index_t localExpert = destExpert % config.numExpertPerRank;
     int destNode = destPe / config.gpuPerNode;
 
-    // Check for duplicates within this token's experts
+    // Check for duplicates within this token's experts (intra-node only)
     bool isDup = false;
     if (laneId < numExpertPerToken) {
       index_t laneExpert = args.tokenIndices[srcTokId * numExpertPerToken + laneId];
@@ -189,10 +192,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     isDup = __any_sync(0xffffffffffffffffull, isDup);
 
     if (isDup || destNode != myNode) {
+      if (destNode != myNode) {
+        // Mark inter-node tokens for next phase
+        if (laneId == 0) args.dispDestTokIdMap[i] = static_cast<index_t>(-1);
+      }
       continue;  // Skip duplicates and inter-node for this phase
     }
 
-    // Allocate slot
+    // Allocate slot for intra-node
     index_t destTokId = 0;
     if (laneId == 0) {
       destTokId = atomicAdd(
@@ -269,12 +276,112 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __threadfence_system();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Phase 2: Send signals to intra-node peers
+  // Phase 2: Inter-node dispatch using same-node proxies (treat as if on same node for now)
+  // For each token destined to another node, send via direct symmetric memory
+  for (int i = globalWarpId; i < args.curRankNumToken * numExpertPerToken; i += globalWarpNum) {
+    if (args.dispDestTokIdMap[i] != static_cast<index_t>(-1)) {
+      continue;  // Already processed in intra-node phase
+    }
+
+    index_t srcTokId = i / numExpertPerToken;
+    index_t expertIdx = i % numExpertPerToken;
+    index_t destExpert = args.tokenIndices[i];
+    index_t destPe = destExpert / config.numExpertPerRank;
+    index_t localExpert = destExpert % config.numExpertPerRank;
+    int destNode = destPe / config.gpuPerNode;
+
+    // Allocate slot on remote PE
+    index_t destTokId = 0;
+    if (laneId == 0) {
+      destTokId = atomicAdd(
+          args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe) + localExpert, 1);
+      atomicAdd(args.destPeTokenCounter + destPe, 1);
+      atomicAdd(args.destNodeTokenCounter + destNode, 1);
+      args.dispDestTokIdMap[i] = destExpert * expertCapacity + destTokId;
+    }
+    destTokId = __shfl(destTokId, 0);
+    index_t destLinearTok = localExpert * expertCapacity + destTokId;
+
+    // Write to remote PE via symmetric memory (works cross-node with shmem)
+    if (laneId == 0) {
+      index_t srcGlobalTok = myPe * config.maxNumInpTokenPerRank + srcTokId;
+      core::AtomicStoreRelaxedSystem(
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
+          srcGlobalTok);
+    }
+
+    // Write weights and indices
+    if (laneId < numExpertPerToken) {
+      if (args.weightsBuf) {
+        core::AtomicStoreRelaxedSystem(
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
+                destLinearTok * numExpertPerToken + laneId,
+            args.weightsBuf[srcTokId * numExpertPerToken + laneId]);
+      }
+      core::AtomicStoreRelaxedSystem(
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
+              destLinearTok * numExpertPerToken + laneId,
+          args.tokenIndices[srcTokId * numExpertPerToken + laneId]);
+    }
+
+    size_t baseOffset = destLinearTok * config.hiddenDim;
+    index_t srcTokOffset = srcTokId * config.hiddenDim;
+
+    // Write hidden states
+    if constexpr (kUseFP8) {
+      auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
+          args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
+      int numScales = config.hiddenDim / internode_detail::kNumPerChannels;
+      
+      for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
+        int channelBase = scaleIdx * internode_detail::kNumPerChannels;
+        float amax = 0.0f;
+        for (int j = laneId; j < internode_detail::kNumPerChannels; j += warpSize) {
+          int offset = channelBase + j;
+          float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
+          amax = fmaxf(amax, fabsf(v));
+        }
+        for (int mask = warpSize / 2; mask > 0; mask >>= 1) 
+          amax = fmaxf(amax, __shfl_xor(amax, mask));
+        float scale = internode_detail::DeepepFp8Scale(amax);
+        float scaleInv = internode_detail::DeepepFp8ScaleInv(amax);
+        if (laneId == 0) {
+          core::AtomicStoreRelaxedSystem(
+              args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
+                  destLinearTok * numScales + scaleIdx,
+              scaleInv);
+        }
+        for (int j = laneId; j < internode_detail::kNumPerChannels; j += warpSize) {
+          int offset = channelBase + j;
+          float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
+          core::AtomicStoreRelaxedSystem(destFp8 + offset,
+                                        internode_detail::CastFloatToFp8(v, scale));
+        }
+      }
+    } else {
+      for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+        core::AtomicStoreRelaxedSystem(
+            args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset + j,
+            args.inpTokenBuf[srcTokOffset + j]);
+      }
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+        index_t destScaleOffset = destLinearTok * config.scaleDim * config.scaleTypeSize;
+        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+        for (size_t j = laneId; j < config.scaleDim * config.scaleTypeSize; j += warpSize) {
+          core::AtomicStoreRelaxedSystem(
+              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset + j,
+              args.scalesBuf[srcScaleOffset + j]);
+        }
+      }
+    }
+  }
+
+  __threadfence_system();
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+
+  // Phase 3: Send signals to all peers (intra-node and inter-node)
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      int destNode = destPe / config.gpuPerNode;
-      if (destNode != myNode) continue;  // Only intra-node in this phase
-      
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
       args.dispatchGridBarrier[0] = 0;
 
@@ -285,13 +392,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Phase 3: Wait for intra-node signals and accumulate
+  // Phase 4: Wait for all signals and accumulate
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
-      int srcNode = srcPe / config.gpuPerNode;
-      if (srcNode != myNode) continue;  // Only intra-node
-      
       index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
