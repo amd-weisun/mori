@@ -788,8 +788,15 @@ def run_benchmark_worker(rank, world_size, setting, port, gpu_per_node_override,
     """Worker function for benchmark mode (mp.spawn)."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
+
+    # Register process group under name "default" for shmem
+    world_group = torch.distributed.group.WORLD
+    assert world_group is not None
+    torch._C._distributed_c10d._register_process_group("default", world_group)
+
     mori.shmem.shmem_torch_process_group_init("default")
 
     try:
@@ -809,11 +816,18 @@ def run_benchmark_worker(rank, world_size, setting, port, gpu_per_node_override,
 
 def run_benchmark_multinode(setting, gpu_per_node_override=None, warmup_iters=2, benchmark_iters=10):
     """Run benchmark in multi-node mode (torchrun/srun)."""
-    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group(backend="nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
+
+    # Register process group under name "default" for shmem
+    world_group = torch.distributed.group.WORLD
+    assert world_group is not None
+    torch._C._distributed_c10d._register_process_group("default", world_group)
+
     mori.shmem.shmem_torch_process_group_init("default")
 
     gpu_per_node = gpu_per_node_override or setting.get("gpu_per_node", world_size)
