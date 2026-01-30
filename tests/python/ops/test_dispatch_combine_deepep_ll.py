@@ -790,7 +790,7 @@ def run_benchmark_worker(rank, world_size, setting, port, gpu_per_node_override,
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
-    mori.shmem.shmem_init(rank, world_size)
+    mori.shmem.shmem_torch_process_group_init("default")
 
     try:
         run_benchmark_impl(
@@ -814,7 +814,7 @@ def run_benchmark_multinode(setting, gpu_per_node_override=None, warmup_iters=2,
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
-    mori.shmem.shmem_init(rank, world_size)
+    mori.shmem.shmem_torch_process_group_init("default")
 
     gpu_per_node = gpu_per_node_override or setting.get("gpu_per_node", world_size)
 
