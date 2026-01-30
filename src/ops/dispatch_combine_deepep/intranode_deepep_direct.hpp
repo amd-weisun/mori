@@ -76,24 +76,22 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 // Low-latency variants with optional fp8 quant/dequant similar to DeepEP.
 namespace detail {
 constexpr int kNumPerChannels = 128;
-__device__ inline float DeepepFp8Scale(float amax) {
-  constexpr float kFP8Margin = 1e-4f;
+constexpr int kElemsPerLoad = 8;  // uint4 = 16 bytes = 8 bf16 elements
+constexpr float kFP8Margin = 1e-4f;
 #ifdef __HIP_PLATFORM_AMD__
-  constexpr float kFP8Amax = 240.0f;
+constexpr float kFP8Amax = 240.0f;
+constexpr float kFP8AmaxInv = 1.0f / 240.0f;
 #else
-  constexpr float kFP8Amax = 448.0f;
+constexpr float kFP8Amax = 448.0f;
+constexpr float kFP8AmaxInv = 1.0f / 448.0f;
 #endif
+
+__device__ inline float DeepepFp8Scale(float amax) {
   float safeAmax = fmaxf(amax, kFP8Margin);
   return kFP8Amax / safeAmax;
 }
 
 __device__ inline float DeepepFp8ScaleInv(float amax) {
-  constexpr float kFP8Margin = 1e-4f;
-#ifdef __HIP_PLATFORM_AMD__
-  constexpr float kFP8AmaxInv = 1.0f / 240.0f;
-#else
-  constexpr float kFP8AmaxInv = 1.0f / 448.0f;
-#endif
   float safeAmax = fmaxf(amax, kFP8Margin);
   return safeAmax * kFP8AmaxInv;
 }
@@ -104,6 +102,15 @@ __device__ inline __hip_fp8_storage_t CastFloatToFp8(float v, float scale) {
 #else
   return __hip_cvt_float_to_fp8(v * scale, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
 #endif
+}
+
+// Quarter-warp reduction for 16 threads (used for 128-element channel with 8 elements per thread)
+__device__ inline float QuarterWarpReduceMax(float value) {
+  value = fmaxf(value, __shfl_xor(value, 8));
+  value = fmaxf(value, __shfl_xor(value, 4));
+  value = fmaxf(value, __shfl_xor(value, 2));
+  value = fmaxf(value, __shfl_xor(value, 1));
+  return value;
 }
 
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
@@ -173,20 +180,16 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       size_t baseOffset = destLinearTok * config.hiddenDim;
 
-      // Scales buffer is required when fp8 is enabled
-      if constexpr (kUseFP8) {
-        int numScales = config.hiddenDim / detail::kNumPerChannels;
-        if (laneId < numScales) {
-          args.shmemOutScalesMemObj->template GetAs<float*>(destPe)
-              [destLinearTok * numScales + laneId] = 0.0f;
+      // Copy pre-computed scales for non-FP8 path (FP8 scales are computed inline below)
+      if constexpr (!kUseFP8) {
+        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+          index_t destScaleOffset =
+              destLinearTok * config.scaleDim * config.scaleTypeSize;
+          index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+          core::WarpCopy(
+              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+              args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
         }
-      } else if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        index_t destScaleOffset =
-            destLinearTok * config.scaleDim * config.scaleTypeSize;
-        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
-        core::WarpCopy(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
 
       index_t srcTokOffset = srcTokId * config.hiddenDim;
@@ -194,29 +197,59 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
           args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
         int numScales = config.hiddenDim / detail::kNumPerChannels;
-        for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
-          int channelBase = scaleIdx * detail::kNumPerChannels;
-          float amax = 0.0f;
-          // compute amax for this channel
-          for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-            int offset = channelBase + j;
-            float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-            amax = fmaxf(amax, fabsf(v));
+        auto* srcPtr = reinterpret_cast<const uint4*>(args.inpTokenBuf + srcTokOffset);
+        auto* destPtr = reinterpret_cast<uint64_t*>(destFp8);
+        float* scalePtr = args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
+                          destLinearTok * numScales;
+
+        // Process 4 channels (512 elements) per iteration using vectorized loads
+        // 64 threads * 8 elements/load = 512 elements = 4 * 128-element channels
+        // Threads 0-15 -> channel 0, threads 16-31 -> channel 1, etc.
+        constexpr int kChannelsPerIter = warpSize * detail::kElemsPerLoad / detail::kNumPerChannels;
+        static_assert(kChannelsPerIter == 4, "Expected 4 channels per iteration");
+
+        for (int scaleBase = 0; scaleBase < numScales; scaleBase += kChannelsPerIter) {
+          // Vectorized load: each thread reads 8 bf16 elements (16 bytes)
+          uint4 packed = srcPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId];
+          auto* bf16Values = reinterpret_cast<const T*>(&packed);
+
+          // Convert to float and compute local amax (8 elements per thread)
+          float fp32Values[detail::kElemsPerLoad];
+          float amax = detail::kFP8Margin;
+          #pragma unroll
+          for (int j = 0; j < detail::kElemsPerLoad; ++j) {
+            fp32Values[j] = static_cast<float>(bf16Values[j]);
+            amax = fmaxf(amax, fabsf(fp32Values[j]));
           }
-          // warp reduce max
-          for (int mask = warpSize / 2; mask > 0; mask >>= 1) amax = fmaxf(amax, __shfl_xor(amax, mask));
-          float scale = detail::DeepepFp8Scale(amax);
-          float scaleInv = detail::DeepepFp8ScaleInv(amax);
-          if (laneId == 0) {
-            args.shmemOutScalesMemObj->template GetAs<float*>(destPe)
-                [destLinearTok * numScales + scaleIdx] = scaleInv;
+
+          // Quarter-warp reduction: 16 threads per channel (128 elements / 8 per thread)
+          amax = detail::QuarterWarpReduceMax(amax);
+          float scale = detail::kFP8Amax / amax;
+          float scaleInv = amax * detail::kFP8AmaxInv;
+
+          // Store scale (only lane 0, 16, 32, 48 write their respective channel's scale)
+          if ((laneId & 15) == 0) {
+            scalePtr[scaleBase + (laneId >> 4)] = scaleInv;
           }
-          // quantize this channel
-          for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-            int offset = channelBase + j;
-            float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-            destFp8[offset] = detail::CastFloatToFp8(v, scale);
+
+          // Quantize using vectorized FP8 conversion
+          uint64_t fp8Packed;
+          auto* fp8x2Values = reinterpret_cast<__hip_fp8x2_storage_t*>(&fp8Packed);
+          #pragma unroll
+          for (int j = 0; j < detail::kElemsPerLoad; j += 2) {
+            float2 fp32x2 = {fp32Values[j] * scale, fp32Values[j + 1] * scale};
+#if defined(__gfx942__)
+            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+#elif defined(__gfx950__)
+            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3);
+#else
+            // Fallback for other architectures
+            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+#endif
           }
+
+          // Vectorized store: 8 FP8 values (8 bytes) per thread
+          destPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId] = fp8Packed;
         }
       } else {
         core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
