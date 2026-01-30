@@ -432,11 +432,6 @@ def run_test_impl(
         for r in range(world_size)
     ]
 
-    all_rank_scales = [
-        torch.rand(num_token[r], hidden_dim // 128, dtype=torch.float32, generator=rng, device=device)
-        for r in range(world_size)
-    ]
-
     all_rank_input = [
         (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=rng, device=device) * 2 - 1).to(data_type)
         for r in range(world_size)
@@ -458,7 +453,6 @@ def run_test_impl(
         num_experts=total_experts,
         use_fp8=use_fp8,
         weights=all_rank_weights[rank],
-        scales=all_rank_scales[rank],
     )
 
     if use_fp8:
