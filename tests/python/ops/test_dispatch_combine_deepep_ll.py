@@ -888,32 +888,76 @@ def run_benchmark(
 
         element_size = 2 if use_fp8 else 4  # bfloat16 or fp32
 
-        print(f"\nDispatch Timing (ms):")
-        for i, times in enumerate(all_disp_times):
-            avg_time = sum(times) / len(times)
-            min_time = min(times)
-            max_time = max(times)
-            print(f"  Iteration {i}: avg={avg_time:.3f}ms, min={min_time:.3f}ms, max={max_time:.3f}ms, per_rank={times}")
+        # Calculate ll_mode_scale for reference
+        # This is used to show performance under load imbalance
+        avg_recv_token = sum(all_token_counts[0]) / len(all_token_counts[0]) if all_token_counts else 1
+        ll_mode_scale = (
+            max_num_inp_token_per_rank * num_experts_per_token / (avg_recv_token + 0.01)
+        )
 
-        avg_disp_all = sum(sum(times) for times in all_disp_times) / (len(all_disp_times) * world_size)
-        print(f"  Overall avg: {avg_disp_all:.3f}ms")
+        # Calculate bandwidth metrics
+        disp_bandwidth_GB_list = []
+        comb_bandwidth_GB_list = []
+        avg_total_bytes_MB_list = []
 
-        print(f"\nCombine Timing (ms):")
-        for i, times in enumerate(all_comb_times):
-            avg_time = sum(times) / len(times)
-            min_time = min(times)
-            max_time = max(times)
-            print(f"  Iteration {i}: avg={avg_time:.3f}ms, min={min_time:.3f}ms, max={max_time:.3f}ms, per_rank={times}")
+        for i in range(len(all_disp_times)):
+            # Average bytes across all ranks for this iteration
+            avg_bytes = all_token_counts[i][0] * hidden_dim * element_size if i < len(all_token_counts) else 0
+            avg_total_bytes_MB_list.append(int(avg_bytes / (1024**2)))
 
-        if not dispatch_only:
-            avg_comb_all = sum(sum(times) for times in all_comb_times) / (len(all_comb_times) * world_size)
-            print(f"  Overall avg: {avg_comb_all:.3f}ms")
+            # Dispatch bandwidth for each rank (GB/s)
+            disp_bw_ranks = []
+            for rank_idx in range(world_size):
+                if all_disp_times[i][rank_idx] > 0:
+                    bw = avg_bytes / (1000**3) / (all_disp_times[i][rank_idx] / 1000)
+                    disp_bw_ranks.append(int(bw))
+                else:
+                    disp_bw_ranks.append(0)
+            disp_bandwidth_GB_list.append(disp_bw_ranks)
 
-        print(f"\nToken Counts:")
-        for i, counts in enumerate(all_token_counts):
-            avg_count = sum(counts) / len(counts)
-            print(f"  Iteration {i}: avg={avg_count:.0f}, per_rank={counts}")
+            # Combine bandwidth for each rank (GB/s)
+            comb_bw_ranks = []
+            for rank_idx in range(world_size):
+                if all_comb_times[i][rank_idx] > 0:
+                    bw = avg_bytes / (1000**3) / (all_comb_times[i][rank_idx] / 1000)
+                    comb_bw_ranks.append(int(bw))
+                else:
+                    comb_bw_ranks.append(0)
+            comb_bandwidth_GB_list.append(comb_bw_ranks)
 
+        # Print Dispatch results
+        print("Dispatch result:")
+        max_disp_algo_bw = 0
+        for i in range(len(all_disp_times)):
+            # Convert ms to us
+            duration_us = [int(t * 1000) for t in all_disp_times[i]]
+            algo_bw = sum(disp_bandwidth_GB_list[i]) / world_size
+            max_disp_algo_bw = max(max_disp_algo_bw, algo_bw)
+            bus_bw = int(algo_bw * (world_size - 1) / world_size)
+            print(
+                f"Round {i} duration(us) {duration_us} "
+                f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
+                f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
+            )
+
+        print()
+        print("Combine result:")
+        max_comb_algo_bw = 0
+        for i in range(len(all_comb_times)):
+            # Convert ms to us
+            duration_us = [int(t * 1000) for t in all_comb_times[i]]
+            algo_bw = sum(comb_bandwidth_GB_list[i]) / world_size
+            max_comb_algo_bw = max(max_comb_algo_bw, algo_bw)
+            bus_bw = int(algo_bw * (world_size - 1) / world_size)
+            print(
+                f"Round {i} duration(us) {duration_us} "
+                f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
+                f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
+            )
+
+        print()
+        print(f"Best Dispatch  performance: {max_disp_algo_bw:.2f} GB/s")
+        print(f"Best Combine   performance: {max_comb_algo_bw:.2f} GB/s")
         print(f"{'='*70}\n")
 
 
