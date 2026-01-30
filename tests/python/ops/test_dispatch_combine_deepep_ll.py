@@ -762,8 +762,8 @@ def run_benchmark(
     setting: dict,
     op: "mori.ops.EpDispatchCombineDeepepOp",
     dispatch_only: bool = False,
-    warmup: int = 1,
-    iters: int = 5,
+    warmup: int = 2,
+    iters: int = 10,
 ):
     """Run benchmark with multiple iterations and report statistics.
 
@@ -849,9 +849,9 @@ def run_benchmark(
 
     # Gather timing from all ranks
     if rank == 0:
-        all_disp_times = [[] for _ in range(world_size)]
-        all_comb_times = [[] for _ in range(world_size)]
-        all_token_counts = [[] for _ in range(world_size)]
+        all_disp_times = []
+        all_comb_times = []
+        all_token_counts = []
     else:
         all_disp_times = None
         all_comb_times = None
