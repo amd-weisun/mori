@@ -790,7 +790,8 @@ def run_benchmark_worker(rank, world_size, setting, port, gpu_per_node_override,
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
+    # Use hybrid backend: gloo for CPU ops (needed by shmem), nccl for CUDA
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size, device_id=device)
 
     # Register process group under name "default" for shmem
     world_group = torch.distributed.group.WORLD
@@ -819,7 +820,8 @@ def run_benchmark_multinode(setting, gpu_per_node_override=None, warmup_iters=2,
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group(backend="nccl", device_id=device)
+    # Use hybrid backend: gloo for CPU ops (needed by shmem), nccl for CUDA
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
