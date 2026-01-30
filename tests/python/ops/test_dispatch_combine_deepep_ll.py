@@ -890,7 +890,15 @@ def run_benchmark(
         print(f"[Benchmark Results] {setting['name']}")
         print(f"{'='*70}")
 
-        element_size = 2 if use_fp8 else 4  # bfloat16 or fp32
+        # Calculate bytes per token following DeepEP's formula
+        # FP8 dispatch: data (1 byte) + scales (hidden/128 * 4 bytes) + overhead (16 bytes)
+        # Non-FP8 dispatch: bfloat16 (2 bytes per element)
+        # Combine: always bfloat16 (2 bytes per element)
+        if use_fp8:
+            bytes_per_token_dispatch = hidden_dim + hidden_dim // 128 * 4 + 16
+        else:
+            bytes_per_token_dispatch = hidden_dim * 2
+        bytes_per_token_combine = hidden_dim * 2  # Always bfloat16 after dequant
 
         # Calculate ll_mode_scale for reference
         # This is used to show performance under load imbalance
@@ -902,18 +910,22 @@ def run_benchmark(
         # Calculate bandwidth metrics
         disp_bandwidth_GB_list = []
         comb_bandwidth_GB_list = []
-        avg_total_bytes_MB_list = []
+        disp_bytes_MB_list = []
+        comb_bytes_MB_list = []
 
         for i in range(len(all_disp_times)):
-            # Average bytes across all ranks for this iteration
-            avg_bytes = all_token_counts[i][0] * hidden_dim * element_size if i < len(all_token_counts) else 0
-            avg_total_bytes_MB_list.append(int(avg_bytes / (1024**2)))
+            # Bytes for dispatch and combine
+            num_tokens = all_token_counts[i][0] if i < len(all_token_counts) else 0
+            disp_bytes = num_tokens * bytes_per_token_dispatch
+            comb_bytes = num_tokens * bytes_per_token_combine
+            disp_bytes_MB_list.append(int(disp_bytes / (1024**2)))
+            comb_bytes_MB_list.append(int(comb_bytes / (1024**2)))
 
             # Dispatch bandwidth for each rank (GB/s)
             disp_bw_ranks = []
             for rank_idx in range(world_size):
                 if all_disp_times[i][rank_idx] > 0:
-                    bw = avg_bytes / (1000**3) / (all_disp_times[i][rank_idx] / 1000)
+                    bw = disp_bytes / (1000**3) / (all_disp_times[i][rank_idx] / 1000)
                     disp_bw_ranks.append(int(bw))
                 else:
                     disp_bw_ranks.append(0)
@@ -923,7 +935,7 @@ def run_benchmark(
             comb_bw_ranks = []
             for rank_idx in range(world_size):
                 if all_comb_times[i][rank_idx] > 0:
-                    bw = avg_bytes / (1000**3) / (all_comb_times[i][rank_idx] / 1000)
+                    bw = comb_bytes / (1000**3) / (all_comb_times[i][rank_idx] / 1000)
                     comb_bw_ranks.append(int(bw))
                 else:
                     comb_bw_ranks.append(0)
@@ -937,11 +949,10 @@ def run_benchmark(
             duration_us = [int(t * 1000) for t in all_disp_times[i]]
             algo_bw = sum(disp_bandwidth_GB_list[i]) / world_size
             max_disp_algo_bw = max(max_disp_algo_bw, algo_bw)
-            bus_bw = int(algo_bw * (world_size - 1) / world_size)
             print(
                 f"Round {i} duration(us) {duration_us} "
                 f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
+                f"bytes(MB) {disp_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
             )
 
         print()
@@ -952,11 +963,10 @@ def run_benchmark(
             duration_us = [int(t * 1000) for t in all_comb_times[i]]
             algo_bw = sum(comb_bandwidth_GB_list[i]) / world_size
             max_comb_algo_bw = max(max_comb_algo_bw, algo_bw)
-            bus_bw = int(algo_bw * (world_size - 1) / world_size)
             print(
                 f"Round {i} duration(us) {duration_us} "
                 f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
+                f"bytes(MB) {comb_bytes_MB_list[i]} bw {algo_bw:.1f} / {algo_bw*ll_mode_scale:.2f}"
             )
 
         print()
