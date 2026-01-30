@@ -567,6 +567,272 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
     _log("[Rank 0] Combine validation passed", force=True)
 
 
+def run_benchmark_impl(
+    rank: int,
+    world_size: int,
+    setting: dict,
+    gpu_per_node_override: int | None = None,
+    local_gpu_id: int | None = None,
+    warmup_iters: int = 2,
+    benchmark_iters: int = 10,
+):
+    """Run dispatch/combine benchmark with timing.
+
+    Args:
+        warmup_iters: Number of warmup iterations (with verification on first).
+        benchmark_iters: Number of timed iterations.
+    """
+    hidden_dim = setting["hidden_dim"]
+    max_num_inp_token_per_rank = setting["max_num_inp_token_per_rank"]
+    total_experts = setting["total_experts"]
+    num_experts_per_token = setting["num_experts_per_token"]
+    gpu_per_node = gpu_per_node_override or setting.get("gpu_per_node", world_size)
+    use_fp8 = setting.get("use_fp8", hidden_dim >= 128)
+    data_type = torch.bfloat16
+
+    assert total_experts % world_size == 0
+    num_experts_per_rank = total_experts // world_size
+
+    # Determine kernel type based on topology
+    is_internode = world_size > gpu_per_node
+    kernel_type = (
+        mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
+        if is_internode
+        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
+    )
+
+    device_id = local_gpu_id if local_gpu_id is not None else (rank % gpu_per_node)
+    device = torch.device("cuda", device_id)
+    rng = torch.Generator(device=device)
+    rng.manual_seed(123)
+
+    # Create config and op
+    config = mori.ops.EpDispatchCombineDeepepConfig(
+        data_type=data_type,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        scale_dim=hidden_dim // 128,
+        scale_type_size=4,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        max_token_type_size=4,
+        block_num=40,
+        warp_num_per_block=8,
+        use_external_inp_buf=True,
+        use_fp8=use_fp8,
+        use_deepep_layout=True,
+        use_weighted_combine=True,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
+    )
+    op = mori.ops.EpDispatchCombineDeepepOp(config)
+
+    dispatch_func = op.dispatch_internode_deepep_ll if is_internode else op.dispatch_deepep_ll
+    combine_func = op.combine_internode_deepep_ll if is_internode else op.combine_deepep_ll
+
+    if rank == 0:
+        num_nodes = (world_size + gpu_per_node - 1) // gpu_per_node
+        print(
+            f"[Benchmark] Config: world_size={world_size}, gpu_per_node={gpu_per_node}, "
+            f"num_nodes={num_nodes}, hidden_dim={hidden_dim}, experts={total_experts}, "
+            f"topk={num_experts_per_token}, use_fp8={use_fp8}, kernel_type={kernel_type}",
+            flush=True,
+        )
+        print(f"[Benchmark] warmup={warmup_iters}, iters={benchmark_iters}", flush=True)
+
+    def gen_test_data():
+        """Generate test data for one iteration."""
+        num_token = torch.tensor([max_num_inp_token_per_rank] * world_size).to(device)
+        all_rank_indices = []
+        for r in range(world_size):
+            indices = torch.empty(num_token[r], num_experts_per_token, dtype=torch.int64)
+            for i in range(num_token[r]):
+                perm = torch.randperm(total_experts, generator=rng, device=device)
+                indices[i] = perm[:num_experts_per_token]
+            all_rank_indices.append(indices.to(torch.int32).to(device))
+
+        all_rank_weights = [
+            torch.ones(num_token[r], num_experts_per_token, dtype=torch.float32, device=device)
+            for r in range(world_size)
+        ]
+        all_rank_input = [
+            (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=rng, device=device) * 2 - 1).to(data_type)
+            for r in range(world_size)
+        ]
+        return all_rank_input, all_rank_indices, all_rank_weights
+
+    def run_once(all_rank_input, all_rank_indices, all_rank_weights, check_result=False):
+        """Run one dispatch+combine iteration and return timing."""
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        dist.barrier()
+        torch.cuda.synchronize()
+
+        # Dispatch timing
+        start_event.record()
+        recv_x, recv_count, handle, _, _ = dispatch_func(
+            all_rank_input[rank],
+            all_rank_indices[rank],
+            num_max_dispatch_tokens_per_rank=max_num_inp_token_per_rank,
+            num_experts=total_experts,
+            use_fp8=use_fp8,
+            weights=all_rank_weights[rank],
+        )
+        end_event.record()
+        torch.cuda.synchronize()
+        disp_time_ms = start_event.elapsed_time(end_event)
+
+        if use_fp8:
+            dispatch_output, dispatch_scales = recv_x
+        else:
+            dispatch_output, dispatch_scales = recv_x, None
+
+        dispatch_weights, dispatch_indices = handle
+        total_recv_tokens = recv_count.sum().item()
+
+        if check_result and not SKIP_DISPATCH_CHECKS:
+            validate_dispatch(rank, num_experts_per_rank, world_size, recv_count, all_rank_indices)
+
+        # Combine timing
+        combine_input = dispatch_output
+        if use_fp8:
+            combine_input = dequant_dispatch_output(dispatch_output, dispatch_scales, hidden_dim)
+
+        start_event.record()
+        combine_output, _, _ = combine_func(
+            combine_input, dispatch_indices, dispatch_weights, handle=handle
+        )
+        end_event.record()
+        torch.cuda.synchronize()
+        comb_time_ms = start_event.elapsed_time(end_event)
+
+        if check_result and not SKIP_COMBINE_CHECKS and rank == 0:
+            validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type)
+
+        op.reset()
+
+        # Calculate bandwidth
+        element_size = 1 if use_fp8 else all_rank_input[rank].element_size()
+        total_bytes = total_recv_tokens * hidden_dim * element_size
+        disp_bw_gbs = total_bytes / 1e9 / (disp_time_ms / 1e3) if disp_time_ms > 0 else 0
+        comb_bw_gbs = total_bytes / 1e9 / (comb_time_ms / 1e3) if comb_time_ms > 0 else 0
+
+        return disp_time_ms, comb_time_ms, disp_bw_gbs, comb_bw_gbs, total_bytes
+
+    # Warmup iterations (first one with verification)
+    for i in range(warmup_iters):
+        test_data = gen_test_data()
+        run_once(*test_data, check_result=(i == 0))
+        if rank == 0:
+            print(f"[Benchmark] Warmup {i+1}/{warmup_iters} complete", flush=True)
+
+    # Benchmark iterations
+    disp_times = []
+    comb_times = []
+    disp_bws = []
+    comb_bws = []
+    total_bytes_list = []
+
+    for i in range(benchmark_iters):
+        test_data = gen_test_data()
+        disp_ms, comb_ms, disp_bw, comb_bw, total_bytes = run_once(*test_data, check_result=False)
+        disp_times.append(disp_ms)
+        comb_times.append(comb_ms)
+        disp_bws.append(disp_bw)
+        comb_bws.append(comb_bw)
+        total_bytes_list.append(total_bytes)
+
+    # Gather results from all ranks
+    def gather_stats(local_values):
+        """Gather values from all ranks and compute statistics."""
+        local_avg = sum(local_values) / len(local_values)
+        gathered = [torch.zeros(1) for _ in range(world_size)]
+        dist.all_gather(gathered, torch.tensor([local_avg]))
+        values = [t.item() for t in gathered]
+        return {
+            "avg": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+            "per_rank": values,
+        }
+
+    disp_stats = gather_stats(disp_times)
+    comb_stats = gather_stats(comb_times)
+    disp_bw_stats = gather_stats(disp_bws)
+    comb_bw_stats = gather_stats(comb_bws)
+    avg_bytes = sum(total_bytes_list) / len(total_bytes_list)
+
+    if rank == 0:
+        print("\n" + "=" * 80)
+        print("[Benchmark Results]")
+        print("=" * 80)
+        print(f"Data size: {avg_bytes / 1e6:.2f} MB per rank (avg)")
+        print()
+        print(f"Dispatch time (ms):  avg={disp_stats['avg']:.3f}, min={disp_stats['min']:.3f}, max={disp_stats['max']:.3f}")
+        print(f"Dispatch BW (GB/s):  avg={disp_bw_stats['avg']:.2f}, min={disp_bw_stats['min']:.2f}, max={disp_bw_stats['max']:.2f}")
+        print()
+        print(f"Combine time (ms):   avg={comb_stats['avg']:.3f}, min={comb_stats['min']:.3f}, max={comb_stats['max']:.3f}")
+        print(f"Combine BW (GB/s):   avg={comb_bw_stats['avg']:.2f}, min={comb_bw_stats['min']:.2f}, max={comb_bw_stats['max']:.2f}")
+        print("=" * 80)
+
+    # Cleanup
+    del op
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def run_benchmark_worker(rank, world_size, setting, port, gpu_per_node_override, warmup_iters, benchmark_iters):
+    """Worker function for benchmark mode (mp.spawn)."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    mori.shmem.shmem_init(rank, world_size)
+
+    try:
+        run_benchmark_impl(
+            rank=rank,
+            world_size=world_size,
+            setting=setting,
+            gpu_per_node_override=gpu_per_node_override,
+            local_gpu_id=rank,
+            warmup_iters=warmup_iters,
+            benchmark_iters=benchmark_iters,
+        )
+    finally:
+        mori.shmem.shmem_finalize()
+        dist.destroy_process_group()
+
+
+def run_benchmark_multinode(setting, gpu_per_node_override=None, warmup_iters=2, benchmark_iters=10):
+    """Run benchmark in multi-node mode (torchrun/srun)."""
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    mori.shmem.shmem_init(rank, world_size)
+
+    gpu_per_node = gpu_per_node_override or setting.get("gpu_per_node", world_size)
+
+    try:
+        run_benchmark_impl(
+            rank=rank,
+            world_size=world_size,
+            setting=setting,
+            gpu_per_node_override=gpu_per_node,
+            local_gpu_id=local_rank,
+            warmup_iters=warmup_iters,
+            benchmark_iters=benchmark_iters,
+        )
+    finally:
+        mori.shmem.shmem_finalize()
+        dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser(description="DeepEP low-latency dispatch/combine test")
     parser.add_argument(
@@ -608,6 +874,23 @@ def main():
         default=1,
         help="Number of iterations to run (for stress testing)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run in benchmark mode (measure timing and bandwidth)",
+    )
+    parser.add_argument(
+        "--benchmark-warmup",
+        type=int,
+        default=2,
+        help="Number of warmup iterations for benchmark (default: 2)",
+    )
+    parser.add_argument(
+        "--benchmark-iters",
+        type=int,
+        default=10,
+        help="Number of timed iterations for benchmark (default: 10)",
+    )
     args = parser.parse_args()
 
     # Set global flags
@@ -620,7 +903,16 @@ def main():
         else:
             # Default to LOCAL_WORLD_SIZE (nproc_per_node from torchrun)
             setting["gpu_per_node"] = int(os.environ.get("LOCAL_WORLD_SIZE", setting["gpu_per_node"]))
-        run_test_multinode(setting, iterations=args.iterations, dispatch_only=args.dispatch_only)
+
+        if args.benchmark:
+            run_benchmark_multinode(
+                setting,
+                gpu_per_node_override=setting["gpu_per_node"],
+                warmup_iters=args.benchmark_warmup,
+                benchmark_iters=args.benchmark_iters,
+            )
+        else:
+            run_test_multinode(setting, iterations=args.iterations, dispatch_only=args.dispatch_only)
         return
 
     # Single-node mode: use mp.spawn for process management
@@ -636,20 +928,31 @@ def main():
         gpu_per_node = args.gpu_per_node
 
         print("=" * 80, flush=True)
-        print(f"[DeepEP] Running setting '{setting['name']}' with {num_processes} processes", flush=True)
-        if args.iterations > 1:
-            print(f"[DeepEP] Running {args.iterations} iterations", flush=True)
+        if args.benchmark:
+            print(f"[Benchmark] Running setting '{setting['name']}' with {num_processes} processes", flush=True)
+            print(f"[Benchmark] warmup={args.benchmark_warmup}, iters={args.benchmark_iters}", flush=True)
+        else:
+            print(f"[DeepEP] Running setting '{setting['name']}' with {num_processes} processes", flush=True)
+            if args.iterations > 1:
+                print(f"[DeepEP] Running {args.iterations} iterations", flush=True)
         print("=" * 80, flush=True)
 
         port = get_free_port()
-        mp.spawn(
-            run_test_worker,
-            args=(num_processes, setting, port, gpu_per_node, args.dispatch_only, args.iterations),
-            nprocs=num_processes,
-        )
+        if args.benchmark:
+            mp.spawn(
+                run_benchmark_worker,
+                args=(num_processes, setting, port, gpu_per_node, args.benchmark_warmup, args.benchmark_iters),
+                nprocs=num_processes,
+            )
+        else:
+            mp.spawn(
+                run_test_worker,
+                args=(num_processes, setting, port, gpu_per_node, args.dispatch_only, args.iterations),
+                nprocs=num_processes,
+            )
 
-        if args.iterations > 1:
-            print(f"[DeepEP] All {args.iterations} iterations passed!", flush=True)
+            if args.iterations > 1:
+                print(f"[DeepEP] All {args.iterations} iterations passed!", flush=True)
         print("=" * 80, flush=True)
 
 
