@@ -777,6 +777,23 @@ def run_benchmark(
     assert total_experts % world_size == 0
     num_experts_per_rank = total_experts // world_size
 
+    is_internode = world_size > gpu_per_node
+    kernel_type = (
+        mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
+        if is_internode
+        else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
+    )
+
+    if rank == 0:
+        num_nodes = (world_size + gpu_per_node - 1) // gpu_per_node
+        print(
+            f"[DeepEP] Running setting '{setting['name']}': "
+            f"world_size={world_size}, gpu_per_node={gpu_per_node}, num_nodes={num_nodes}, "
+            f"hidden_dim={hidden_dim}, experts={total_experts}, topk={num_experts_per_token}, "
+            f"use_fp8={use_fp8}, kernel_type={kernel_type}",
+            flush=True,
+        )
+
     # Generate test data once
     def gen_test_data():
         num_token = torch.tensor(
