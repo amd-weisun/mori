@@ -238,6 +238,12 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
       barrierSize * 2 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
 
+  // Finish counter per destination PE for low-latency dispatch (Phase 3 optimization)
+  // Size: worldSize counters, each tracking dispatch completion for one destination PE
+  size_t finishCounterSize = config.worldSize * sizeof(uint32_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&finishCounterPerDestPe, finishCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(finishCounterPerDestPe, 0, finishCounterSize));
+
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =
       config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(uint64_t);
@@ -255,6 +261,7 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(crossDeviceBarrierFlag));
+  HIP_RUNTIME_CHECK(hipFree(finishCounterPerDestPe));
   HIP_RUNTIME_CHECK(hipFree(interNodeChunkFlagCombine));
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
@@ -303,6 +310,9 @@ void EpDispatchCombineHandle::LaunchIntraNodeDispatchDeepepLL(int blockNum, int 
                                      config.numExpertPerRank * sizeof(index_t), stream));
   }
   HIP_RUNTIME_CHECK(hipMemsetAsync(destPeTokenCounter, 0, config.worldSize * sizeof(index_t), stream));
+  // Reset finish counters for Phase 3 optimization
+  HIP_RUNTIME_CHECK(hipMemsetAsync(finishCounterPerDestPe, 0,
+                                   config.worldSize * sizeof(uint32_t), stream));
 
   size_t expertCapacity = static_cast<size_t>(config.worldSize) * config.maxNumInpTokenPerRank;
   size_t totalTokenSlots = static_cast<size_t>(config.numExpertPerRank) * expertCapacity;

@@ -257,6 +257,11 @@ class EpDispatchCombineHandle {
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
 
+  // Finish counter per destination PE for low-latency dispatch (Phase 3 optimization)
+  // Each destPe has a counter that tracks: dispatched_tokens + (FINISHED_SUM_TAG - expected_tokens)
+  // When counter equals FINISHED_SUM_TAG, all tokens to that destPe have been dispatched
+  uint32_t* finishCounterPerDestPe{nullptr};
+
   // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
   // at combine recv phase
   index_t* dispSenderIdxMap{nullptr};
@@ -340,6 +345,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
+  uint32_t* finishCounterPerDestPe{nullptr};
   index_t* destPeTokenCounter{nullptr};
   index_t* destExpertTokenCounter{nullptr};
   mori::application::SymmMemObjPtr destExpertTokenCounterMemObj;
@@ -411,6 +417,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
   args.combineGridBarrier = handle.combineGridBarrier;
+  args.finishCounterPerDestPe = handle.finishCounterPerDestPe;
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
   args.dispSenderIdxMap = handle.dispSenderIdxMap;
   args.destPeTokenIdxMap = handle.destPeTokenIdxMap;

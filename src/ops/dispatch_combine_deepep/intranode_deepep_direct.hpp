@@ -80,6 +80,11 @@ namespace detail {
 constexpr int kNumPerChannels = 128;
 constexpr int kElemsPerLoad = 8;  // uint4 = 16 bytes = 8 bf16 elements
 constexpr float kFP8Margin = 1e-4f;
+
+// Finish counter pattern: when counter reaches this value, all tokens for that destPe are dispatched
+// The pattern works as: finish_counter = dispatched_count + (FINISHED_SUM_TAG - expected_count)
+// When dispatched_count == expected_count, finish_counter == FINISHED_SUM_TAG
+constexpr uint32_t kFinishedSumTag = 0x80000000u;  // High bit set to avoid collision with counts
 #ifdef __HIP_PLATFORM_AMD__
 constexpr float kFP8Amax = 240.0f;
 constexpr float kFP8AmaxInv = 1.0f / 240.0f;
@@ -258,20 +263,57 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
                        args.inpTokenBuf + srcTokOffset, config.hiddenDim);
       }
+
+      // Phase 3 optimization: Increment finish counter for this destPe after copying token data.
+      // Uses release semantics to ensure all prior writes are visible.
+      if (laneId == 0) {
+        detail::AtomicAddReleaseSystem(args.finishCounterPerDestPe + destPe, 1u);
+      }
     }
   }
-  // Use release semantics to ensure all prior writes are visible before incrementing barrier
-  // This replaces the expensive __threadfence_system() + atomicAdd pattern
-  if (laneId == 0) {
-    detail::AtomicAddReleaseSystem(args.dispatchGridBarrier, 1u);
+
+  // Phase 3: Count warp computes expected tokens per destPe and adds offset to finish counters.
+  // This runs after the dispatch loop for the count warp. Uses the last warp.
+  // The finish counter pattern: when finish_counter[destPe] == kFinishedSumTag, all tokens are done.
+  // Math: finish_counter = dispatched_count + (kFinishedSumTag - expected_count) = kFinishedSumTag
+  constexpr int kMaxGpuPerNode = 8;  // MI300X has 8 GPUs per node
+  assert(npes <= kMaxGpuPerNode && "Intranode dispatch assumes worldSize <= 8 GPUs per node");
+  if (globalWarpId == globalWarpNum - 1) {
+    // Count expected tokens per destPe by reading tokenIndices
+    // Use registers to accumulate counts per destPe (worldSize is typically small, 8 for intranode)
+    int countPerDestPe[kMaxGpuPerNode] = {0};
+    for (int i = laneId; i < args.curRankNumToken * config.numExpertPerToken; i += warpSize) {
+      if (args.tokenIndices) {
+        index_t destExpert = args.tokenIndices[i];
+        index_t destPe = destExpert / config.numExpertPerRank;
+        if (destPe < npes && destPe < kMaxGpuPerNode) {
+          countPerDestPe[destPe]++;
+        }
+      }
+    }
+    // Warp-reduce counts per destPe and add offset to finish counters
+    for (int pe = 0; pe < npes && pe < kMaxGpuPerNode; ++pe) {
+      int count = countPerDestPe[pe];
+      // Warp reduction using shuffle
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        count += __shfl_xor(count, offset);
+      }
+      // Lane 0 adds the offset to finish counter
+      if (laneId == 0) {
+        uint32_t finishOffset = detail::kFinishedSumTag - static_cast<uint32_t>(count);
+        detail::AtomicAddReleaseSystem(args.finishCounterPerDestPe + pe, finishOffset);
+      }
+    }
   }
 
+  // Signal phase: Wait for finish counter per destPe instead of global barrier.
+  // The finish counter pattern allows signaling per-destPe as soon as all tokens for that
+  // destPe are dispatched, without waiting for all warps globally. This is the key optimization.
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Use acquire semantics to ensure we see all writes after barrier is reached
-      while (detail::AtomicLoadAcquireSystem(args.dispatchGridBarrier) < globalWarpNum) {
+      // Wait for finish counter to reach kFinishedSumTag (all tokens for this destPe dispatched)
+      while (detail::AtomicLoadAcquireSystem(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
       }
-      args.dispatchGridBarrier[0] = 0;
 
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
