@@ -35,6 +35,45 @@ namespace mori {
 namespace moe {
 namespace deepep {
 
+// Acquire/Release atomic primitives for optimized synchronization.
+// Device-scope variants are sufficient for intranode (xGMI) where all GPUs share
+// a unified coherency domain. System-scope variants are provided for future internode use.
+namespace detail {
+
+// Device-scope atomics (~10 cycles) - for intranode xGMI
+template <typename T>
+__device__ inline T AtomicLoadAcquire(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+__device__ inline void AtomicStoreRelease(T* ptr, T val) {
+  __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+__device__ inline T AtomicAddRelease(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+// System-scope atomics (~50-100 cycles) - for future internode use
+template <typename T>
+__device__ inline T AtomicLoadAcquireSystem(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+__device__ inline void AtomicStoreReleaseSystem(T* ptr, T val) {
+  __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+__device__ inline T AtomicAddReleaseSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+}  // namespace detail
+
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
