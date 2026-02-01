@@ -383,7 +383,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               destPe, 0);
           shmem::ShmemQuietThread(destPe);
         } else {
-          core::AtomicStoreReleaseSystem(signalSlot, encodedCount);
+          detail::AtomicStoreReleaseSystem(signalSlot, encodedCount);
         }
       }
     }
@@ -426,7 +426,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         atomicAdd(args.totalRecvTokenNum, numRecvTokens);
 
         // Reset signal for next iteration
-        core::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
+        detail::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
       }
     }
   }
@@ -437,7 +437,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (!internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode) && srcPe != myPe) {
         int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>() +
                               localExpert * npes + srcPe;
-        int64_t rawCount = core::AtomicLoadAcquireSystem(signalSlot);
+        int64_t rawCount = detail::AtomicLoadAcquireSystem(signalSlot);
         if (rawCount != 0) {
           int numRecvTokens = static_cast<int>(-rawCount - 1);
           index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
@@ -445,7 +445,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
           atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
           atomicAdd(args.totalRecvTokenNum, numRecvTokens);
-          core::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
+          detail::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
         }
       }
     }
@@ -560,7 +560,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           shmem::ShmemQuietThread(srcPe);
         } else {
           int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
-          core::AtomicAddReleaseSystem(flagSlot, int64_t{1});
+          detail::AtomicAddReleaseSystem(flagSlot, int64_t{1});
         }
       }
     }

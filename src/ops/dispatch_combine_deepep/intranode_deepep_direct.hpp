@@ -97,7 +97,7 @@ constexpr float kFP8Margin = 1e-4f;
 // Finish counter pattern: when counter reaches this value, all tokens for that destPe are dispatched
 // The pattern works as: finish_counter = dispatched_count + (FINISHED_SUM_TAG - expected_count)
 // When dispatched_count == expected_count, finish_counter == FINISHED_SUM_TAG
-constexpr uint32_t kFinishedSumTag = 0x80000000u;  // High bit set to avoid collision with counts
+// Note: kFinishedSumTag is defined in dispatch_combine_deepep.hpp
 #ifdef __HIP_PLATFORM_AMD__
 constexpr float kFP8Amax = 240.0f;
 constexpr float kFP8AmaxInv = 1.0f / 240.0f;

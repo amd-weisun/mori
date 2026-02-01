@@ -266,9 +266,9 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(atomicCounterPerExpert, 0, atomicCounterSize));
 
   // Finish counter per expert for dispatch completion detection (device memory)
-  size_t finishCounterSize = numExpertsTotal * sizeof(uint32_t);
-  HIP_RUNTIME_CHECK(hipMalloc(&finishCounterPerExpert, finishCounterSize));
-  HIP_RUNTIME_CHECK(hipMemset(finishCounterPerExpert, 0, finishCounterSize));
+  size_t finishCounterPerExpertSize = numExpertsTotal * sizeof(uint32_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&finishCounterPerExpert, finishCounterPerExpertSize));
+  HIP_RUNTIME_CHECK(hipMemset(finishCounterPerExpert, 0, finishCounterPerExpertSize));
 
   // Allocated slots counter per local expert in packed output buffer (device memory)
   size_t packedRecvCountSize = config.numExpertPerRank * sizeof(index_t);
