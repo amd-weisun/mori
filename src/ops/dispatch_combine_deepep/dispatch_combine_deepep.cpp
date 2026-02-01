@@ -255,6 +255,38 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, sizeof(index_t)));
+
+  // ====== Internode LL (DeepEP-aligned) buffers ======
+  // Total number of experts across all ranks
+  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
+
+  // Local slot assignment counter per expert (device memory)
+  size_t atomicCounterSize = numExpertsTotal * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&atomicCounterPerExpert, atomicCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(atomicCounterPerExpert, 0, atomicCounterSize));
+
+  // Finish counter per expert for dispatch completion detection (device memory)
+  size_t finishCounterSize = numExpertsTotal * sizeof(uint32_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&finishCounterPerExpert, finishCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(finishCounterPerExpert, 0, finishCounterSize));
+
+  // Allocated slots counter per local expert in packed output buffer (device memory)
+  size_t packedRecvCountSize = config.numExpertPerRank * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&packedRecvCount, packedRecvCountSize));
+  HIP_RUNTIME_CHECK(hipMemset(packedRecvCount, 0, packedRecvCountSize));
+
+  // Layout range for combine kernel (device memory)
+  size_t layoutRangeSize = static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&layoutRange, layoutRangeSize));
+  HIP_RUNTIME_CHECK(hipMemset(layoutRange, 0, layoutRangeSize));
+
+  // Symmetric buffer for negative-encoded count signals (RDMA accessible)
+  size_t rdmaRecvCountSize = static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t);
+  rdmaRecvCountMemObj = ShmemMallocAndReturnMemObjPtr(rdmaRecvCountSize, hipDeviceMallocUncached);
+
+  // Symmetric buffer for combine completion flags per expert (RDMA accessible)
+  size_t rdmaRecvFlagSize = numExpertsTotal * sizeof(int64_t);
+  rdmaRecvFlagMemObj = ShmemMallocAndReturnMemObjPtr(rdmaRecvFlagSize, hipDeviceMallocUncached);
 }
 
 void EpDispatchCombineHandle::FinalizeBarrier() {
@@ -266,6 +298,14 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
   ShmemFree(interNodeChunkFlagMemObj->localPtr);
+
+  // ====== Internode LL (DeepEP-aligned) buffers ======
+  HIP_RUNTIME_CHECK(hipFree(atomicCounterPerExpert));
+  HIP_RUNTIME_CHECK(hipFree(finishCounterPerExpert));
+  HIP_RUNTIME_CHECK(hipFree(packedRecvCount));
+  HIP_RUNTIME_CHECK(hipFree(layoutRange));
+  ShmemFree(rdmaRecvCountMemObj->localPtr);
+  ShmemFree(rdmaRecvFlagMemObj->localPtr);
 }
 
 void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
@@ -426,6 +466,18 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
   HIP_RUNTIME_CHECK(hipMemsetAsync(dispTokIdToSrcTokIdMemObj->Get(), 0xFF,
           totalTokenSlots * sizeof(index_t), stream));
 
+  // Reset internode LL (DeepEP-aligned) buffers
+  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(atomicCounterPerExpert, 0, numExpertsTotal * sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(finishCounterPerExpert, 0, numExpertsTotal * sizeof(uint32_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(packedRecvCount, 0, config.numExpertPerRank * sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(layoutRange, 0,
+      static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvCountMemObj->Get(), 0,
+      static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t), stream));
+  // Reset grid barrier counter for dispatch
+  HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, sizeof(uint32_t), stream));
+
   size_t sharedMemSize =
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
@@ -469,6 +521,12 @@ void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int w
     HIP_RUNTIME_CHECK(
         hipMemsetAsync(shmemCombineOutWeightsMemObj->Get(), 0, combineOutWeightsSize, stream));
   }
+
+  // Reset internode LL combine buffers
+  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvFlagMemObj->Get(), 0, numExpertsTotal * sizeof(int64_t), stream));
+  // Reset grid barrier counter for combine
+  HIP_RUNTIME_CHECK(hipMemsetAsync(combineGridBarrier, 0, sizeof(uint32_t), stream));
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(

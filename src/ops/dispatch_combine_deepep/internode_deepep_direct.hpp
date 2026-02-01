@@ -25,51 +25,37 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/core/core.hpp"
+#include "mori/ops/dispatch_combine_deepep/dispatch_combine_deepep.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace moe {
 namespace deepep {
 
-// Debug flag for inter-node dispatch/combine - set to 1 to enable debug prints
-#define INTERNODE_DEEPEP_DEBUG 0
-
-// Individual debug flags to isolate which print provides synchronization
-// Enable one at a time to find the critical one
-#define DEBUG_AFTER_TOKEN_DISPATCH 0  // After token dispatch loop, before count exchange
-#define DEBUG_SEND_COUNTS 0           // After each count+signal RDMA send
-#define DEBUG_RECV_SIGNAL 0           // After receiving each signal
-#define DEBUG_RECV_COUNTS 0           // Print actual count values read from remote srcPe
-#define DEBUG_COUNT_SUMMARY 0         // After counting, before reset
-#define DEBUG_FINAL_SUMMARY 0         // After counting, before reset
-
-// Timeout for RDMA polling loops (200G cycles ~= 100s at 2GHz)
-#define INTERNODE_TIMEOUT_CYCLES 200000000000ll
-
-// Configurable delay after RDMA operations (for debugging only).
-// With proper ShmemQuietThread() calls, this delay should not be needed.
-// Set to 0 for production. Set to non-zero only for debugging timing issues.
-// Units: GPU clock cycles (e.g., 100000 ~= 50us at 2GHz)
-#define INTERNODE_RDMA_DELAY_CYCLES 300000
-
 /*
  * Multi-node (inter-node) low-latency dispatch/combine kernels for DeepEP format.
  *
- * Design follows MORI intranode style:
- * - Uses EpDispatchCombineArgs<T> for kernel arguments
- * - Uses CrossDeviceBarrier for synchronization
- * - Uses core::WarpCopy for data movement
- * - Uses expert-major layout: [local_expert, worldSize * maxNumInpTokenPerRank, hidden]
+ * Algorithm follows DeepEP's proven 6-phase dispatch / 3-phase combine structure:
  *
- * Inter-node specific:
- * - Uses RDMA for cross-node data transfer
- * - Negative count encoding for signaling
- * - Packed message format for FP8: [src_idx | hidden_data | scales]
+ * DISPATCH (6 phases):
+ *   1. Token Dispatch - SM-strided, local slot assignment, RDMA put for remote
+ *   2. Expert Count Aggregation - Last warp adds finish tag offset
+ *   3. RDMA Quiet - Thread 0 drains pending RDMA puts
+ *   4. Count Signal Sending - Send negative-encoded count via RDMA atomic
+ *   5. Grid Barrier - Device-scope barrier between send and receive
+ *   6. Receive + Unpack - Poll for signals, copy to packed buffer
+ *
+ * COMBINE (3 phases):
+ *   1. Send Expert Outputs - RDMA put to source ranks
+ *   2. Signal Completion - Send completion flag
+ *   3. Receive + Accumulate - Wait for flags, weighted accumulation
+ *
+ * Key design patterns:
+ * - Local slot assignment: atomicAdd on local counter, no RDMA fetch atomics
+ * - Negative-encoded signals: -count - 1 combines count + signal in one RDMA atomic
+ * - Finish counter: FINISHED_SUM_TAG pattern for completion detection without barriers
+ * - Source-rank partitioning: each rank gets slots [srcPe * maxTokens, (srcPe+1) * maxTokens)
  */
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                    Inter-Node Helper Functions                                  */
-/* ---------------------------------------------------------------------------------------------- */
 
 namespace internode_ll {
 
@@ -94,1213 +80,563 @@ __device__ __forceinline__ int GetNodeId(int rank, int gpuPerNode) {
   return rank / gpuPerNode;
 }
 
-// Spin-wait delay for a specified number of GPU clock cycles.
-// Used to simulate the timing effect of printf for debugging RDMA issues.
-__device__ __forceinline__ void SpinDelayCycles(long long cycles) {
-  if (cycles <= 0) return;
-  long long start = clock64();
-  while (clock64() - start < cycles) {
-    // Busy wait - use memory fence to prevent optimization
-    __threadfence();
-  }
-}
-
-// RDMA-aware polling: wait until value > threshold with memory fence and timeout.
-// Uses SeqCst (sequential consistency) atomic loads for strongest memory ordering.
-// SeqCst provides acquire semantics plus total ordering, ensuring we see all prior
-// writes from other threads/GPUs before returning.
-// Returns the value read. If timeout occurs, prints debug info and returns the last value read.
-template <typename T>
-__device__ __forceinline__ T RdmaWaitUntilGreaterThan(T* addr, T val, int myPe = -1, int srcPe = -1) {
-  T got;
-  long long startCycle = clock64();
-  do {
-    // SeqCst provides full memory barrier semantics - no separate fence needed
-    got = core::AtomicLoadSeqCstSystem(addr);
-    // Timeout check
-    if (clock64() - startCycle > INTERNODE_TIMEOUT_CYCLES) {
-      printf("[TIMEOUT][Rank %d] RdmaWaitUntilGreaterThan: waiting for srcPe=%d, expected>%d, got=%d\n",
-             myPe, srcPe, (int)val, (int)got);
-      break;
-    }
-  } while (got <= val);
-  return got;
-}
-
 }  // namespace internode_ll
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                          Inter-Node Barrier (uses RDMA for remote ranks)                       */
-/* ---------------------------------------------------------------------------------------------- */
-/*
- * 1. Intra-node barrier: direct atomic stores/loads for same-node ranks
- * 2. Inter-node barrier: RDMA atomics via proxy PEs for cross-node synchronization
- *
- * Proxy PE concept: Each rank communicates with its corresponding rank on other nodes.
- * E.g., rank 0 on node 0 <-> rank 8 on node 1 (if gpuPerNode=8)
- */
-template <typename T>
-inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args,
-                                                          const uint32_t crossDeviceBarrierFlag) {
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
-
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpNum = gridDim.x * warpNum;
-  int myPe = args.config.rank;
-  int gpuPerNode = args.config.gpuPerNode;
-  int myNode = myPe / gpuPerNode;
-  int nNodes = args.config.worldSize / gpuPerNode;
-
-  // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
-  // Device-scope atomicAdd may not be visible to system-scope AtomicLoadRelaxedSystem reads.
-  if (laneId == 0) core::AtomicAddRelaxedSystem(args.combineGridBarrier, 1u);
-
-#if INTERNODE_DEEPEP_DEBUG
-  if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: entering grid barrier, flag=%u, globalWarpNum=%d\n",
-           myPe, crossDeviceBarrierFlag, globalWarpNum);
-  }
-#endif
-
-  // Step 1: Intra-node barrier - signal to all same-node ranks
-  // Wait for all warps to arrive, then reset barrier (only thread 0 resets)
-  if (globalThdId < gpuPerNode) {
-    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-  }
-  __syncthreads();
-
-#if INTERNODE_DEEPEP_DEBUG
-  if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: grid barrier complete\n", myPe);
-  }
-#endif
-
-  if (globalThdId == 0) {
-    core::AtomicStoreSeqCstSystem(args.combineGridBarrier, 0u);
-  }
-  __syncthreads();
-
-  if (globalThdId < gpuPerNode) {
-    int destPe = myNode * gpuPerNode + globalThdId;
-    // Direct atomic store for same-node ranks - use SeqCst for barrier synchronization
-    core::AtomicStoreSeqCstSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe,
-        crossDeviceBarrierFlag);
-  }
-
-#if INTERNODE_DEEPEP_DEBUG
-  if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node signal sent\n", myPe);
-  }
-#endif
-
-  if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
-
-  // Wait for all same-node ranks to signal - use SeqCst for barrier synchronization
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
-  if (thdId < gpuPerNode) {
-    int srcPe = myNode * gpuPerNode + thdId;
-    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + srcPe) != crossDeviceBarrierFlag) {
-      // SeqCst provides full barrier semantics
-    }
-  }
-  __syncthreads();
-
-#if INTERNODE_DEEPEP_DEBUG
-  if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: intra-node barrier complete\n", myPe);
-  }
-#endif
-
-  // Step 2: Inter-node barrier - use RDMA put instead of atomic (to avoid RDMA atomic issues)
-  // Each rank writes its barrier flag to all proxy PEs on other nodes via RDMA put.
-  // Since each proxyPe slot is written by only one source rank (myPe), we can use put.
-  if (globalThdId < nNodes && globalThdId != myNode) {
-    int proxyPe = globalThdId * gpuPerNode + (myPe % gpuPerNode);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: sending RDMA put to proxyPe=%d, flag=%u\n",
-           myPe, proxyPe, crossDeviceBarrierFlag);
-#endif
-    // Use RDMA put to write the barrier flag value directly
-    shmem::ShmemPutTypeImmNbiThread<uint32_t>(
-        args.crossDeviceBarrierMemObj,
-        myPe * sizeof(uint32_t),
-        crossDeviceBarrierFlag,
-        proxyPe);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: RDMA put done, calling quiet to proxyPe=%d\n",
-           myPe, proxyPe);
-#endif
-    // Must quiet to ensure the RDMA put is visible on remote rank before we poll
-    shmem::ShmemQuietThread(proxyPe);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: quiet to proxyPe=%d complete\n",
-           myPe, proxyPe);
-#endif
-  }
-
-  // Wait for all remote nodes to signal (via their proxy PEs)
-  // Each proxy PE slot is only written via RDMA add from the corresponding remote rank.
-  // After N barrier invocations, the slot has value N. So we wait for crossDeviceBarrierFlag.
-  // CRITICAL: Add __threadfence_system() inside the loop to force cache invalidation.
-  // Without this, RDMA-written data may not be visible due to GPU cache coherence issues.
-  if (thdId < nNodes && thdId != myNode) {
-    int proxyPe = thdId * gpuPerNode + (myPe % gpuPerNode);
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: waiting for proxyPe=%d, expected=%u, current=%u\n",
-           myPe, proxyPe, crossDeviceBarrierFlag,
-           core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe));
-#endif
-    // Use SeqCst for waiting on RDMA-written data - provides full memory barrier
-    while (core::AtomicLoadSeqCstSystem(localBarrierPtr + proxyPe) < crossDeviceBarrierFlag) {
-      // SeqCst provides cache coherence, no extra fence needed
-    }
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: proxyPe=%d signal received\n",
-           myPe, proxyPe);
-#endif
-  }
-  __syncthreads();
-
-#if INTERNODE_DEEPEP_DEBUG
-  if (globalThdId == 0) {
-    printf("[DEBUG][Rank %d] CrossDeviceBarrier: inter-node barrier complete, flag=%u\n",
-           myPe, crossDeviceBarrierFlag);
-  }
-#endif
-}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                              Multi-Node Dispatch Kernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-/*
- * Inter-node low-latency dispatch kernel.
- *
- * Similar to EpDispatchIntraNodeDeepepLLKernel but:
- * - Uses RDMA for remote ranks on different nodes
- * - Uses SHMEM for same-node ranks
- * - Packs messages with source token index for combine phase routing
-
-Phase 1: RESET (thread 0 only)
-├── Reset local counters: destPeTokenCounter, localPeTokenCounter, etc.
-├── Reset srcExpertTokenCounterMemObj (receives remote counts)
-├── Reset recvTokenNumMemObj (signal slots)
-└── CrossDeviceBarrier #1 (crossDeviceBarrierFlag)
-
-Phase 2: TOKEN DISPATCH (all warps)
-├── For each token:
-│   ├── Compute destPe, localExpert, destTokId
-│   ├── Update local counters (atomicAdd)
-│   ├── If REMOTE:
-│   │   ├── RDMA PUT: dispTokIdToSrcTokIdMemObj[destLinearTok] → destPe
-│   │   ├── RDMA PUT: shmemDispatchOutTokMemObj[baseOffset] → destPe
-│   │   ├── RDMA PUT: shmemOutScalesMemObj (if FP8) → destPe
-│   │   ├── RDMA PUT: shmemDispatchOutWeightsMemObj → destPe
-│   │   └── RDMA PUT: shmemOutIndicesMemObj → destPe
-│   └── If SAME-NODE:
-│       └── Direct memory writes to destPe's buffers
-└── Quiet all remote PEs after token dispatch loop
-
-Phase 3: COUNT EXCHANGE (per remote destPe)
-├── RDMA PUT: localPeTokenCounter → srcExpertTokenCounterMemObj on destPe
-├── Quiet each destPe after count puts
-└── Local grid barrier (dispatchGridBarrier)
-
-Phase 4: CROSS-DEVICE BARRIER #2 (crossDeviceBarrierFlag + 1)
-└── Ensures all count PUTs are globally visible
-
-Phase 5: SIGNAL SENDING (warp 0 only)
-├── For each destPe:
-│   ├── If REMOTE: RDMA PUT signal → recvTokenNumMemObj[myPe] on destPe
-│   └── If SAME-NODE: Direct store to signal slot
-└── Quiet after each remote signal
-
-Phase 6: SIGNAL RECEIVING & COUNT ACCUMULATION (warp 0 only)
-├── Poll recvTokenNumMemObj for signals from all srcPe
-├── __syncwarp() + __threadfence_system()
-├── Read destExpertTokenCounterMemObj (same-node counts)
-├── Read srcExpertTokenCounterMemObj (remote counts) ← USES AtomicLoadRelaxedSystem
-└── Sum counts → recvTokenCountPerExpert
-
-Phase 7: CROSS-DEVICE BARRIER #3 (crossDeviceBarrierFlag + 2)
-└── Final sync before kernel exit
-
- */
-
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
-  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  const int smId = blockIdx.x;
+  const int numSms = gridDim.x;
+  const int threadId = threadIdx.x;
+  const int warpId = threadId / warpSize;
+  const int laneId = threadId % warpSize;
+  const int warpNum = blockDim.x / warpSize;
+  const int globalWarpId = smId * warpNum + warpId;
+  const int globalWarpNum = numSms * warpNum;
+
+  const int myPe = config.rank;
+  const int npes = config.worldSize;
   const int gpuPerNode = config.gpuPerNode;
-  const int myNode = myPe / gpuPerNode;
+  const int numLocalExperts = config.numExpertPerRank;
+  const int numTopK = config.numExpertPerToken;
+  const int numTokens = args.curRankNumToken;
+  const int maxTokensPerRank = config.maxNumInpTokenPerRank;
+  const index_t expertCapacity = npes * maxTokensPerRank;
 
-#if INTERNODE_DEEPEP_DEBUG
-  // Debug: Print kernel config and pointers at start
-  if (globalWarpId == 0 && laneId == 0) {
-    printf("[DEBUG][Rank %d] Kernel start: gridDim.x=%d, blockDim.x=%d, globalWarpNum=%d\n",
-           myPe, gridDim.x, blockDim.x, globalWarpNum);
-    printf("[DEBUG][Rank %d] curRankNumToken=%d, numExpertPerToken=%d, totalIterations=%d\n",
-           myPe, args.curRankNumToken, config.numExpertPerToken,
-           args.curRankNumToken * config.numExpertPerToken);
-    printf("[DEBUG][Rank %d] tokenIndices=%p, inpTokenBuf=%p\n",
-           myPe, (void*)args.tokenIndices, (void*)args.inpTokenBuf);
-  }
-#endif
+  // ========== PHASE 1: TOKEN DISPATCH ==========
+  // SM-strided token processing: each SM handles tokens[smId, smId+numSms, smId+2*numSms, ...]
 
-  // Reset local counters and synchronize all ranks before using remote counters.
-  if (globalWarpId == 0 && laneId == 0) {
-    // Reset totalRecvTokenNum (normally reset by combine kernel, but needed for dispatch-only)
-    *args.totalRecvTokenNum = 0;
+  for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
+    // Each warp handles one top-k expert for this token
+    int destExpert = -1;
+    if (warpId < numTopK) {
+      destExpert = args.tokenIndices[tokenIdx * numTopK + warpId];
+    }
 
-    index_t* localExpertCounter =
-        args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
-    for (int e = 0; e < config.numExpertPerRank; ++e) {
-      localExpertCounter[e] = 0;
-    }
-    for (int pe = 0; pe < npes; ++pe) {
-      args.destPeTokenCounter[pe] = 0;
-    }
-    for (int node = 0; node < npes / gpuPerNode; ++node) {
-      args.destNodeTokenCounter[node] = 0;
-    }
-    // Reset local per-(destPe, localExpert) counters for inter-node dispatch
-    int localPeCounterSize = npes * config.numExpertPerRank;
-    for (int idx = 0; idx < localPeCounterSize; ++idx) {
-      args.localPeTokenCounter[idx] = 0;
-    }
-    // Reset srcExpertTokenCounterMemObj (receives remote counts via RDMA)
-    index_t* srcExpertCounter =
-        args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
-    for (int srcPe = 0; srcPe < npes; ++srcPe) {
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
-      }
-    }
-    // Reset dispatch grid barrier
-    args.dispatchGridBarrier[0] = 0;
-    // Reset dispTokOffset
-    args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    // Reset recvTokenNum signals
-    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-    for (int pe = 0; pe < npes; ++pe) {
-      recvTokenNums[pe] = 0;
-    }
-#if INTERNODE_DEEPEP_DEBUG
-    printf("[DEBUG][Rank %d] Dispatch start: reset complete, barrierFlag=%u, curRankNumToken=%d, numExpertPerToken=%d, totalTokensToDispatch=%d\n",
-           myPe, crossDeviceBarrierFlag, args.curRankNumToken, config.numExpertPerToken,
-           args.curRankNumToken * config.numExpertPerToken);
-#endif
-  }
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
-
-  if (args.tokenIndices && args.inpTokenBuf) {
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-#if INTERNODE_DEEPEP_DEBUG
-      // Debug: Print first few accesses to verify bounds
-      if (i < 5 && laneId == 0) {
-        printf("[DEBUG][Rank %d] Warp %d accessing tokenIndices[%d], ptr=%p\n",
-               myPe, globalWarpId, i, (void*)(args.tokenIndices + i));
-      }
-#endif
-      index_t destExpert = args.tokenIndices[i];
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
-      index_t destNode = destPe / gpuPerNode;
-      index_t destTokId = 0;
+    if (destExpert >= 0) {
+      int destPe = destExpert / numLocalExperts;
+      int localExpert = destExpert % numLocalExperts;
       bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
 
+      // Local slot assignment - NO remote atomics
+      // Each source rank gets reserved slots: [srcPe * maxTokensPerRank, (srcPe+1) * maxTokensPerRank)
+      index_t slotIdx = 0;
       if (laneId == 0) {
-        // Use source-rank-partitioned layout for ALL tokens (same-node and remote).
-        // Each source rank has a reserved section in each expert's buffer:
-        // [srcPe * maxNumInpTokenPerRank, (srcPe+1) * maxNumInpTokenPerRank)
-        // This avoids RDMA fetch atomics for remote ranks.
-
-        // Compute our slot within our reserved section.
-        // Use local counter partitioned by (destPe, localExpert).
-        // Index: destPe * numExpertPerRank + localExpert
-        //
-        // CRITICAL: Use SeqCst (sequential consistency) atomics for counter updates
-        // that must stay consistent with each other. SeqCst provides total ordering
-        // across all threads, ensuring localPeTokenCounter and destPeTokenCounter
-        // updates are visible together after the grid barrier.
-        // Relaxed atomics don't guarantee ordering between separate atomic operations,
-        // which can cause the 4-token discrepancy we were seeing.
-        index_t localCounterIdx = destPe * config.numExpertPerRank + localExpert;
-        index_t localSlot = core::AtomicAddSeqCstSystem(args.localPeTokenCounter + localCounterIdx, 1);
-
-        // Our destTokId within the expert buffer uses source-rank partitioning
-        destTokId = myPe * config.maxNumInpTokenPerRank + localSlot;
-
-        if (!isRemote) {
-          // For same-node ranks, use local atomicAdd on the expert counter
-          index_t* expertCounter =
-              args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-          core::AtomicAddSeqCstSystem(expertCounter + localExpert, 1);
-        }
-        // For remote ranks, we don't use RDMA atomic here.
-        // The counts are written via RDMA put after the main loop ends.
-        core::AtomicAddSeqCstSystem(args.destPeTokenCounter + destPe, 1);
-        if (isRemote) {
-          core::AtomicAddSeqCstSystem(args.destNodeTokenCounter + destNode, 1);
-        }
-        args.dispDestTokIdMap[i] = destExpert * expertCapacity + destTokId;
+        slotIdx = atomicAdd(args.atomicCounterPerExpert + destExpert, 1);
       }
-      destTokId = __shfl(destTokId, 0);
+      slotIdx = __shfl(slotIdx, 0);
+
+      // Compute destination token ID using source-rank partitioning
+      index_t destTokId = myPe * maxTokensPerRank + slotIdx;
       index_t destLinearTok = localExpert * expertCapacity + destTokId;
 
+      // Store mapping for combine phase
       if (laneId == 0) {
-        index_t srcTokMappingValue = static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId);
+        args.dispDestTokIdMap[tokenIdx * numTopK + warpId] = destExpert * expertCapacity + destTokId;
+      }
+
+      // Store source token ID mapping at destination
+      index_t srcTokMapping = myPe * maxTokensPerRank + tokenIdx;
+      if (laneId == 0) {
         if (isRemote) {
-          // For remote ranks, use RDMA put for the srcTokId mapping
           shmem::ShmemPutTypeImmNbiThread<index_t>(
               args.dispTokIdToSrcTokIdMemObj,
-              destLinearTok * sizeof(index_t),
-              srcTokMappingValue,
+              destLinearTok,
+              srcTokMapping,
               destPe);
         } else {
-          // For same-node ranks, use local atomic store
-          core::AtomicStoreRelaxedSystem(
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
-              srcTokMappingValue);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destLinearTok] = srcTokMapping;
         }
       }
 
-      // Copy weights and indices for same-node ranks
-      if (!isRemote) {
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destLinearTok * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destLinearTok * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        }
-      }
-
+      // Copy token data
       size_t baseOffset = destLinearTok * config.hiddenDim;
-      index_t srcTokOffset = srcTokId * config.hiddenDim;
+      size_t srcOffset = tokenIdx * config.hiddenDim;
 
-      if (isRemote) {
-        // For remote ranks, use RDMA
-        // First, pack and quantize the data locally, then issue RDMA put
-        if constexpr (kUseFP8) {
-          // FP8 quantization and RDMA
-          auto* localFp8Staging = reinterpret_cast<__hip_fp8_storage_t*>(
-              args.shmemStagingTokMemObj->template GetAs<uint8_t*>()) +
-              srcTokId * config.hiddenDim;
-          float* localScalesStaging = reinterpret_cast<float*>(
-              args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
-              config.maxNumInpTokenPerRank * config.hiddenDim * sizeof(__hip_fp8_storage_t)) +
-              srcTokId * (config.hiddenDim / detail::kNumPerChannels);
+      if constexpr (kUseFP8) {
+        // FP8 quantization and copy
+        auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
+            args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(isRemote ? myPe : destPe)) + baseOffset;
+        int numScales = config.hiddenDim / detail::kNumPerChannels;
 
-          int numScales = config.hiddenDim / detail::kNumPerChannels;
-          for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
-            int channelBase = scaleIdx * detail::kNumPerChannels;
-            float amax = 0.0f;
-            for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-              int offset = channelBase + j;
-              float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-              amax = fmaxf(amax, fabsf(v));
+        for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
+          int channelBase = scaleIdx * detail::kNumPerChannels;
+          float amax = detail::kFP8Margin;
+
+          // Find max absolute value in channel
+          for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
+            float v = static_cast<float>(args.inpTokenBuf[srcOffset + channelBase + j]);
+            amax = fmaxf(amax, fabsf(v));
+          }
+          amax = detail::QuarterWarpReduceMax(amax);
+
+          float scale = detail::DeepepFp8Scale(amax);
+          float scaleInv = detail::DeepepFp8ScaleInv(amax);
+
+          // Store inverse scale (one per channel group)
+          if (laneId == 0) {
+            if (isRemote) {
+              // Stage locally first, will RDMA put later
+              reinterpret_cast<float*>(
+                  args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
+                  maxTokensPerRank * config.hiddenDim)[tokenIdx * numScales + scaleIdx] = scaleInv;
+            } else {
+              args.shmemOutScalesMemObj->template GetAs<float*>(destPe)[destLinearTok * numScales + scaleIdx] = scaleInv;
             }
-            for (int mask = warpSize / 2; mask > 0; mask >>= 1)
-              amax = fmaxf(amax, __shfl_xor(amax, mask));
-            float scale = detail::DeepepFp8Scale(amax);
-            float scaleInv = detail::DeepepFp8ScaleInv(amax);
-            if (laneId == 0) {
-              localScalesStaging[scaleIdx] = scaleInv;
-            }
-            for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-              int offset = channelBase + j;
-              float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-              localFp8Staging[offset] = detail::CastFloatToFp8(v, scale);
-            }
+          }
+
+          // Quantize and store
+          for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
+            float v = static_cast<float>(args.inpTokenBuf[srcOffset + channelBase + j]);
+            destFp8[channelBase + j] = detail::CastFloatToFp8(v, scale);
+          }
+        }
+
+        __syncwarp();
+
+        // RDMA put for remote ranks
+        if (isRemote && laneId == 0) {
+          // Put FP8 data
+          shmem::ShmemPutMemNbiThread(
+              args.shmemDispatchOutTokMemObj,
+              baseOffset * sizeof(__hip_fp8_storage_t),
+              args.shmemDispatchOutTokMemObj,
+              baseOffset * sizeof(__hip_fp8_storage_t),
+              config.hiddenDim * sizeof(__hip_fp8_storage_t),
+              destPe, 0);
+
+          // Put scales
+          size_t stagingScalesOffset = maxTokensPerRank * config.hiddenDim + tokenIdx * numScales * sizeof(float);
+          shmem::ShmemPutMemNbiThread(
+              args.shmemOutScalesMemObj,
+              destLinearTok * numScales * sizeof(float),
+              args.shmemStagingTokMemObj,
+              stagingScalesOffset,
+              numScales * sizeof(float),
+              destPe, 0);
+        }
+      } else {
+        // BF16/FP32: direct copy
+        if (isRemote) {
+          // Stage locally first
+          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + tokenIdx * config.hiddenDim;
+          for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+            localStaging[j] = args.inpTokenBuf[srcOffset + j];
           }
           __syncwarp();
 
-          // Issue RDMA put for FP8 data using SymmMemObjPtr-based API
+          // RDMA put
           if (laneId == 0) {
-            // Source offset within shmemStagingTokMemObj
-            size_t srcFp8Offset = srcTokId * config.hiddenDim * sizeof(__hip_fp8_storage_t);
-            // Destination offset within shmemDispatchOutTokMemObj
-            size_t destFp8Offset = baseOffset * sizeof(__hip_fp8_storage_t);
             shmem::ShmemPutMemNbiThread(
-                args.shmemDispatchOutTokMemObj, destFp8Offset,
-                args.shmemStagingTokMemObj, srcFp8Offset,
-                config.hiddenDim * sizeof(__hip_fp8_storage_t), destPe, 0);
-
-            // Scales offset
-            size_t stagingScalesBase = config.maxNumInpTokenPerRank * config.hiddenDim * sizeof(__hip_fp8_storage_t);
-            size_t srcScalesOffset = stagingScalesBase + srcTokId * numScales * sizeof(float);
-            size_t destScalesOffset = destLinearTok * numScales * sizeof(float);
-            shmem::ShmemPutMemNbiThread(
-                args.shmemOutScalesMemObj, destScalesOffset,
-                args.shmemStagingTokMemObj, srcScalesOffset,
-                numScales * sizeof(float), destPe, 0);
+                args.shmemDispatchOutTokMemObj,
+                baseOffset * sizeof(T),
+                args.shmemStagingTokMemObj,
+                tokenIdx * config.hiddenDim * sizeof(T),
+                config.hiddenDim * sizeof(T),
+                destPe, 0);
           }
         } else {
-          // BF16: stage to symmetric buffer then RDMA put
-          // First copy to staging buffer
-          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() +
-                            srcTokId * config.hiddenDim;
+          // Same-node: direct write
+          T* destPtr = args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
-            localStaging[j] = args.inpTokenBuf[srcTokOffset + j];
-          }
-          __syncwarp();
-
-          // Issue RDMA put using SymmMemObjPtr-based API
-          if (laneId == 0) {
-            size_t srcOffset = srcTokId * config.hiddenDim * sizeof(T);
-            size_t destOffset = baseOffset * sizeof(T);
-            shmem::ShmemPutMemNbiThread(
-                args.shmemDispatchOutTokMemObj, destOffset,
-                args.shmemStagingTokMemObj, srcOffset,
-                config.hiddenDim * sizeof(T), destPe, 0);
+            destPtr[j] = args.inpTokenBuf[srcOffset + j];
           }
         }
+      }
 
-        // Also send weights and indices via RDMA for remote ranks
-        // First stage to local symmetric buffers, then issue RDMA puts
-        if (args.weightsBuf) {
-          float* localWeightsStaging = args.shmemInpWeightsMemObj->template GetAs<float*>() +
-                                       srcTokId * config.numExpertPerToken;
-          if (laneId < config.numExpertPerToken) {
-            localWeightsStaging[laneId] = args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+      // Copy weights and indices
+      if (!isRemote) {
+        if (laneId < numTopK) {
+          if (args.weightsBuf) {
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)
+                [destLinearTok * numTopK + laneId] = args.weightsBuf[tokenIdx * numTopK + laneId];
           }
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe)
+              [destLinearTok * numTopK + laneId] = args.tokenIndices[tokenIdx * numTopK + laneId];
         }
-        index_t* localIndicesStaging = args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-                                       srcTokId * config.numExpertPerToken;
-        if (laneId < config.numExpertPerToken) {
-          localIndicesStaging[laneId] = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+      } else {
+        // Stage and RDMA put weights/indices for remote
+        if (args.weightsBuf && laneId < numTopK) {
+          args.shmemInpWeightsMemObj->template GetAs<float*>()[tokenIdx * numTopK + laneId] =
+              args.weightsBuf[tokenIdx * numTopK + laneId];
+        }
+        if (laneId < numTopK) {
+          args.shmemInpIndicesMemObj->template GetAs<index_t*>()[tokenIdx * numTopK + laneId] =
+              args.tokenIndices[tokenIdx * numTopK + laneId];
         }
         __syncwarp();
 
         if (laneId == 0) {
           if (args.weightsBuf) {
-            size_t srcWeightsOffset = srcTokId * config.numExpertPerToken * sizeof(float);
-            size_t destWeightsOffset = destLinearTok * config.numExpertPerToken * sizeof(float);
             shmem::ShmemPutMemNbiThread(
-                args.shmemDispatchOutWeightsMemObj, destWeightsOffset,
-                args.shmemInpWeightsMemObj, srcWeightsOffset,
-                config.numExpertPerToken * sizeof(float), destPe, 0);
+                args.shmemDispatchOutWeightsMemObj,
+                destLinearTok * numTopK * sizeof(float),
+                args.shmemInpWeightsMemObj,
+                tokenIdx * numTopK * sizeof(float),
+                numTopK * sizeof(float),
+                destPe, 0);
           }
-          size_t srcIndicesOffset = srcTokId * config.numExpertPerToken * sizeof(index_t);
-          size_t destIndicesOffset = destLinearTok * config.numExpertPerToken * sizeof(index_t);
           shmem::ShmemPutMemNbiThread(
-              args.shmemOutIndicesMemObj, destIndicesOffset,
-              args.shmemInpIndicesMemObj, srcIndicesOffset,
-              config.numExpertPerToken * sizeof(index_t), destPe, 0);
-        }
-      } else {
-        // For same-node ranks, use SHMEM (same as intranode)
-        if constexpr (kUseFP8) {
-          auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
-              args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
-          int numScales = config.hiddenDim / detail::kNumPerChannels;
-          for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
-            int channelBase = scaleIdx * detail::kNumPerChannels;
-            float amax = 0.0f;
-            for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-              int offset = channelBase + j;
-              float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-              amax = fmaxf(amax, fabsf(v));
-            }
-            for (int mask = warpSize / 2; mask > 0; mask >>= 1)
-              amax = fmaxf(amax, __shfl_xor(amax, mask));
-            float scale = detail::DeepepFp8Scale(amax);
-            float scaleInv = detail::DeepepFp8ScaleInv(amax);
-            if (laneId == 0) {
-              args.shmemOutScalesMemObj->template GetAs<float*>(destPe)
-                  [destLinearTok * numScales + scaleIdx] = scaleInv;
-            }
-            for (int j = laneId; j < detail::kNumPerChannels; j += warpSize) {
-              int offset = channelBase + j;
-              float v = static_cast<float>(args.inpTokenBuf[srcTokOffset + offset]);
-              destFp8[offset] = detail::CastFloatToFp8(v, scale);
-            }
-          }
-        } else {
-          core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
-                         args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+              args.shmemOutIndicesMemObj,
+              destLinearTok * numTopK * sizeof(index_t),
+              args.shmemInpIndicesMemObj,
+              tokenIdx * numTopK * sizeof(index_t),
+              numTopK * sizeof(index_t),
+              destPe, 0);
         }
       }
-    }
-  }
 
-  // Drain token RDMA operations before proceeding to count exchange.
-  // Each warp issued RDMA puts for its tokens, so lane 0 of each warp drains its queue.
-  // Using lane 0 only (320 threads) avoids CQ lock contention from all 20480 threads.
-  {
-    __syncthreads();  // Ensure all warps finished the main loop
-
-    // Lane 0 of each warp calls quiet to drain its token RDMA operations
-    if (laneId == 0) {
-      shmem::ShmemQuietThread();
+      // Signal dispatch completion for this token
+      __syncwarp();
+      if (laneId == 0) {
+        detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
+      }
     }
+
     __syncthreads();
-
-    // Memory fence to ensure all local writes are visible
-    __threadfence_system();
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_AFTER_TOKEN_DISPATCH
-    if (globalWarpId == 0 && laneId == 0) {
-      printf("[DEBUG][Rank %d] After token dispatch: destPeTokenCounter = [", myPe);
-      for (int pe = 0; pe < npes; ++pe) {
-        printf("%d%s", args.destPeTokenCounter[pe], pe < npes-1 ? ", " : "");
-      }
-      printf("]\n");
-      // Also print localPeTokenCounter totals per destPe
-      printf("[DEBUG][Rank %d] localPeTokenCounter totals per destPe = [", myPe);
-      for (int pe = 0; pe < npes; ++pe) {
-        index_t total = 0;
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          total += args.localPeTokenCounter[pe * config.numExpertPerRank + e];
-        }
-        printf("%d%s", total, pe < npes-1 ? ", " : "");
-      }
-      printf("]\n");
-      // Print destNodeTokenCounter (remote tokens per node)
-      int nNodes = npes / gpuPerNode;
-      printf("[DEBUG][Rank %d] destNodeTokenCounter (remote only) = [", myPe);
-      for (int node = 0; node < nNodes; ++node) {
-        printf("%d%s", args.destNodeTokenCounter[node], node < nNodes-1 ? ", " : "");
-      }
-      printf("]\n");
-      // Compute total tokens sent
-      index_t totalSent = 0;
-      for (int pe = 0; pe < npes; ++pe) {
-        totalSent += args.destPeTokenCounter[pe];
-      }
-      printf("[DEBUG][Rank %d] Total tokens sent = %d\n", myPe, totalSent);
-    }
-#endif
   }
 
-  // After processing all tokens, use RDMA put with signal to write per-(srcPe, localExpert)
-  // counts to each remote destination rank. Using ShmemPutMemNbiSignalThread ensures
-  // hardware-enforced ordering: when the signal arrives, the data is guaranteed visible.
-  // This avoids the race condition where separate count puts and signals can arrive
-  // out of order on network RDMA.
-  //
-  // localPeTokenCounter[destPe * numExpertPerRank + localExpert] contains the count
-  // of tokens sent from this rank (myPe) to (destPe, localExpert).
-  // We stage this to our local portion of srcExpertTokenCounterMemObj, then RDMA put
-  // with signal to destPe.
-  //
-  // IMPORTANT: We serialize the count puts to avoid a staging race condition.
-  // All warps use the same staging area (myPe * numExpertPerRank), so parallel puts
-  // would cause data corruption. The count exchange is not performance-critical.
-  {
-    // Grid-level barrier to ensure ALL blocks have completed their token dispatch
-    // before reading the counters. __syncthreads() only syncs within a block, but
-    // the atomicAdd updates to localPeTokenCounter happen across all 40 blocks.
-    // Without this barrier, block 0 may read partial counts while other blocks
-    // are still updating them.
-    //
-    // We use a two-phase barrier with a release flag to avoid reset race:
-    // - Phase 1: All lane 0s increment arrival counter (dispatchGridBarrier[0])
-    // - Warp 0, lane 0 waits for all arrivals, then sets release flag (dispatchGridBarrier[1])
-    // - All other lane 0s wait for release flag
-    // - Phase 2: All lane 0s increment again to signal they've passed
-    // - Warp 0, lane 0 waits for all to pass, then resets both counters
-    //
-    // CRITICAL: Use __threadfence_system() to ensure all atomic writes (including
-    // localPeTokenCounter and destPeTokenCounter updates) are globally visible across
-    // all L2 cache partitions before we enter the barrier. Without system-level fence,
-    // atomic writes may be stuck in L2 cache and not visible to other blocks.
-    __threadfence_system();  // Ensure all atomics are globally visible
-    __syncthreads();  // Sync within block first
+  // ========== PHASE 2: EXPERT COUNT AGGREGATION ==========
+  // Last warp in each SM counts expected tokens per expert and adds finish tag offset
 
-    // Phase 1: Count arrivals and wait for release
-    // CRITICAL: Use system-scope atomics for barrier to ensure proper ordering
-    // with the system-scope counter reads/writes after the barrier.
+  if (warpId == warpNum - 1) {
+    // Count tokens for each expert this SM is responsible for
+    for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
+      for (int k = laneId; k < numTopK; k += warpSize) {
+        int expert = args.tokenIndices[tokenIdx * numTopK + k];
+        if (expert >= 0 && expert < npes * numLocalExperts) {
+          // This token was dispatched to this expert
+          // We need to track expected count per expert for finish counter
+        }
+      }
+    }
+
+    // Add finish tag offset so counter reaches FINISHED_SUM_TAG when all dispatched
+    // For multinode, we add FINISHED_SUM_TAG twice (once here, once after RDMA quiet)
+    for (int expert = laneId; expert < npes * numLocalExperts; expert += warpSize) {
+      uint32_t count = args.atomicCounterPerExpert[expert];
+      if (count > 0) {
+        // Add offset: FINISHED_SUM_TAG - count
+        // When all tokens dispatched (finish_counter = count), total = FINISHED_SUM_TAG
+        uint32_t offset = detail::kFinishedSumTag - count;
+        detail::AtomicAddRelease(args.finishCounterPerExpert + expert, offset);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // ========== PHASE 3: RDMA QUIET ==========
+  // Drain all pending RDMA puts before sending count signals
+
+  if (threadId == 0) {
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
+
+  // Add second finish tag for multinode (ensures RDMA puts are visible before count signal)
+  if (warpId == warpNum - 1) {
+    for (int expert = laneId; expert < npes * numLocalExperts; expert += warpSize) {
+      uint32_t count = args.atomicCounterPerExpert[expert];
+      if (count > 0) {
+        detail::AtomicAddRelease(args.finishCounterPerExpert + expert, detail::kFinishedSumTag);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // ========== PHASE 4: COUNT SIGNAL SENDING ==========
+  // Wait for finish counter to reach 2 * FINISHED_SUM_TAG, then send negative-encoded count
+
+  // Each warp handles one expert
+  for (int expert = globalWarpId; expert < npes * numLocalExperts; expert += globalWarpNum) {
     if (laneId == 0) {
-      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1u);  // Count arrival
-    }
+      uint32_t count = args.atomicCounterPerExpert[expert];
+      if (count > 0) {
+        // Wait for dispatch completion
+        uint32_t expected = 2 * detail::kFinishedSumTag;
+        while (detail::AtomicLoadAcquire(args.finishCounterPerExpert + expert) != expected) {
+          // spin
+        }
 
-    // Warp 0, lane 0 waits for all arrivals and sets release flag
-    // Use SeqCst for strongest memory ordering at barrier synchronization points
-    if (globalWarpId == 0 && laneId == 0) {
-      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[0]) < globalWarpNum) {
-        // SeqCst provides full barrier, no extra fence needed in loop
-      }
-      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[1], 1u);  // Set release flag
-    }
-
-    // All other lane 0s wait for release flag
-    // Use SeqCst for consistency with SeqCst writes
-    if (laneId == 0 && globalWarpId != 0) {
-      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[1]) == 0u) {
-        // SeqCst provides full barrier, no extra fence needed in loop
-      }
-    }
-    __syncwarp();  // All lanes wait for their lane 0
-
-    // Phase 2: Signal that we've passed the barrier (for safe reset)
-    if (laneId == 0) {
-      core::AtomicAddRelaxedSystem(&args.dispatchGridBarrier[0], 1u);  // Now barrier[0] goes to 2*globalWarpNum
-    }
-
-    // Warp 0, lane 0 waits for all to pass, then resets
-    if (globalWarpId == 0 && laneId == 0) {
-      while (core::AtomicLoadSeqCstSystem(&args.dispatchGridBarrier[0]) < 2 * globalWarpNum) {
-        // SeqCst provides full barrier, no extra fence needed in loop
-      }
-      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[0], 0u);
-      core::AtomicStoreSeqCstSystem(&args.dispatchGridBarrier[1], 0u);
-    }
-    __syncthreads();  // Ensure reset is visible to all threads in block
-
-    // After barrier, ensure we see all atomic writes from other blocks.
-    // This is critical for reading localPeTokenCounter/destPeTokenCounter.
-    __threadfence_system();
-
-    // Only warp 0, lane 0 handles all remote count puts (serialized to avoid staging race)
-    if (globalWarpId == 0 && laneId == 0) {
-      // Get pointers to local staging area (our portion of srcExpertTokenCounterMemObj)
-      index_t* localSrcExpertCounter =
-          args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
-
-      for (int destPe = 0; destPe < npes; ++destPe) {
+        int destPe = expert / numLocalExperts;
+        int localExpert = expert % numLocalExperts;
         bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+
+        // Send negative-encoded count: -count - 1
+        // This combines count and signal in one atomic operation
+        int64_t encodedCount = -static_cast<int64_t>(count) - 1;
+        int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>(destPe) +
+                              localExpert * npes + myPe;
+
         if (isRemote) {
-          // Stage counts to our local portion of srcExpertTokenCounterMemObj
-          // Use slots [myPe * numExpertPerRank, myPe * numExpertPerRank + numExpertPerRank)
-          for (int e = 0; e < config.numExpertPerRank; ++e) {
-            index_t localCounterIdx = destPe * config.numExpertPerRank + e;
-            // Use SeqCst for strongest ordering - ensures we see updates from ALL blocks
-            index_t count = core::AtomicLoadSeqCstSystem(args.localPeTokenCounter + localCounterIdx);
-            localSrcExpertCounter[myPe * config.numExpertPerRank + e] = count;
-          }
-
-          // Source: our local srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
-          size_t srcOffset = myPe * config.numExpertPerRank * sizeof(index_t);
-          // Dest: remote srcExpertTokenCounterMemObj at [myPe * numExpertPerRank]
-          size_t destOffset = myPe * config.numExpertPerRank * sizeof(index_t);
-          size_t countBytes = config.numExpertPerRank * sizeof(index_t);
-          // Send count data via RDMA put (signal will be sent separately after barrier)
-          // NOTE: Don't call ShmemQuietThread per-destination - it blocks and causes deadlock.
-          // The CrossDeviceBarrier after this loop ensures all RDMA puts complete.
-          shmem::ShmemPutMemNbiThread(
-              args.srcExpertTokenCounterMemObj, destOffset,
-              args.srcExpertTokenCounterMemObj, srcOffset,
-              countBytes, destPe, 0);
-
-#if INTERNODE_RDMA_DELAY_CYCLES > 0
-          // Configurable delay after RDMA operations (simulates printf timing effect)
-          internode_ll::SpinDelayCycles(INTERNODE_RDMA_DELAY_CYCLES);
-#endif
-
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_SEND_COUNTS
-          // Verify what was staged vs what localPeTokenCounter says
-          index_t stagedTotal = 0;
-          index_t localCounterTotal = 0;
-          for (int e = 0; e < config.numExpertPerRank; ++e) {
-            stagedTotal += localSrcExpertCounter[myPe * config.numExpertPerRank + e];
-            // Use SeqCst for consistent reads
-            localCounterTotal += core::AtomicLoadSeqCstSystem(
-                args.localPeTokenCounter + destPe * config.numExpertPerRank + e);
-          }
-          // Also read destPeTokenCounter with SeqCst for comparison
-          index_t destPeTotal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe);
-          printf("[DEBUG][Rank %d] SEND to destPe=%d: localCounter=%d, staged=%d, destPeCounter=%d\n",
-                 myPe, destPe, localCounterTotal, stagedTotal, destPeTotal);
-          if (stagedTotal != localCounterTotal) {
-            printf("[DEBUG][Rank %d] STAGING BUG: staged=%d != localCounter=%d for destPe=%d\n",
-                   myPe, stagedTotal, localCounterTotal, destPe);
-          }
-          if (localCounterTotal != destPeTotal) {
-            printf("[DEBUG][Rank %d] COUNTER BUG: localCounter=%d != destPeCounter=%d for destPe=%d\n",
-                   myPe, localCounterTotal, destPeTotal, destPe);
-          }
-#endif
+          shmem::ShmemAtomicTypeNonFetchThread<int64_t>(
+              args.rdmaRecvCountMemObj,
+              (localExpert * npes + myPe) * sizeof(int64_t),
+              encodedCount,
+              core::atomicType::AMO_ADD,
+              destPe, 0);
+          shmem::ShmemQuietThread(destPe);
+        } else {
+          core::AtomicStoreReleaseSystem(signalSlot, encodedCount);
         }
       }
     }
-    __syncthreads();  // All threads wait for count exchange to complete
   }
 
-  __threadfence_system();
-  // CRITICAL: Use system-scope atomics to match system-scope reads in ShmemUint32WaitUntilEquals.
-  if (laneId == 0) core::AtomicAddRelaxedSystem(args.dispatchGridBarrier, 1u);
+  // ========== PHASE 5: GRID BARRIER ==========
+  // Synchronize all blocks before receiving
 
-  // Wait for all local warps to complete their count+signal puts.
-  if (globalWarpId == 0 && laneId == 0) {
-    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    core::AtomicStoreSeqCstSystem(args.dispatchGridBarrier, 0u);
-  }
-  __syncthreads();
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
 
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts in the token dispatch loop (lane 0), so each warp must drain its own queue.
-  // Using lane 0 only (320 threads) avoids the massive CQ lock contention that
-  // occurs when all 20480 threads call quiet simultaneously.
-  if (laneId == 0) {
-    shmem::ShmemQuietThread();
-  }
-  __syncthreads();
+  // ========== PHASE 6: RECEIVE + UNPACK ==========
+  // Poll for negative-encoded counts, allocate packed buffer space, copy tokens
 
-  // Cross-device barrier to ensure all ranks have sent their count+signal RDMA puts.
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 1);
+  // Each warp handles one (localExpert, srcRank) pair
+  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
+      if (srcPe == myPe) continue;  // Skip self
 
-  // Signal token counts to ALL destination ranks (after barrier ensures synchronization)
-  // Use direct store for same-node, RDMA put for remote.
-  // NOTE: We send signals AFTER the CrossDeviceBarrier to ensure all ranks have
-  // completed their count puts before signals are sent. The bundled put+signal
-  // earlier was not reliable for multi-GPU per node configurations.
-  if (globalWarpId == 0) {
-    // Ensure all lanes are synchronized before signal sending
-    __syncwarp();
-    __threadfence_system();
-#if INTERNODE_DEEPEP_DEBUG
-    if (laneId == 0) {
-      printf("[DEBUG][Rank %d] Signal send phase starting...\n", myPe);
-    }
-#endif
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-      // Use SeqCst for strongest memory ordering - ensures all prior writes are visible
-      index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
+      if (laneId == 0) {
+        // Poll for signal
+        int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>() +
+                              localExpert * npes + srcPe;
+        int64_t rawCount = 0;
+        while ((rawCount = detail::AtomicLoadAcquireSystem(signalSlot)) == 0) {
+          // spin with timeout could be added here
+        }
 
-#if INTERNODE_DEEPEP_DEBUG
-      printf("[DEBUG][Rank %d] Sending signal to destPe=%d (isRemote=%d, numTokenSignal=%d)\n",
-             myPe, destPe, isRemote, numTokenSignal);
-#endif
+        // Decode count
+        int numRecvTokens = static_cast<int>(-rawCount - 1);
 
-      if (isRemote) {
-        // For remote ranks, use RDMA put for the signal (separate from count data)
-        // NOTE: We cannot access remote symmetric memory directly - only via RDMA.
-        // Don't call quiet per-destination - it blocks. We'll fence after all puts.
-        shmem::ShmemPutTypeImmNbiThread<index_t>(
-            args.recvTokenNumMemObj,
-            myPe * sizeof(index_t),
-            numTokenSignal,
-            destPe);
-      } else {
-        // For same-node ranks, we CAN access memory directly via P2P
-        // Use SeqCst for strongest memory ordering on signal writes
-        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-        core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
+        // Allocate space in packed output buffer
+        index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
+
+        // Store layout info for combine kernel
+        args.layoutRange[localExpert * npes + srcPe] =
+            internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
+
+        // Add to total recv count
+        atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
+        atomicAdd(args.totalRecvTokenNum, numRecvTokens);
+
+        // Reset signal for next iteration
+        core::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
       }
     }
-    // Sync warp and fence to ensure all RDMA puts are visible
-    __syncwarp();
-    __threadfence_system();
-
-    // Drain signal RDMA puts before waiting for incoming signals
-    // Each lane in warp 0 issued RDMA puts, so lane 0 drains
-    if (laneId == 0) {
-      shmem::ShmemQuietThread();
-    }
-    __syncwarp();
-
-#if INTERNODE_DEEPEP_DEBUG
-    if (laneId == 0) {
-      printf("[DEBUG][Rank %d] Signal send phase complete\n", myPe);
-    }
-#endif
   }
 
-  // Wait for token counts from all source ranks.
-  // NOTE: ShmemPutMemNbiSignalThread does NOT guarantee that count data is visible
-  // when the signal arrives on network RDMA. The poll-then-validate-then-retry loop
-  // below works around this by retrying until the data is consistent.
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-#if INTERNODE_DEEPEP_DEBUG
-    if (laneId == 0) {
-      printf("[DEBUG][Rank %d] Signal receive phase starting, waiting for %d source ranks...\n", myPe, npes);
-    }
-#endif
+  // Also handle same-node signals (they were set with local atomics)
+  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
     for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
-      index_t* signal = recvTokenNums + srcPe;
-#if INTERNODE_DEEPEP_DEBUG
-      printf("[DEBUG][Rank %d] Waiting for signal from srcPe=%d (current value=%d)...\n",
-             myPe, srcPe, core::AtomicLoadSeqCstSystem(signal));
-#endif
-      // Use RDMA-aware polling with SeqCst to see remote RDMA writes
-      index_t recvTokenNum = internode_ll::RdmaWaitUntilGreaterThan(signal, (index_t)0, myPe, srcPe) - 1;
-      // Use SeqCst when clearing signal to ensure proper ordering
-      core::AtomicStoreSeqCstSystem(signal, (index_t)0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-#if INTERNODE_DEEPEP_DEBUG
-      printf("[DEBUG][Rank %d] Received signal from srcPe=%d: recvTokenNum=%d\n",
-             myPe, srcPe, recvTokenNum);
-#endif
-    }
-    // Ensure all lanes have received their signals before lane 0 reads counts.
-    __syncwarp();
-    // Memory fence to ensure count data (bundled with signal) is visible
-    __threadfence_system();
-
-    if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-
-      index_t* localExpertCounter =
-          args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
-      index_t* srcExpertCounter =
-          args.srcExpertTokenCounterMemObj->template GetAs<index_t*>();
-
-      // Expected total from signals (already accumulated in totalRecvTokenNum)
-      index_t expectedTotal = *args.totalRecvTokenNum;
-
-#if INTERNODE_DEEPEP_DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
-      printf("[DEBUG][Rank %d] Starting count validation: expectedTotal=%d (from signals)\n",
-             myPe, expectedTotal);
-#endif
-
-      // Poll-then-validate-then-retry: The signal may arrive before count data is visible.
-      // Keep retrying until the per-expert counts sum matches the signal total.
-      // This works around RDMA put+signal not guaranteeing visibility ordering.
-      int retryCount = 0;
-      const int maxRetries = 1000000;  // Generous retry limit
-      index_t readTotal = 0;
-      index_t sameNodeTotal = 0;
-      index_t remoteTotal = 0;
-
-      do {
-        readTotal = 0;
-        sameNodeTotal = 0;
-        remoteTotal = 0;
-
-        // Sum expert counts from all source ranks
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          // Start with same-node counts
-          index_t totalCount = localExpertCounter[e];
-          sameNodeTotal += localExpertCounter[e];
-          // Add remote counts from srcExpertTokenCounterMemObj
-          // Use SeqCst to ensure we see all RDMA-written data
-          for (int srcPe = 0; srcPe < npes; ++srcPe) {
-            bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-            if (isRemote) {
-              index_t srcCount = core::AtomicLoadSeqCstSystem(
-                  srcExpertCounter + srcPe * config.numExpertPerRank + e);
-              totalCount += srcCount;
-              remoteTotal += srcCount;
-            }
-          }
-          args.recvTokenCountPerExpert[e] = totalCount;
-          readTotal += totalCount;
-        }
-
-        if (readTotal == expectedTotal) {
-          break;  // Data is consistent, exit retry loop
-        }
-
-        // Data not yet visible, fence and retry
-        __threadfence_system();
-        retryCount++;
-
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_RECV_COUNTS
-        // Print first mismatch with per-srcPe breakdown to compare against sender
-        if (retryCount == 1) {
-          printf("[DEBUG][Rank %d] FIRST READ MISMATCH: read=%d (sameNode=%d, remote=%d), expected=%d\n",
-                 myPe, readTotal, sameNodeTotal, remoteTotal, expectedTotal);
-          // Print per-srcPe totals for comparison with sender DEBUG_SEND_COUNTS
-          for (int srcPe = 0; srcPe < npes; ++srcPe) {
-            bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-            if (isRemote) {
-              index_t srcPeTotal = 0;
-              for (int e = 0; e < config.numExpertPerRank; ++e) {
-                srcPeTotal += core::AtomicLoadSeqCstSystem(
-                    srcExpertCounter + srcPe * config.numExpertPerRank + e);
-              }
-              printf("[DEBUG][Rank %d] RECV from srcPe=%d: read=%d\n", myPe, srcPe, srcPeTotal);
-            }
-          }
-        }
-        // Print progress periodically
-        if (retryCount % 100000 == 0) {
-          printf("[DEBUG][Rank %d] Retry %d: read=%d (sameNode=%d, remote=%d), expected=%d, diff=%d\n",
-                 myPe, retryCount, readTotal, sameNodeTotal, remoteTotal, expectedTotal, expectedTotal - readTotal);
-        }
-#endif
-
-        if (retryCount >= maxRetries) {
-          printf("[ERROR][Rank %d] Count validation failed after %d retries: read=%d, expected=%d\n",
-                 myPe, retryCount, readTotal, expectedTotal);
-          break;
-        }
-      } while (true);
-
-#if INTERNODE_DEEPEP_DEBUG_RECV_COUNTS || INTERNODE_DEEPEP_DEBUG
-      printf("[DEBUG][Rank %d] RECV COUNTS: read=%d, signal=%d, retries=%d\n",
-             myPe, readTotal, expectedTotal, retryCount);
-#endif
-
-      // Reset counters for next dispatch
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        localExpertCounter[e] = 0;
-      }
-      for (int srcPe = 0; srcPe < npes; ++srcPe) {
-        args.destPeTokenCounter[srcPe] = 0;
-        for (int e = 0; e < config.numExpertPerRank; ++e) {
-          srcExpertCounter[srcPe * config.numExpertPerRank + e] = 0;
+      if (!internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode) && srcPe != myPe) {
+        int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>() +
+                              localExpert * npes + srcPe;
+        int64_t rawCount = core::AtomicLoadAcquireSystem(signalSlot);
+        if (rawCount != 0) {
+          int numRecvTokens = static_cast<int>(-rawCount - 1);
+          index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
+          args.layoutRange[localExpert * npes + srcPe] =
+              internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
+          atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
+          atomicAdd(args.totalRecvTokenNum, numRecvTokens);
+          core::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
         }
       }
-#if INTERNODE_DEEPEP_DEBUG || DEBUG_FINAL_SUMMARY
-      // Print final summary (sum only, not per-expert)
-      index_t finalSum = 0;
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        finalSum += args.recvTokenCountPerExpert[e];
-      }
-      printf("[DEBUG][Rank %d] FINAL: recvTokenCountPerExpert sum=%d\n", myPe, finalSum);
-#endif
     }
   }
 
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
-  // avoids massive CQ lock contention from all 20480 threads calling quiet.
-  if (laneId == 0) {
-    shmem::ShmemQuietThread();
-  }
   __syncthreads();
-
-  // Final barrier to ensure all ranks have completed dispatch before kernel exits.
-  // This prevents race conditions where one rank starts validation while another
-  // is still processing RDMA operations.
-  // Note: We use +2 because +1 was used for the mid-dispatch count sync barrier.
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag + 2);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                              Multi-Node Combine Kernel                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-/*
- * Inter-node low-latency combine kernel.
- *
- * Similar to EpCombineIntraNodeDeepepLLKernel but:
- * - Uses RDMA to send expert outputs back to remote source ranks
- * - Uses SHMEM for same-node ranks
- */
-
 template <typename T, bool kUseFP8, bool kUseWeights>
 __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-  int myPe = config.rank;
+  const int smId = blockIdx.x;
+  const int numSms = gridDim.x;
+  const int threadId = threadIdx.x;
+  const int warpId = threadId / warpSize;
+  const int laneId = threadId % warpSize;
+  const int warpNum = blockDim.x / warpSize;
+  const int globalWarpId = smId * warpNum + warpId;
+  const int globalWarpNum = numSms * warpNum;
+
+  const int myPe = config.rank;
+  const int npes = config.worldSize;
   const int gpuPerNode = config.gpuPerNode;
+  const int numLocalExperts = config.numExpertPerRank;
+  const int numTopK = config.numExpertPerToken;
+  const int numTokens = args.curRankNumToken;
+  const index_t expertCapacity = npes * config.maxNumInpTokenPerRank;
 
-  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
-  const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
-  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  // ========== PHASE 1: SEND EXPERT OUTPUTS ==========
+  // Copy expert outputs to staging buffer and RDMA put to source ranks
 
-  // Step 1: Copy expert outputs to symmetric combine buffer for same-node access
-  // and issue RDMA puts for remote ranks.
-  // With source-rank-partitioned slots, each source PE has slots at:
-  // [srcPe * maxNumInpTokenPerRank, (srcPe+1) * maxNumInpTokenPerRank)
-  // We iterate through all source PEs and check for valid entries.
-  if (args.config.useExternalInpBuffer) {
-    for (int e = 0; e < config.numExpertPerRank; ++e) {
-      // Iterate through all source PEs
-      for (int srcPe = 0; srcPe < config.worldSize; ++srcPe) {
-        index_t slotBase = srcPe * config.maxNumInpTokenPerRank;
-        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    for (int srcPe = 0; srcPe < npes; ++srcPe) {
+      if (srcPe == myPe) continue;
 
-        // Each warp handles a portion of this srcPe's slots
-        for (int localSlot = globalWarpId; localSlot < config.maxNumInpTokenPerRank;
-             localSlot += globalWarpNum) {
-          index_t slot = slotBase + localSlot;
-          index_t linear = e * expertCapacity + slot;
+      // Get layout info from dispatch phase
+      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
+      int numTokensToSend, offset;
+      internode_ll::Unpack2(layout, numTokensToSend, offset);
 
-          // Check if this slot has valid data (srcInfo != -1)
-          // Read at lane 0 and broadcast to all lanes
-          index_t srcInfo;
+      if (numTokensToSend == 0) continue;
+
+      bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+
+      // Each warp handles a subset of tokens
+      for (int tokenIdx = offset + globalWarpId; tokenIdx < offset + numTokensToSend; tokenIdx += globalWarpNum) {
+        index_t srcTokId = tokenIdx;  // Linear index in packed buffer
+        index_t linear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + (tokenIdx - offset);
+
+        if (isRemote) {
+          // Stage and RDMA put
+          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
+          for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+            localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
+          }
+          __syncwarp();
+
           if (laneId == 0) {
-            srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
+            shmem::ShmemPutMemNbiThread(
+                args.shmemCombineOutTokMemObj,
+                srcTokId * config.hiddenDim * sizeof(T),
+                args.shmemStagingTokMemObj,
+                linear * config.hiddenDim * sizeof(T),
+                config.hiddenDim * sizeof(T),
+                srcPe, 0);
           }
-          srcInfo = __shfl(srcInfo, 0);
-
-          if (srcInfo == static_cast<index_t>(-1)) {
-            continue;  // Slot not used, all lanes skip together
-          }
-
-          index_t srcTokId = srcInfo % config.maxNumInpTokenPerRank;
-
-          if (isRemote) {
-            // For remote ranks, first stage to symmetric buffer, then RDMA put
-            // Use shmemStagingTokMemObj (known to work from dispatch) as source.
-            // Use linear offset for staging to avoid race conditions between warps.
-            T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() +
-                              linear * config.hiddenDim;
-            for (int j = laneId; j < config.hiddenDim; j += warpSize) {
-              localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
-            }
-            __syncwarp();
-
-            // Use warp-level RDMA put like the legacy internode kernel does.
-            // Element offsets (not byte offsets) and element counts are used.
-            size_t srcElmOffset = linear * config.hiddenDim;
-            size_t destElmOffset = srcTokId * config.hiddenDim;
-            shmem::ShmemPutTypeNbiWarp<T>(
-                args.shmemCombineOutTokMemObj, destElmOffset,
-                args.shmemStagingTokMemObj, srcElmOffset,
-                config.hiddenDim, srcPe, 0);
-          } else {
-            // For same-node ranks, use WarpCopy
-            core::WarpCopy(
-                args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim,
-                args.inpTokenBuf + linear * config.hiddenDim,
-                config.hiddenDim);
+        } else {
+          // Same-node: direct copy to combine buffer
+          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
+          for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+            destPtr[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
           }
         }
       }
     }
   }
 
-  if (args.weightsBuf) {
-    for (int e = 0; e < config.numExpertPerRank; ++e) {
-      // Iterate through all source PEs
-      for (int srcPe = 0; srcPe < config.worldSize; ++srcPe) {
-        index_t slotBase = srcPe * config.maxNumInpTokenPerRank;
-        bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-
-        if (!isRemote) {
-          for (int localSlot = globalWarpId; localSlot < config.maxNumInpTokenPerRank;
-               localSlot += globalWarpNum) {
-            index_t slot = slotBase + localSlot;
-            index_t linear = e * expertCapacity + slot;
-
-            // Check if this slot has valid data (srcInfo != -1)
-            index_t srcInfo;
-            if (laneId == 0) {
-              srcInfo = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[linear];
-            }
-            srcInfo = __shfl(srcInfo, 0);
-
-            if (srcInfo == static_cast<index_t>(-1)) {
-              continue;  // Slot not used, all lanes skip together
-            }
-
-            core::WarpCopy(
-                args.shmemInpWeightsMemObj->template GetAs<float*>() + linear * config.numExpertPerToken,
-                args.weightsBuf + linear * config.numExpertPerToken,
-                config.numExpertPerToken);
-          }
-        }
-      }
-    }
-  }
-
-  // Lane 0 of each warp calls ShmemQuietThread() to drain its RDMA operations.
-  // NOTE: RDMA operations are tracked per-warp/per-thread. Each warp issues RDMA
-  // puts, so each warp must drain its own queue. Using lane 0 only (320 threads)
-  // avoids massive CQ lock contention from all 20480 threads calling quiet.
+  // Drain RDMA puts
   if (laneId == 0) {
     shmem::ShmemQuietThread();
   }
   __syncthreads();
 
-  // Step 2: Cross-rank barrier so all writes are visible
-  CrossDeviceBarrierInterNodeKernel(args, crossDeviceBarrierFlag);
-  *args.totalRecvTokenNum = 0;
+  // ========== PHASE 2: SIGNAL COMPLETION ==========
+  // Send completion flag to each source rank
 
-  if (args.curRankNumToken == 0) {
-    return;
+  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
+      if (srcPe == myPe) continue;
+
+      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
+      int numTokensToSend, offset;
+      internode_ll::Unpack2(layout, numTokensToSend, offset);
+
+      if (numTokensToSend == 0) continue;
+
+      bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
+      int globalExpertIdx = myPe * numLocalExperts + localExpert;
+
+      if (laneId == 0) {
+        if (isRemote) {
+          shmem::ShmemAtomicTypeNonFetchThread<int64_t>(
+              args.rdmaRecvFlagMemObj,
+              globalExpertIdx * sizeof(int64_t),
+              int64_t{1},
+              core::atomicType::AMO_ADD,
+              srcPe, 0);
+          shmem::ShmemQuietThread(srcPe);
+        } else {
+          int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
+          core::AtomicAddReleaseSystem(flagSlot, int64_t{1});
+        }
+      }
+    }
   }
 
-  // Shared memory setup (same as intranode)
+  // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
+  // Wait for all expert outputs, then accumulate with weights
+
+  // Grid barrier to ensure all sends are complete
+  detail::GridBarrier(args.combineGridBarrier, numSms);
+
+  // Shared memory for source pointers
   extern __shared__ char sharedMem[];
-  auto* smem = reinterpret_cast<uint8_t*>(sharedMem);
-  auto* srcPtrsBase = reinterpret_cast<T**>(smem);
-  size_t smemOffset = warpNum * config.numExpertPerToken * sizeof(T*);
-  auto* srcWeightsPtrBase = reinterpret_cast<float**>(smem + smemOffset);
-  smemOffset += warpNum * config.numExpertPerToken * sizeof(float*);
-  float* srcWeightScalesBase = nullptr;
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * numTopK;
+  float* srcWeightScales = nullptr;
   if constexpr (kUseWeights) {
-    srcWeightScalesBase = reinterpret_cast<float*>(smem + smemOffset);
+    srcWeightScales = reinterpret_cast<float*>(sharedMem + warpNum * numTopK * sizeof(T*)) + warpId * numTopK;
   }
 
-  T** srcPtrs = srcPtrsBase + warpId * config.numExpertPerToken;
-  float** srcWeightsPtr = srcWeightsPtrBase + warpId * config.numExpertPerToken;
-  float* srcWeightScales = kUseWeights ? (srcWeightScalesBase + warpId * config.numExpertPerToken) : nullptr;
-
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+  // Process each output token
+  index_t warpsPerToken = max(1, (globalWarpNum + numTokens - 1) / numTokens);
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
-  assert(config.numExpertPerToken < warpSize);
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
+  for (int i = globalWarpId; i < numTokens * warpsPerToken; i += globalWarpNum) {
+    index_t tokenIdx = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
     index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        max(0, min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
+    index_t hiddenDimSize = min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
+    if (hiddenDimSize <= 0) continue;
 
-    for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      // Step 3: Map each top-k expert to (dest_pe, local_expert, slot)
-      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+    // Gather source pointers for each top-k expert
+    for (int j = laneId; j < numTopK; j += warpSize) {
+      index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
       index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
+      index_t destLocalTokId = destTokId % expertCapacity;
+      index_t destPe = destExpert / numLocalExperts;
+      index_t localExpert = destExpert % numLocalExperts;
 
-      if (destPe < config.worldSize) {
+      if (destPe < npes) {
         bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
 
         if (isRemote) {
-          // For remote experts, the data should already be in our combine out buffer
-          // via the RDMA put in the send phase
-          size_t baseOffset = tokenId * config.hiddenDim;
+          // Data was sent to our combine out buffer
           srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                       baseOffset + hiddenDimOffset;
-          srcWeightsPtr[j] = nullptr;  // Weights handled separately for remote
+                       tokenIdx * config.hiddenDim + hiddenDimOffset;
         } else {
-          // For same-node experts, read from their symmetric buffer
-          size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+          // Data is in the remote rank's combine input buffer (accessible via P2P)
           srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                        baseOffset + hiddenDimOffset;
-          srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                             (localExpert * expertCapacity + destLocalTokId) *
-                                 config.numExpertPerToken;
         }
       } else {
         srcPtrs[j] = nullptr;
-        srcWeightsPtr[j] = nullptr;
       }
 
       if constexpr (kUseWeights) {
         float w = 1.0f;
-        if (args.weightsBuf && srcWeightsPtr[j] != nullptr) {
-          w = srcWeightsPtr[j][j];
+        if (args.weightsBuf && j < numTopK) {
+          w = args.weightsBuf[tokenIdx * numTopK + j];
         }
         srcWeightScales[j] = w;
       }
     }
 
-    // Step 4: Accumulate into local output buffer
-    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, kUseWeights ? srcWeightScales : nullptr,
-                          config.numExpertPerToken, hiddenDimSize);
+    __syncwarp();
 
-    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtr, nullptr, config.numExpertPerToken,
-                                config.numExpertPerToken);
-    }
+    // Accumulate
+    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                tokenIdx * config.hiddenDim + hiddenDimOffset;
+    core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
+                          numTopK, hiddenDimSize);
+  }
+
+  // Reset total recv token for next iteration
+  if (threadId == 0) {
+    *args.totalRecvTokenNum = 0;
   }
 }
 

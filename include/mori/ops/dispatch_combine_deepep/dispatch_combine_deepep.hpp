@@ -83,6 +83,40 @@ __device__ inline T AtomicAddReleaseSystem(T* ptr, T val) {
   return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+// System-scope relaxed atomics - for grid barrier counters
+template <typename T>
+__device__ inline T AtomicAddRelaxedSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+__device__ inline T AtomicLoadRelaxedSystem(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Finished sum tag for internode dispatch completion detection
+// Counter reaches FINISHED_SUM_TAG when all local tokens are dispatched
+// For multinode, counter reaches FINISHED_SUM_TAG * 2 when both local and remote are done
+constexpr uint32_t kFinishedSumTag = 0x20000000u;
+
+// Grid-level barrier using device-scope atomics (for internode LL kernels)
+// All blocks must call this function. Thread 0 of each block participates in the barrier.
+// The counter must be reset to 0 before each kernel invocation.
+__device__ inline void GridBarrier(uint32_t* counter, uint32_t numBlocks) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();  // Ensure prior writes are visible
+    AtomicAddRelaxed(counter, 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    while (AtomicLoadRelaxed(counter) != numBlocks) {
+      // spin
+    }
+  }
+  __syncthreads();
+}
+
 }  // namespace detail
 
 enum KernelType {
@@ -327,6 +361,25 @@ class EpDispatchCombineHandle {
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
 
+  // ====== Internode LL (DeepEP-aligned) buffers ======
+  // Local slot assignment counter per expert (device memory, not symmetric)
+  // Size: numExpertsTotal * sizeof(index_t)
+  index_t* atomicCounterPerExpert{nullptr};
+  // Finish counter per expert for dispatch completion detection
+  // Size: numExpertsTotal * sizeof(uint32_t)
+  uint32_t* finishCounterPerExpert{nullptr};
+  // Allocated slots counter per local expert in packed output buffer
+  // Size: numExpertPerRank * sizeof(index_t)
+  index_t* packedRecvCount{nullptr};
+  // Layout range for combine kernel: stores (numTokens << 32 | startIdx) per (localExpert, srcRank)
+  // Size: numExpertPerRank * worldSize * sizeof(int64_t)
+  int64_t* layoutRange{nullptr};
+  // Symmetric buffer for negative-encoded count signals from each source rank
+  // Size: numExpertPerRank * worldSize * sizeof(int64_t)
+  mori::application::SymmMemObjPtr rdmaRecvCountMemObj;
+  // Symmetric buffer for combine completion flags per expert
+  // Size: numExpertsTotal * sizeof(int64_t)
+  mori::application::SymmMemObjPtr rdmaRecvFlagMemObj;
 };
 
 template <typename T>
@@ -381,6 +434,13 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  // Internode LL (DeepEP-aligned) buffers
+  index_t* atomicCounterPerExpert{nullptr};
+  uint32_t* finishCounterPerExpert{nullptr};
+  index_t* packedRecvCount{nullptr};
+  int64_t* layoutRange{nullptr};
+  mori::application::SymmMemObjPtr rdmaRecvCountMemObj;
+  mori::application::SymmMemObjPtr rdmaRecvFlagMemObj;
 };
 
 using EpDispatchCombineArgsVariant =
@@ -447,6 +507,13 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  // Internode LL (DeepEP-aligned) buffers
+  args.atomicCounterPerExpert = handle.atomicCounterPerExpert;
+  args.finishCounterPerExpert = handle.finishCounterPerExpert;
+  args.packedRecvCount = handle.packedRecvCount;
+  args.layoutRange = handle.layoutRange;
+  args.rdmaRecvCountMemObj = handle.rdmaRecvCountMemObj;
+  args.rdmaRecvFlagMemObj = handle.rdmaRecvFlagMemObj;
   return args;
 }
 
