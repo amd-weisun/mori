@@ -260,12 +260,17 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       }
     }
   }
-  __threadfence_system();
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  // Use release semantics to ensure all prior writes are visible before incrementing barrier
+  // This replaces the expensive __threadfence_system() + atomicAdd pattern
+  if (laneId == 0) {
+    detail::AtomicAddReleaseSystem(args.dispatchGridBarrier, 1u);
+  }
 
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      // Use acquire semantics to ensure we see all writes after barrier is reached
+      while (detail::AtomicLoadAcquireSystem(args.dispatchGridBarrier) < globalWarpNum) {
+      }
       args.dispatchGridBarrier[0] = 0;
 
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
