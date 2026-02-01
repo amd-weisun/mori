@@ -300,130 +300,107 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     __syncthreads();
   }
 
-  // ========== PHASE 2: EXPERT COUNT AGGREGATION ==========
-  // Last warp in each SM counts expected tokens per expert and adds finish tag offset
+  // ========== PHASE 2: RDMA QUIET + GRID BARRIER ==========
+  // Ensure all RDMA puts are drained BEFORE grid barrier (following DeepEP pattern)
+  // Grid barrier alone doesn't guarantee RDMA completion
 
-  if (warpId == warpNum - 1) {
-    // Count tokens for each expert this SM is responsible for
-    for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
-      for (int k = laneId; k < numTopK; k += warpSize) {
-        int expert = args.tokenIndices[tokenIdx * numTopK + k];
-        if (expert >= 0 && expert < npes * numLocalExperts) {
-          // This token was dispatched to this expert
-          // We need to track expected count per expert for finish counter
-        }
-      }
-    }
-
-    // Add finish tag offset so counter reaches FINISHED_SUM_TAG when all dispatched
-    // For multinode, we add FINISHED_SUM_TAG twice (once here, once after RDMA quiet)
-    for (int expert = laneId; expert < npes * numLocalExperts; expert += warpSize) {
-      uint32_t count = args.atomicCounterPerExpert[expert];
-      if (count > 0) {
-        // Add offset: FINISHED_SUM_TAG - count
-        // When all tokens dispatched (finish_counter = count), total = FINISHED_SUM_TAG
-        uint32_t offset = detail::kFinishedSumTag - count;
-        detail::AtomicAddRelease(args.finishCounterPerExpert + expert, offset);
-      }
-    }
-  }
-
-  __syncthreads();
-
-  // ========== PHASE 3: RDMA QUIET ==========
-  // Drain all pending RDMA puts before sending count signals
-
+  // RDMA quiet FIRST to drain all pending puts
   if (threadId == 0) {
     shmem::ShmemQuietThread();
+    __threadfence_system();  // System-wide visibility after quiet
   }
   __syncthreads();
 
-  // Add second finish tag for multinode (ensures RDMA puts are visible before count signal)
-  if (warpId == warpNum - 1) {
-    for (int expert = laneId; expert < npes * numLocalExperts; expert += warpSize) {
-      uint32_t count = args.atomicCounterPerExpert[expert];
-      if (count > 0) {
-        detail::AtomicAddRelease(args.finishCounterPerExpert + expert, detail::kFinishedSumTag);
-      }
-    }
-  }
+  // Then grid barrier to ensure all blocks have finished Phase 1 dispatch
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
 
-  __syncthreads();
-
-  // ========== PHASE 4: COUNT SIGNAL SENDING ==========
-  // Wait for finish counter to reach 2 * FINISHED_SUM_TAG, then send negative-encoded count
+  // ========== PHASE 3: COUNT SIGNAL SENDING ==========
+  // Send negative-encoded count to each destination rank for each expert
+  // MUST send signal even when count == 0, otherwise receiver will hang
+  // Skip self (destPe == myPe) since we handle self-tokens directly in Phase 5
 
   // Each warp handles one expert
   for (int expert = globalWarpId; expert < npes * numLocalExperts; expert += globalWarpNum) {
+    int destPe = expert / numLocalExperts;
+    if (destPe == myPe) continue;  // Skip self - handled directly via atomicCounterPerExpert
+
     if (laneId == 0) {
-      uint32_t count = args.atomicCounterPerExpert[expert];
-      if (count > 0) {
-        // Wait for dispatch completion
-        uint32_t expected = 2 * detail::kFinishedSumTag;
-        while (detail::AtomicLoadAcquire(args.finishCounterPerExpert + expert) != expected) {
-          // spin
-        }
+      int localExpert = expert % numLocalExperts;
 
-        int destPe = expert / numLocalExperts;
-        int localExpert = expert % numLocalExperts;
-        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      // Get count of tokens this rank sent to this expert
+      index_t count = args.atomicCounterPerExpert[expert];
 
-        // Send negative-encoded count: -count - 1
-        // This combines count and signal in one atomic operation
-        int64_t encodedCount = -static_cast<int64_t>(count) - 1;
+      // Send negative-encoded count: -count - 1
+      // Even 0 tokens becomes -1, which is distinguishable from initial value 0
+      int64_t encodedCount = -static_cast<int64_t>(count) - 1;
+
+      bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        // Use PUT (not AMO_ADD) to write the signal value directly
+        // DeepEP uses rocshmem_long_p which is a PUT, not atomic add
+        shmem::ShmemPutTypeImmNbiThread<int64_t>(
+            args.rdmaRecvCountMemObj,
+            (localExpert * npes + myPe) * sizeof(int64_t),  // byte offset
+            encodedCount,
+            destPe, 0);
+      } else {
+        // Same-node: direct atomic store with system-scope release
         int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>(destPe) +
                               localExpert * npes + myPe;
-
-        if (isRemote) {
-          shmem::ShmemAtomicTypeNonFetchThread<int64_t>(
-              args.rdmaRecvCountMemObj,
-              (localExpert * npes + myPe) * sizeof(int64_t),
-              encodedCount,
-              core::atomicType::AMO_ADD,
-              destPe, 0);
-          shmem::ShmemQuietThread(destPe);
-        } else {
-          detail::AtomicStoreReleaseSystem(signalSlot, encodedCount);
-        }
+        detail::AtomicStoreReleaseSystem(signalSlot, encodedCount);
       }
     }
   }
 
-  // ========== PHASE 5: GRID BARRIER ==========
+  // Drain all RDMA puts (count signals)
+  if (threadId == 0) {
+    shmem::ShmemQuietThread();
+    __threadfence_system();  // System-wide visibility
+  }
+  __syncthreads();
+
+  // ========== PHASE 4: GRID BARRIER ==========
   // Synchronize all blocks before receiving
 
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+  // Need a second barrier counter since dispatchGridBarrier was used in Phase 2
+  // We reuse combineGridBarrier here (will be reset before combine kernel)
+  detail::GridBarrier(args.combineGridBarrier, numSms);
 
-  // ========== PHASE 6: RECEIVE + UNPACK ==========
-  // Poll for negative-encoded counts, allocate packed buffer space, copy tokens
+  // ========== PHASE 5: RECEIVE + UNPACK ==========
+  // Poll for negative-encoded counts, allocate packed buffer space
+  // All signals should be ready after the grid barrier, just need to read them
 
-  // Each warp handles one (localExpert, srcRank) pair
+  // Process signals from other ranks
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
     for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
-      if (srcPe == myPe) continue;  // Skip self
+      if (srcPe == myPe) continue;  // Skip self - handled separately below
 
       if (laneId == 0) {
-        // Poll for signal
+        // Read signal (should already be set after grid barrier)
         int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>() +
                               localExpert * npes + srcPe;
         int64_t rawCount = 0;
+
+        // Poll until signal arrives (with grid barrier, should be immediate)
         while ((rawCount = detail::AtomicLoadAcquireSystem(signalSlot)) == 0) {
-          // spin with timeout could be added here
+          // spin - should not spin long since all sends completed before barrier
         }
 
-        // Decode count
+        // Decode count: -1 means 0 tokens, -2 means 1 token, etc.
         int numRecvTokens = static_cast<int>(-rawCount - 1);
 
-        // Allocate space in packed output buffer
-        index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
+        if (numRecvTokens > 0) {
+          // Allocate space in packed output buffer
+          index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
 
-        // Store layout info for combine kernel
-        args.layoutRange[localExpert * npes + srcPe] =
-            internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
+          // Store layout info for combine kernel
+          args.layoutRange[localExpert * npes + srcPe] =
+              internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
 
-        // Add to total recv count
-        atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
-        atomicAdd(args.totalRecvTokenNum, numRecvTokens);
+          // Add to total recv count
+          atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
+          atomicAdd(args.totalRecvTokenNum, numRecvTokens);
+        }
 
         // Reset signal for next iteration
         detail::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
@@ -431,22 +408,24 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Also handle same-node signals (they were set with local atomics)
-  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
-    for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
-      if (!internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode) && srcPe != myPe) {
-        int64_t* signalSlot = args.rdmaRecvCountMemObj->template GetAs<int64_t*>() +
-                              localExpert * npes + srcPe;
-        int64_t rawCount = detail::AtomicLoadAcquireSystem(signalSlot);
-        if (rawCount != 0) {
-          int numRecvTokens = static_cast<int>(-rawCount - 1);
-          index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, numRecvTokens);
-          args.layoutRange[localExpert * npes + srcPe] =
-              internode_ll::Pack2(numRecvTokens, recvTokenBeginIdx);
-          atomicAdd(args.recvTokenCountPerExpert + localExpert, numRecvTokens);
-          atomicAdd(args.totalRecvTokenNum, numRecvTokens);
-          detail::AtomicStoreReleaseSystem(signalSlot, int64_t{0});
-        }
+  // Process self-tokens: tokens this rank sent to its own local experts
+  // These don't need RDMA signals, just read the counter directly
+  if (globalWarpId == 0 && laneId == 0) {
+    for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+      int globalExpert = myPe * numLocalExperts + localExpert;
+      index_t selfCount = args.atomicCounterPerExpert[globalExpert];
+
+      if (selfCount > 0) {
+        // Allocate space in packed output buffer for self-tokens
+        index_t recvTokenBeginIdx = atomicAdd(args.packedRecvCount + localExpert, selfCount);
+
+        // Store layout info for combine kernel (self as srcPe)
+        args.layoutRange[localExpert * npes + myPe] =
+            internode_ll::Pack2(static_cast<int>(selfCount), static_cast<int>(recvTokenBeginIdx));
+
+        // Add to total recv count
+        atomicAdd(args.recvTokenCountPerExpert + localExpert, selfCount);
+        atomicAdd(args.totalRecvTokenNum, selfCount);
       }
     }
   }

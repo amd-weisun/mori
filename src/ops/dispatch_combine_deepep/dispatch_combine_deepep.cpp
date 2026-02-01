@@ -475,8 +475,9 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
       static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t), stream));
   HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvCountMemObj->Get(), 0,
       static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t), stream));
-  // Reset grid barrier counter for dispatch
+  // Reset grid barrier counters for dispatch (we use both in dispatch kernel)
   HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, sizeof(uint32_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(combineGridBarrier, 0, sizeof(uint32_t), stream));
 
   size_t sharedMemSize =
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
