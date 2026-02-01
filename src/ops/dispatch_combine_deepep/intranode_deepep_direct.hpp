@@ -41,32 +41,45 @@ namespace deepep {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
+// Phase 4: Optimized CrossDeviceBarrier with device-scope atomics
+// Aligned with DeepEP's grid_barrier pattern but extended for cross-device synchronization.
+// Uses device-scope relaxed atomics for counters (xGMI is cache-coherent).
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
                                                          const uint32_t crossDeviceBarrierFlag) {
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  const int thdId = threadIdx.x;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  const int warpNum = blockDim.x / warpSize;
+  const int globalWarpNum = gridDim.x * warpNum;
 
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpNum = gridDim.x * warpNum;
+  // Step 1: Intra-grid barrier (all warps arrive)
+  // Use device-scope relaxed atomic for counter increment
+  if (laneId == 0) {
+    detail::AtomicAddRelaxed(args.combineGridBarrier, 1u);
+  }
 
-  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
-
+  // Step 2: First few threads signal to remote ranks after local grid barrier completes
   if (globalThdId < args.config.worldSize) {
-    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    // Wait for all warps to arrive (device-scope poll)
+    while (detail::AtomicLoadRelaxed(args.combineGridBarrier) != static_cast<uint32_t>(globalWarpNum)) {
+    }
+    // Reset barrier for next use
     args.combineGridBarrier[0] = 0;
-    // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
+    // Signal to remote rank using device-scope release (xGMI is cache-coherent)
     detail::AtomicStoreRelease(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
         crossDeviceBarrierFlag);
   }
 
-  if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+  // Step 3: Increment flag counter (device-scope relaxed)
+  if (globalThdId == 0) {
+    detail::AtomicAddRelaxed(args.crossDeviceBarrierFlag, 1u);
+  }
 
+  // Step 4: Wait for signals from all remote ranks (device-scope acquire)
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    // Use device-scope acquire for cross-GPU visibility (xGMI is cache-coherent)
     while (detail::AtomicLoadAcquire(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
   }

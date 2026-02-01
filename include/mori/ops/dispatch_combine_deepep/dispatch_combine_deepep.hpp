@@ -56,6 +56,17 @@ __device__ inline T AtomicAddRelease(T* ptr, T val) {
   return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// Device-scope relaxed atomics - for barrier counters (no ordering needed, just atomicity)
+template <typename T>
+__device__ inline T AtomicAddRelaxed(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+__device__ inline T AtomicLoadRelaxed(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 // System-scope atomics (~50-100 cycles) - for future internode use
 template <typename T>
 __device__ inline T AtomicLoadAcquireSystem(T* ptr) {
