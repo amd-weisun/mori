@@ -137,17 +137,8 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
   const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
 
-  // Reset local counters and synchronize all ranks before using remote counters.
-  if (globalWarpId == 0 && laneId == 0) {
-    index_t* localExpertCounter =
-        args.destExpertTokenCounterMemObj->template GetAs<index_t*>(config.rank);
-    for (int e = 0; e < config.numExpertPerRank; ++e) {
-      localExpertCounter[e] = 0;
-    }
-    for (int pe = 0; pe < npes; ++pe) {
-      args.destPeTokenCounter[pe] = 0;
-    }
-  }
+  // Synchronize all ranks before accessing remote symmetric memory.
+  // Note: Counter buffers are already reset by hipMemsetAsync before kernel launch.
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
 
   if (args.tokenIndices && args.inpTokenBuf) {
@@ -331,7 +322,7 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Use system-scope release to reset signal
       detail::AtomicStoreReleaseSystem(signal, static_cast<index_t>(0));
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[destPe] = 0;
+      // Note: destPeTokenCounter reset removed - done by hipMemsetAsync before next dispatch
     }
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
@@ -340,10 +331,7 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         args.recvTokenCountPerExpert[e] = localExpertCounter[e];
       }
-      // reset per-expert counters for this rank
-      for (int e = 0; e < config.numExpertPerRank; ++e) {
-        localExpertCounter[e] = 0;
-      }
+      // Note: per-expert counter reset removed - done by hipMemsetAsync before next dispatch
     }
   }
 }
