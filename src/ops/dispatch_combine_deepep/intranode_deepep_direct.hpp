@@ -123,17 +123,30 @@ __device__ inline float QuarterWarpReduceMax(float value) {
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
 }  // namespace detail
 
+// DeepEP-aligned dispatch kernel with SM-based token striding (Phase 6)
+// Key differences from previous MORI implementation:
+// 1. SM-based token striding: Each block handles tokens[blockIdx.x], tokens[blockIdx.x + gridDim.x], ...
+// 2. Warp-based top-k handling: Each warp handles one top-k destination per token
+// 3. All-thread FP8 quantization: All threads in block work on one token's FP8 quantization
+// 4. Per-destPe finish counters: Aggregates all experts on each rank (simpler for intranode)
+//
+// Note on Phase 5 (Packed Buffers): Packed message format is primarily beneficial for internode
+// RDMA where bundling reduces per-message overhead. For intranode xGMI (cache-coherent),
+// separate buffers are kept as they provide simpler indexing without packing/unpacking overhead.
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-  int myPe = config.rank;
-  int npes = config.worldSize;
+  const int thdId = threadIdx.x;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int warpId = thdId / warpSize;
+  const int warpNum = blockDim.x / warpSize;
+  const int numThreads = blockDim.x;
+  const int smId = static_cast<int>(blockIdx.x);
+  const int numSms = static_cast<int>(gridDim.x);
+  const int globalWarpId = smId * warpNum + warpId;
+  const int globalWarpNum = numSms * warpNum;
+  const int myPe = config.rank;
+  const int npes = config.worldSize;
   const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
   const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
 
@@ -141,137 +154,184 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Note: Counter buffers are already reset by hipMemsetAsync before kernel launch.
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
 
+  // Shared memory for per-warp destination info (DeepEP-style)
+  // Each warp needs: destExpert, destPe, localExpert, destTokId, destLinearTok
+  __shared__ index_t sharedDestTokId[16];      // Max 16 warps per block
+  __shared__ index_t sharedDestLinearTok[16];
+
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
+    // DeepEP-style: SM-based token striding
+    // Each block handles tokens[smId], tokens[smId + numSms], ...
+    for (int tokenIdx = smId; tokenIdx < args.curRankNumToken; tokenIdx += numSms) {
+      // Each warp reads its own top-k index (similar to DeepEP)
+      // Warps with warpId >= numExpertPerToken will have invalid destExpert (-1)
+      index_t destExpert = -1;
+      index_t destPe = -1;
+      index_t localExpert = -1;
       index_t destTokId = 0;
+      index_t destLinearTok = 0;
 
-      if (laneId == 0) {
-        index_t* expertCounter =
-            args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-        destTokId = atomicAdd(expertCounter + localExpert, 1);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispDestTokIdMap[i] = destExpert * expertCapacity + destTokId;
-      }
-      destTokId = __shfl(destTokId, 0);
-      index_t destLinearTok = localExpert * expertCapacity + destTokId;
+      if (warpId < config.numExpertPerToken) {
+        destExpert = args.tokenIndices[tokenIdx * config.numExpertPerToken + warpId];
+        destPe = destExpert / config.numExpertPerRank;
+        localExpert = destExpert % config.numExpertPerRank;
 
-      if (laneId == 0) {
-        // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
-        detail::AtomicStoreRelease(
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
-            static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId));
-      }
+        // Allocate slot and update counters (lane 0 only)
+        if (laneId == 0) {
+          index_t* expertCounter =
+              args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
+          destTokId = atomicAdd(expertCounter + localExpert, 1);
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[tokenIdx * config.numExpertPerToken + warpId] =
+              destExpert * expertCapacity + destTokId;
 
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-          destPe)[destLinearTok * config.numExpertPerToken + laneId] =
-          args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-        }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-        destPe)[destLinearTok * config.numExpertPerToken + laneId] =
-        args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-      }
-
-      size_t baseOffset = destLinearTok * config.hiddenDim;
-
-      // Copy pre-computed scales for non-FP8 path (FP8 scales are computed inline below)
-      if constexpr (!kUseFP8) {
-        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          index_t destScaleOffset =
-              destLinearTok * config.scaleDim * config.scaleTypeSize;
-          index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
-          core::WarpCopy(
-              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-              args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+          // Store to shared memory for other threads to access
+          sharedDestTokId[warpId] = destTokId;
+          sharedDestLinearTok[warpId] = localExpert * expertCapacity + destTokId;
         }
       }
+      __syncthreads();
 
-      index_t srcTokOffset = srcTokId * config.hiddenDim;
+      // Read back from shared memory
+      if (warpId < config.numExpertPerToken) {
+        destTokId = sharedDestTokId[warpId];
+        destLinearTok = sharedDestLinearTok[warpId];
+      }
+
+      // FP8 quantization: All threads in block work on the token's data
+      // This is the key DeepEP optimization - better parallelism for FP8 cast
       if constexpr (kUseFP8) {
-        auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
-          args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
-        int numScales = config.hiddenDim / detail::kNumPerChannels;
-        auto* srcPtr = reinterpret_cast<const uint4*>(args.inpTokenBuf + srcTokOffset);
-        auto* destPtr = reinterpret_cast<uint64_t*>(destFp8);
-        float* scalePtr = args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
-                          destLinearTok * numScales;
+        // All threads participate in FP8 quantization for this token
+        // The quantized data is written to a temporary location, then copied by each warp
+        constexpr int kNumElemsPerRead = sizeof(uint4) / sizeof(T);  // 8 bf16 elements
+        const int hiddenBf16Int4 = config.hiddenDim / kNumElemsPerRead;
+        const int numScales = config.hiddenDim / detail::kNumPerChannels;
+        const auto* srcInt4 = reinterpret_cast<const uint4*>(args.inpTokenBuf + tokenIdx * config.hiddenDim);
 
-        // Process 4 channels (512 elements) per iteration using vectorized loads
-        // 64 threads * 8 elements/load = 512 elements = 4 * 128-element channels
-        // Threads 0-15 -> channel 0, threads 16-31 -> channel 1, etc.
-        constexpr int kChannelsPerIter = warpSize * detail::kElemsPerLoad / detail::kNumPerChannels;
-        static_assert(kChannelsPerIter == 4, "Expected 4 channels per iteration");
+        // Each warp that has a valid destination does its own FP8 quantization and copy
+        // This maintains the per-warp independence while using the same loop structure as DeepEP
+        if (warpId < config.numExpertPerToken && destPe >= 0) {
+          auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
+              args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) +
+              destLinearTok * config.hiddenDim;
+          auto* srcPtr = reinterpret_cast<const uint4*>(args.inpTokenBuf + tokenIdx * config.hiddenDim);
+          auto* destPtr = reinterpret_cast<uint64_t*>(destFp8);
+          float* scalePtr = args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
+                            destLinearTok * numScales;
 
-        for (int scaleBase = 0; scaleBase < numScales; scaleBase += kChannelsPerIter) {
-          // Vectorized load: each thread reads 8 bf16 elements (16 bytes)
-          uint4 packed = srcPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId];
-          auto* bf16Values = reinterpret_cast<const T*>(&packed);
+          // Store source token mapping
+          detail::AtomicStoreRelease(
+              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
+              static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + tokenIdx));
 
-          // Convert to float and compute local amax (8 elements per thread)
-          float fp32Values[detail::kElemsPerLoad];
-          float amax = detail::kFP8Margin;
-          #pragma unroll
-          for (int j = 0; j < detail::kElemsPerLoad; ++j) {
-            fp32Values[j] = static_cast<float>(bf16Values[j]);
-            amax = fmaxf(amax, fabsf(fp32Values[j]));
+          // Copy weights and indices
+          if (laneId < config.numExpertPerToken) {
+            if (args.weightsBuf) {
+              args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                  destPe)[destLinearTok * config.numExpertPerToken + laneId] =
+                  args.weightsBuf[tokenIdx * config.numExpertPerToken + laneId];
+            }
+            args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+                destPe)[destLinearTok * config.numExpertPerToken + laneId] =
+                args.tokenIndices[tokenIdx * config.numExpertPerToken + laneId];
           }
 
-          // Quarter-warp reduction: 16 threads per channel (128 elements / 8 per thread)
-          amax = detail::QuarterWarpReduceMax(amax);
-          float scale = detail::kFP8Amax / amax;
-          float scaleInv = amax * detail::kFP8AmaxInv;
+          // Process channels with vectorized FP8 quantization
+          constexpr int kChannelsPerIter = warpSize * detail::kElemsPerLoad / detail::kNumPerChannels;
 
-          // Store scale (only lane 0, 16, 32, 48 write their respective channel's scale)
-          if ((laneId & 15) == 0) {
-            scalePtr[scaleBase + (laneId >> 4)] = scaleInv;
-          }
+          for (int scaleBase = 0; scaleBase < numScales; scaleBase += kChannelsPerIter) {
+            uint4 packed = srcPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId];
+            auto* bf16Values = reinterpret_cast<const T*>(&packed);
 
-          // Quantize using vectorized FP8 conversion
-          uint64_t fp8Packed;
-          auto* fp8x2Values = reinterpret_cast<__hip_fp8x2_storage_t*>(&fp8Packed);
-          #pragma unroll
-          for (int j = 0; j < detail::kElemsPerLoad; j += 2) {
-            float2 fp32x2 = {fp32Values[j] * scale, fp32Values[j + 1] * scale};
+            float fp32Values[detail::kElemsPerLoad];
+            float amax = detail::kFP8Margin;
+            #pragma unroll
+            for (int j = 0; j < detail::kElemsPerLoad; ++j) {
+              fp32Values[j] = static_cast<float>(bf16Values[j]);
+              amax = fmaxf(amax, fabsf(fp32Values[j]));
+            }
+
+            amax = detail::QuarterWarpReduceMax(amax);
+            float scale = detail::kFP8Amax / amax;
+            float scaleInv = amax * detail::kFP8AmaxInv;
+
+            if ((laneId & 15) == 0) {
+              scalePtr[scaleBase + (laneId >> 4)] = scaleInv;
+            }
+
+            uint64_t fp8Packed;
+            auto* fp8x2Values = reinterpret_cast<__hip_fp8x2_storage_t*>(&fp8Packed);
+            #pragma unroll
+            for (int j = 0; j < detail::kElemsPerLoad; j += 2) {
+              float2 fp32x2 = {fp32Values[j] * scale, fp32Values[j + 1] * scale};
 #if defined(__gfx942__)
-            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+              fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
 #elif defined(__gfx950__)
-            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3);
+              fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3);
 #else
-            // Fallback for other architectures
-            fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+              fp8x2Values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
 #endif
+            }
+
+            destPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId] = fp8Packed;
           }
 
-          // Vectorized store: 8 FP8 values (8 bytes) per thread
-          destPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId] = fp8Packed;
+          // Increment finish counter after copy (release semantics)
+          if (laneId == 0) {
+            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
+          }
         }
       } else {
-        core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
-                       args.inpTokenBuf + srcTokOffset, config.hiddenDim);
-      }
+        // Non-FP8 path: Each warp handles its destination independently
+        if (warpId < config.numExpertPerToken && destPe >= 0) {
+          // Store source token mapping
+          if (laneId == 0) {
+            detail::AtomicStoreRelease(
+                args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
+                static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + tokenIdx));
+          }
 
-      // Phase 3 optimization: Increment finish counter for this destPe after copying token data.
-      // Uses release semantics to ensure all prior writes are visible.
-      if (laneId == 0) {
-        detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
+          // Copy weights and indices
+          if (laneId < config.numExpertPerToken) {
+            if (args.weightsBuf) {
+              args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                  destPe)[destLinearTok * config.numExpertPerToken + laneId] =
+                  args.weightsBuf[tokenIdx * config.numExpertPerToken + laneId];
+            }
+            args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+                destPe)[destLinearTok * config.numExpertPerToken + laneId] =
+                args.tokenIndices[tokenIdx * config.numExpertPerToken + laneId];
+          }
+
+          // Copy pre-computed scales
+          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+            index_t destScaleOffset = destLinearTok * config.scaleDim * config.scaleTypeSize;
+            index_t srcScaleOffset = tokenIdx * config.scaleDim * config.scaleTypeSize;
+            core::WarpCopy(
+                args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+                args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+          }
+
+          // Copy token data
+          size_t baseOffset = destLinearTok * config.hiddenDim;
+          core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
+                         args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+
+          // Increment finish counter after copy (release semantics)
+          if (laneId == 0) {
+            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
+          }
+        }
       }
+      __syncthreads();  // Sync before next token iteration
     }
   }
 
-  // Phase 3: Count warp computes expected tokens per destPe and adds offset to finish counters.
-  // This runs after the dispatch loop for the count warp. Uses the last warp.
-  // The finish counter pattern: when finish_counter[destPe] == kFinishedSumTag, all tokens are done.
-  // Math: finish_counter = dispatched_count + (kFinishedSumTag - expected_count) = kFinishedSumTag
-  constexpr int kMaxGpuPerNode = 8;  // MI300X has 8 GPUs per node
+  // Count warp: Computes expected tokens per destPe and adds offset to finish counters
+  // Uses the last global warp (DeepEP uses last warp per SM, but for intranode one warp suffices)
+  constexpr int kMaxGpuPerNode = 8;
   assert(npes <= kMaxGpuPerNode && "Intranode dispatch assumes worldSize <= 8 GPUs per node");
   if (globalWarpId == globalWarpNum - 1) {
-    // Count expected tokens per destPe by reading tokenIndices
-    // Use registers to accumulate counts per destPe (worldSize is typically small, 8 for intranode)
     int countPerDestPe[kMaxGpuPerNode] = {0};
     for (int i = laneId; i < args.curRankNumToken * config.numExpertPerToken; i += warpSize) {
       if (args.tokenIndices) {
@@ -282,14 +342,11 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
       }
     }
-    // Warp-reduce counts per destPe and add offset to finish counters
     for (int pe = 0; pe < npes && pe < kMaxGpuPerNode; ++pe) {
       int count = countPerDestPe[pe];
-      // Warp reduction using shuffle
       for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         count += __shfl_xor(count, offset);
       }
-      // Lane 0 adds the offset to finish counter
       if (laneId == 0) {
         uint32_t finishOffset = detail::kFinishedSumTag - static_cast<uint32_t>(count);
         detail::AtomicAddRelease(args.finishCounterPerDestPe + pe, finishOffset);
@@ -297,32 +354,27 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Signal phase: Wait for finish counter per destPe instead of global barrier.
-  // The finish counter pattern allows signaling per-destPe as soon as all tokens for that
-  // destPe are dispatched, without waiting for all warps globally. This is the key optimization.
+  // Signal phase: Wait for finish counter per destPe, then send token counts
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait for finish counter to reach kFinishedSumTag (all tokens for this destPe dispatched)
       while (detail::AtomicLoadAcquire(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
       }
 
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
       detail::AtomicStoreRelease(signal, numTokenSignal);
     }
   }
 
+  // Receive phase: Wait for signals from other ranks
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      // Use device-scope release to reset signal (xGMI is cache-coherent)
       detail::AtomicStoreRelease(signal, static_cast<index_t>(0));
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      // Note: destPeTokenCounter reset removed - done by hipMemsetAsync before next dispatch
     }
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
@@ -331,7 +383,6 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       for (int e = 0; e < config.numExpertPerRank; ++e) {
         args.recvTokenCountPerExpert[e] = localExpertCounter[e];
       }
-      // Note: per-expert counter reset removed - done by hipMemsetAsync before next dispatch
     }
   }
 }
