@@ -56,8 +56,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId < args.config.worldSize) {
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
     args.combineGridBarrier[0] = 0;
-    // Use system-scope release for cross-GPU visibility with proper ordering
-    detail::AtomicStoreReleaseSystem(
+    // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
+    detail::AtomicStoreRelease(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
         crossDeviceBarrierFlag);
   }
@@ -66,8 +66,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    // Use system-scope acquire for cross-GPU visibility with proper ordering
-    while (detail::AtomicLoadAcquireSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+    // Use device-scope acquire for cross-GPU visibility (xGMI is cache-coherent)
+    while (detail::AtomicLoadAcquire(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
   }
   __syncthreads();
@@ -160,8 +160,8 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t destLinearTok = localExpert * expertCapacity + destTokId;
 
       if (laneId == 0) {
-        // Use system-scope release for cross-GPU visibility with proper ordering
-        detail::AtomicStoreReleaseSystem(
+        // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
+        detail::AtomicStoreRelease(
             args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destLinearTok,
             static_cast<index_t>(myPe * config.maxNumInpTokenPerRank + srcTokId));
       }
@@ -258,7 +258,7 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Phase 3 optimization: Increment finish counter for this destPe after copying token data.
       // Uses release semantics to ensure all prior writes are visible.
       if (laneId == 0) {
-        detail::AtomicAddReleaseSystem(args.finishCounterPerDestPe + destPe, 1u);
+        detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
       }
     }
   }
@@ -292,7 +292,7 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Lane 0 adds the offset to finish counter
       if (laneId == 0) {
         uint32_t finishOffset = detail::kFinishedSumTag - static_cast<uint32_t>(count);
-        detail::AtomicAddReleaseSystem(args.finishCounterPerDestPe + pe, finishOffset);
+        detail::AtomicAddRelease(args.finishCounterPerDestPe + pe, finishOffset);
       }
     }
   }
@@ -303,14 +303,14 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait for finish counter to reach kFinishedSumTag (all tokens for this destPe dispatched)
-      while (detail::AtomicLoadAcquireSystem(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
+      while (detail::AtomicLoadAcquire(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
       }
 
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      // Use system-scope release for cross-GPU visibility with proper ordering
-      detail::AtomicStoreReleaseSystem(signal, numTokenSignal);
+      // Use device-scope release for cross-GPU visibility (xGMI is cache-coherent)
+      detail::AtomicStoreRelease(signal, numTokenSignal);
     }
   }
 
@@ -319,8 +319,8 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      // Use system-scope release to reset signal
-      detail::AtomicStoreReleaseSystem(signal, static_cast<index_t>(0));
+      // Use device-scope release to reset signal (xGMI is cache-coherent)
+      detail::AtomicStoreRelease(signal, static_cast<index_t>(0));
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       // Note: destPeTokenCounter reset removed - done by hipMemsetAsync before next dispatch
     }
