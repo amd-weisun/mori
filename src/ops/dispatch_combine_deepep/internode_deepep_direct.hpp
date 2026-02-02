@@ -622,19 +622,25 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       index_t localExpert = destExpert % numLocalExperts;
 
       if (destPe < npes) {
-        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
         // baseOffset uses expert-major layout matching dispatch and Phase 1 send
         size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
 
-        if (isRemote) {
-          // Data was sent to our combine out buffer via RDMA
-          srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                       baseOffset + hiddenDimOffset;
+        if (destPe == myPe) {
+          // Self-token: expert output is in our own dispatch output buffer (inpTokenBuf)
+          // No inter-rank transfer needed
+          srcPtrs[j] = args.inpTokenBuf + baseOffset + hiddenDimOffset;
         } else {
-          // Data was written to our combine input buffer via P2P by destPe
-          // (Phase 1 on destPe wrote to args.shmemCombineInpTokMemObj->GetAs<T*>(myPe))
-          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
-                       baseOffset + hiddenDimOffset;
+          bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+          if (isRemote) {
+            // Data was sent to our combine out buffer via RDMA
+            srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                         baseOffset + hiddenDimOffset;
+          } else {
+            // Data was written to our combine input buffer via P2P by destPe
+            // (Phase 1 on destPe wrote to args.shmemCombineInpTokMemObj->GetAs<T*>(myPe))
+            srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
+                         baseOffset + hiddenDimOffset;
+          }
         }
       } else {
         srcPtrs[j] = nullptr;
