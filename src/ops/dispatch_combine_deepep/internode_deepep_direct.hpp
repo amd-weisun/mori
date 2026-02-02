@@ -561,21 +561,24 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
 
-  // Wait for completion signals from all destination ranks before reading
-  // Each destination rank signals to rdmaRecvFlagMemObj when it finishes sending expert outputs back
-  // We need to wait for signals from each expert we sent tokens to
-  for (int destPe = 0; destPe < npes; ++destPe) {
-    if (destPe == myPe) continue;
+  // Wait for completion signals using per-block expert assignment (like DeepEP)
+  // Each block is responsible for specific experts based on blockIdx.x
+  // This avoids deadlock by ensuring we only wait for our responsible experts
+  constexpr int kNumWarpGroups = 2;
+  int warpGroupId = warpId / (warpNum / kNumWarpGroups);
+  int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
 
-    for (int localExpert = globalWarpId; localExpert < numLocalExperts; localExpert += globalWarpNum) {
+  if (responsibleExpertIdx < npes * numLocalExperts) {
+    int destPe = responsibleExpertIdx / numLocalExperts;
+    int localExpert = responsibleExpertIdx % numLocalExperts;
+
+    // Only wait if this is a remote expert we sent tokens to
+    if (destPe != myPe) {
       int globalExpert = destPe * numLocalExperts + localExpert;
-      // Check if we sent tokens to this expert (in dispatch phase)
       index_t count = args.atomicCounterPerExpert[globalExpert];
-      if (count == 0) continue;
 
-      if (laneId == 0) {
+      if (count > 0 && warpId % (warpNum / kNumWarpGroups) == 0 && laneId == 0) {
         // Wait for completion signal from destPe for this expert
-        // destPe signals our buffer at index (destPe * numLocalExperts + localExpert)
         int globalExpertIdx = destPe * numLocalExperts + localExpert;
         int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
 

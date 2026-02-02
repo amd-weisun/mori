@@ -570,6 +570,8 @@ def run_test_impl(
                 data_type=data_type,
                 max_tokens_to_check=10,
             )
+        torch.cuda.synchronize()
+        dist.barrier()
 
     # Skip combine phase if dispatch-only mode
     if dispatch_only:
