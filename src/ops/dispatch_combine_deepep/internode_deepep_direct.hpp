@@ -525,57 +525,59 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       // slotIdx iterates from 0 to numTokensToSend-1, representing the slot within srcPe's partition
       // offset is the packed buffer offset (not used for reading input)
       for (int slotIdx = globalWarpId; slotIdx < numTokensToSend; slotIdx += globalWarpNum) {
-        // Linear index in expert-major layout: localExpert * expertCapacity + srcPe * maxTokens + slot
-        index_t linear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + slotIdx;
+        // Source linear index (on this PE's buffer): localExpert * expertCapacity + srcPe * maxTokens + slot
+        index_t srcLinear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + slotIdx;
+
+        // Destination linear index (on srcPe's receive buffer): must include myPe to avoid collisions
+        // Layout: [destPe][localExpert][slot] where destPe is myPe (the rank sending back)
+        // This ensures data from different destination PEs goes to different offsets
+        index_t destLinear = myPe * numLocalExperts * config.maxNumInpTokenPerRank +
+                             localExpert * config.maxNumInpTokenPerRank + slotIdx;
 
         if (isRemote) {
           // Stage and RDMA put token data
-          // Use expert-major layout: linear = localExpert * expertCapacity + srcPe * maxTokens + slot
-          // This matches what Phase 3 expects when reading via dispDestTokIdMap
-          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
+          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + srcLinear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
-            localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
+            localStaging[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
           }
           __syncwarp();
 
           if (laneId == 0) {
-            // Put token data at expert-major offset
+            // Put token data - use destLinear for destination offset
             shmem::ShmemPutMemNbiThread(
                 args.shmemCombineOutTokMemObj,
-                linear * config.hiddenDim * sizeof(T),
+                destLinear * config.hiddenDim * sizeof(T),
                 args.shmemStagingTokMemObj,
-                linear * config.hiddenDim * sizeof(T),
+                srcLinear * config.hiddenDim * sizeof(T),
                 config.hiddenDim * sizeof(T),
                 srcPe, 0);
 
             // Also send weights back to srcPe for accumulation
-            // Weights were stored at shmemDispatchOutWeightsMemObj[linear * numTopK]
-            // Send to srcPe's shmemCombineOutWeightsMemObj at same offset
             if constexpr (kUseWeights) {
 #ifdef ENABLE_DEBUG_PRINTF
               // Debug: print the weight values we're about to send
               if (srcPe == 0 && localExpert == 0 && slotIdx < 2) {
-                float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[linear * numTopK + 0];
-                float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[linear * numTopK + 1];
-                printf("[COMBINE-P1-DBG] myPe=%d srcPe=%d localExp=%d slot=%d linear=%d: src_w[0]=%.4f src_w[1]=%.4f\n",
-                       myPe, srcPe, localExpert, slotIdx, (int)linear, w0, w1);
+                float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[srcLinear * numTopK + 0];
+                float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[srcLinear * numTopK + 1];
+                printf("[COMBINE-P1-DBG] myPe=%d srcPe=%d localExp=%d slot=%d srcLinear=%d destLinear=%d: src_w[0]=%.4f src_w[1]=%.4f\n",
+                       myPe, srcPe, localExpert, slotIdx, (int)srcLinear, (int)destLinear, w0, w1);
               }
 #endif
               shmem::ShmemPutMemNbiThread(
                   args.shmemCombineOutWeightsMemObj,
-                  linear * numTopK * sizeof(float),
+                  destLinear * numTopK * sizeof(float),
                   args.shmemDispatchOutWeightsMemObj,
-                  linear * numTopK * sizeof(float),
+                  srcLinear * numTopK * sizeof(float),
                   numTopK * sizeof(float),
                   srcPe, 0);
             }
           }
         } else {
           // Same-node: direct P2P copy to srcPe's combine input buffer
-          // srcPe will read from their shmemCombineInpTokMemObj at this offset
-          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>(srcPe) + linear * config.hiddenDim;
+          // Use destLinear for the destination offset (includes myPe)
+          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>(srcPe) + destLinear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
-            destPtr[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
+            destPtr[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
           }
         }
       }
@@ -659,13 +661,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   if (myPe == 0 && smId == 0 && threadId == 0) {
     printf("[COMBINE-PHASE3-ENTER] myPe=%d numSms=%d npes=%d numLocalExperts=%d\n",
            myPe, numSms, npes, numLocalExperts);
-    // Check what's in shmemCombineOutWeightsMemObj at linear=0 (received from rank 7 for localExp=0)
-    // For tokens from rank 0 to expert 56 on rank 7: linear = 0 * 32 + 0 * 4 + slot
-    float cw0 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 0];
-    float cw1 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 1];
-    float cw2 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[1 * numTopK + 0];  // linear=1
-    printf("[COMBINE-PHASE3] myPe=%d CombineOutWeights: linear=0: w[0]=%.4f w[1]=%.4f | linear=1: w[0]=%.4f\n",
-           myPe, cw0, cw1, cw2);
+    // Check weights with new layout: [destPe][localExpert][slot]
+    // For destPe=7, localExpert=0, slot=0: linear = 7 * 8 * 4 + 0 * 4 + 0 = 224
+    // For destPe=4, localExpert=0, slot=0: linear = 4 * 8 * 4 + 0 * 4 + 0 = 128
+    index_t linear_r7 = 7 * numLocalExperts * config.maxNumInpTokenPerRank + 0 * config.maxNumInpTokenPerRank + 0;
+    index_t linear_r4 = 4 * numLocalExperts * config.maxNumInpTokenPerRank + 0 * config.maxNumInpTokenPerRank + 0;
+    float cw_r7 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[linear_r7 * numTopK + 0];
+    float cw_r4 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[linear_r4 * numTopK + 0];
+    printf("[COMBINE-PHASE3] myPe=%d CombineOutWeights: destPe=7 w=%.4f | destPe=4 w=%.4f\n",
+           myPe, cw_r7, cw_r4);
   }
 #endif
 
@@ -743,26 +747,32 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       index_t destLocalTokId = destTokId % expertCapacity;
       index_t destPe = destExpert / numLocalExperts;
       index_t localExpert = destExpert % numLocalExperts;
+      // Extract slot index from destLocalTokId (destLocalTokId = srcPe * maxTokens + slot)
+      index_t destSlotIdx = destLocalTokId % config.maxNumInpTokenPerRank;
 
       if (destPe < npes) {
-        // baseOffset uses expert-major layout matching dispatch and Phase 1 send
-        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+        // For SELF tokens: use original expert-major layout
+        // For remote/P2P tokens: use new layout [destPe][localExpert][slot]
+        // selfBaseOffset matches dispatch: localExpert * expertCapacity + destLocalTokId
+        size_t selfBaseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+        // remoteBaseOffset matches combine Phase 1: destPe * numLocalExperts * maxTokens + localExpert * maxTokens + slot
+        size_t remoteBaseOffset = (destPe * numLocalExperts * config.maxNumInpTokenPerRank +
+                                   localExpert * config.maxNumInpTokenPerRank + destSlotIdx) * config.hiddenDim;
 
         if (destPe == myPe) {
           // Self-token: expert output is in our own dispatch output buffer (inpTokenBuf)
           // No inter-rank transfer needed
-          srcPtrs[j] = args.inpTokenBuf + baseOffset + hiddenDimOffset;
+          srcPtrs[j] = args.inpTokenBuf + selfBaseOffset + hiddenDimOffset;
         } else {
           bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
           if (isRemote) {
             // Data was sent to our combine out buffer via RDMA
             srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                         baseOffset + hiddenDimOffset;
+                         remoteBaseOffset + hiddenDimOffset;
           } else {
             // Data was written to our combine input buffer via P2P by destPe
-            // (Phase 1 on destPe wrote to args.shmemCombineInpTokMemObj->GetAs<T*>(myPe))
             srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
-                         baseOffset + hiddenDimOffset;
+                         remoteBaseOffset + hiddenDimOffset;
           }
         }
       } else {
@@ -772,21 +782,23 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       if constexpr (kUseWeights) {
         float w = 1.0f;
         if (j < numTopK && destPe < npes) {
-          // Weights are stored in expert-major layout: [localExpert][expertCapacity][numTopK]
-          // During dispatch, weights were written to shmemDispatchOutWeightsMemObj on destPe.
-          // For combine, we are on myPe (source rank), so we need to read from destPe's buffer.
-          index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
+          // For SELF: weights are in local shmemDispatchOutWeightsMemObj
+          // For remote/P2P: weights were sent back to shmemCombineOutWeightsMemObj
+          index_t selfLinearTok = localExpert * expertCapacity + destLocalTokId;
+          index_t remoteLinearTok = destPe * numLocalExperts * config.maxNumInpTokenPerRank +
+                                    localExpert * config.maxNumInpTokenPerRank + destSlotIdx;
+
           if (destPe == myPe) {
             // SELF token: weight is in our local buffer
-            w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
+            w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfLinearTok * numTopK + j];
           } else {
             bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
             if (isRemote) {
               // RDMA token: weight was sent back to our shmemCombineOutWeightsMemObj in Phase 1
-              w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
+              w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[remoteLinearTok * numTopK + j];
             } else {
-              // P2P token: read directly from destPe's buffer via xGMI
-              w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[destLinearTok * numTopK + j];
+              // P2P token: read directly from destPe's buffer via xGMI (original layout)
+              w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfLinearTok * numTopK + j];
             }
           }
         }
@@ -805,12 +817,17 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         index_t dLocalTokId = dTokId % expertCapacity;
         index_t dPe = dExpert / numLocalExperts;
         index_t lExpert = dExpert % numLocalExperts;
-        size_t bOffset = (lExpert * expertCapacity + dLocalTokId) * config.hiddenDim;
+        index_t dSlotIdx = dLocalTokId % config.maxNumInpTokenPerRank;
         bool isRem = internode_ll::IsRemoteRank(myPe, dPe, gpuPerNode);
+        // Use appropriate offset based on token type
+        size_t bOffset = (dPe == myPe)
+            ? (lExpert * expertCapacity + dLocalTokId) * config.hiddenDim
+            : (dPe * numLocalExperts * config.maxNumInpTokenPerRank +
+               lExpert * config.maxNumInpTokenPerRank + dSlotIdx) * config.hiddenDim;
         float val = srcPtrs[jj] ? static_cast<float>(srcPtrs[jj][0]) : -999.0f;
         float w = kUseWeights ? srcWeightScales[jj] : 1.0f;
         const char* srcType = (dPe == myPe) ? "SELF" : (isRem ? "RDMA" : "P2P");
-        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d localExp=%d baseOffset=%lu %s srcVal=%.1f w=%.4f\n",
+        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d localExp=%d offset=%lu %s srcVal=%.1f w=%.4f\n",
                (int)tokenIdx, jj, (int)dTokId, (int)dPe, (int)lExpert,
                (unsigned long)bOffset, srcType, val, w);
       }
