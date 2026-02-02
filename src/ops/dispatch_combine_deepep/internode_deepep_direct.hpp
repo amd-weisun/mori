@@ -494,6 +494,16 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     float w16 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[1 * numTopK + 0];  // linear=1
     printf("[COMBINE-ENTRY] myPe=%d: weights at linear=0: w[0]=%.4f w[1]=%.4f | linear=1: w[0]=%.4f\n",
            myPe, w0, w1, w16);
+    // Debug: Check layoutRange contents for localExpert=0
+    for (int sp = 0; sp < npes; ++sp) {
+      int64_t layout = args.layoutRange[0 * npes + sp];
+      int numTok, off;
+      internode_ll::Unpack2(layout, numTok, off);
+      if (numTok > 0) {
+        printf("[COMBINE-LAYOUT] myPe=%d localExp=0 srcPe=%d: numTok=%d offset=%d\n",
+               myPe, sp, numTok, off);
+      }
+    }
   }
 #endif
 
