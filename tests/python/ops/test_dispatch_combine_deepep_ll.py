@@ -184,21 +184,20 @@ def dequant_input_like_fp8(inputs: torch.Tensor, data_type: torch.dtype) -> torc
 def select_block_config(num_tokens: int, total_experts: int) -> tuple[int, int]:
     """Select appropriate block_num and warp_num_per_block.
 
-    DeepEP-aligned expert-centric configuration:
-        block_num = ceil(total_experts / kNumWarpGroups)
+    Token-centric configuration:
+        block_num = min(num_tokens, ceil(total_experts / 2))
 
-    Each SM (block) is responsible for kNumWarpGroups=2 experts in the count/signal phase.
-    For 288 experts: block_num = ceil(288/2) = 144 blocks.
-
-    The token dispatch phase uses SM-based striding:
+    The kernel uses SM-based token striding:
         for (tokenIdx = smId; tokenIdx < num_tokens; tokenIdx += numSms)
 
-    Blocks beyond num_tokens have no tokens to dispatch, but they still participate
-    in the expert-centric count/signal phase (counting tokens for their responsible experts).
+    Block count should not exceed num_tokens (otherwise some blocks have no work).
+    We also cap at ceil(experts/2) to match DeepEP's maximum block utilization.
     """
     kNumWarpGroups = 2
     expert_based_blocks = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
-    return expert_based_blocks, 16  # 16 warps per block
+    # Use minimum of token count and expert-based blocks
+    block_num = min(num_tokens, expert_based_blocks)
+    return block_num, 16  # 16 warps per block
 
 
 def create_op_for_setting(
@@ -530,6 +529,23 @@ def run_test_impl(
         validate_dispatch(
             rank, num_experts_per_rank, world_size, recv_count, all_rank_indices
         )
+        # Also validate data placement (only on rank 0 for performance)
+        if rank == 0:
+            validate_dispatch_data(
+                rank=rank,
+                world_size=world_size,
+                num_experts_per_rank=num_experts_per_rank,
+                hidden_dim=hidden_dim,
+                gpu_per_node=gpu_per_node,
+                dispatch_output=dispatch_output,
+                dispatch_scales=dispatch_scales,
+                recv_count=recv_count,
+                all_rank_input=all_rank_input,
+                all_rank_indices=all_rank_indices,
+                use_fp8=use_fp8,
+                data_type=data_type,
+                max_tokens_to_check=10,
+            )
 
     # Skip combine phase if dispatch-only mode
     if dispatch_only:
@@ -598,6 +614,150 @@ def validate_dispatch(rank, num_experts_per_rank, world_size, recv_count, all_ra
             f"Expected {expected_from_indices}, got {actual_from_counts}"
         )
     _log(f"[Rank {rank}] Dispatch validation passed: {actual_from_counts} tokens", force=True)
+
+
+def validate_dispatch_data(
+    rank: int,
+    world_size: int,
+    num_experts_per_rank: int,
+    hidden_dim: int,
+    gpu_per_node: int,
+    dispatch_output: torch.Tensor,
+    dispatch_scales: torch.Tensor | None,
+    recv_count: torch.Tensor,
+    all_rank_input: list,
+    all_rank_indices: list,
+    use_fp8: bool,
+    data_type: torch.dtype,
+    max_tokens_to_check: int = 10,
+):
+    """Validate dispatch data placement by checking actual token values.
+
+    This function verifies that tokens dispatched from each source rank are
+    placed at the correct locations in the output buffer with correct values.
+
+    Buffer layout (internode):
+    - dispatch_output: [num_local_experts, expert_capacity, hidden_dim]
+    - expert_capacity = max_num_inp_token_per_rank * world_size (for internode)
+    - Each source rank has reserved slots: [srcPe * max_tokens, (srcPe+1) * max_tokens)
+
+    Args:
+        rank: Current rank
+        world_size: Total number of ranks
+        num_experts_per_rank: Number of experts per rank
+        hidden_dim: Hidden dimension
+        gpu_per_node: GPUs per node (to determine if internode)
+        dispatch_output: Output buffer [num_experts, capacity, hidden_dim]
+        dispatch_scales: Scales for FP8 (or None for BF16)
+        recv_count: Received count per expert [num_experts]
+        all_rank_input: List of input tensors for each rank
+        all_rank_indices: List of expert indices for each rank
+        use_fp8: Whether FP8 quantization is used
+        data_type: Data type for comparison
+        max_tokens_to_check: Maximum tokens to check per expert (for performance)
+    """
+    is_internode = world_size > gpu_per_node
+
+    # Dequantize output if FP8
+    if use_fp8 and dispatch_scales is not None:
+        dispatch_out_bf16 = dequant_dispatch_output(dispatch_output, dispatch_scales, hidden_dim)
+    else:
+        dispatch_out_bf16 = dispatch_output
+
+    # For internode: each source rank gets slots [srcPe * max_tokens, (srcPe+1) * max_tokens)
+    max_tokens_per_rank = all_rank_input[0].shape[0]
+
+    # Build expected token placement for this rank's local experts
+    rank_begin = rank * num_experts_per_rank
+    rank_end = rank_begin + num_experts_per_rank
+
+    print(f"[Rank {rank}] Validating dispatch data placement...", flush=True)
+    print(f"  Local experts: {rank_begin} to {rank_end - 1}", flush=True)
+    print(f"  dispatch_output shape: {dispatch_out_bf16.shape}", flush=True)
+    print(f"  is_internode: {is_internode}", flush=True)
+
+    # Track expected token positions per local expert
+    # expected_tokens[local_expert_idx] = list of (src_rank, src_token_idx, slot_idx)
+    expected_tokens = {e: [] for e in range(num_experts_per_rank)}
+
+    # For each source rank, track what tokens should go to which local expert
+    slot_counters = {e: {} for e in range(num_experts_per_rank)}  # local_expert -> {src_rank: count}
+
+    for src_rank in range(world_size):
+        indices = all_rank_indices[src_rank]  # [num_tokens, topk]
+        for src_token_idx in range(indices.shape[0]):
+            for k in range(indices.shape[1]):
+                expert_id = indices[src_token_idx, k].item()
+                if rank_begin <= expert_id < rank_end:
+                    local_expert = expert_id - rank_begin
+                    if src_rank not in slot_counters[local_expert]:
+                        slot_counters[local_expert][src_rank] = 0
+
+                    # Slot index for internode: srcPe * max_tokens + count
+                    slot_idx = src_rank * max_tokens_per_rank + slot_counters[local_expert][src_rank]
+                    slot_counters[local_expert][src_rank] += 1
+
+                    expected_tokens[local_expert].append((src_rank, src_token_idx, slot_idx))
+
+    # Validate each local expert
+    errors_found = 0
+    tokens_checked = 0
+
+    for local_expert in range(num_experts_per_rank):
+        expert_tokens = expected_tokens[local_expert]
+        expert_recv_count = recv_count[local_expert].item()
+
+        # Check count matches
+        if len(expert_tokens) != expert_recv_count:
+            print(f"  [Expert {local_expert}] Count mismatch: expected {len(expert_tokens)}, got {expert_recv_count}", flush=True)
+            errors_found += 1
+            continue
+
+        # Check actual token data (limit for performance)
+        tokens_to_check = min(max_tokens_to_check, len(expert_tokens))
+        for i in range(tokens_to_check):
+            src_rank, src_token_idx, slot_idx = expert_tokens[i]
+
+            # Get expected value (from source rank's input)
+            expected_input = all_rank_input[src_rank][src_token_idx]
+            if use_fp8:
+                expected_input = dequant_input_like_fp8(expected_input.unsqueeze(0), data_type).squeeze(0)
+
+            # Get actual value from dispatch output
+            actual = dispatch_out_bf16[local_expert, slot_idx, :]
+
+            # Compare with tolerance
+            atol = 0.5 if use_fp8 else 0.01
+            rtol = 0.25 if use_fp8 else 0.01
+
+            if not torch.allclose(actual.float(), expected_input.float(), atol=atol, rtol=rtol):
+                # Print detailed mismatch info
+                print(f"  [Expert {local_expert}] Token mismatch at slot {slot_idx}:", flush=True)
+                print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
+                print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
+                print(f"    actual[:8]={actual[:8].tolist()}", flush=True)
+                errors_found += 1
+
+                # Also check if data is zero (not written at all)
+                if actual.abs().max().item() < 1e-6:
+                    print(f"    WARNING: Slot appears to be all zeros - token may not have been written", flush=True)
+
+                # Check first 8 slots for this expert to see pattern
+                if i == 0:
+                    print(f"    First 8 slots for expert {local_expert}:", flush=True)
+                    for s in range(min(8, dispatch_out_bf16.shape[1])):
+                        slot_data = dispatch_out_bf16[local_expert, s, :8]
+                        is_zero = slot_data.abs().max().item() < 1e-6
+                        print(f"      slot[{s}]: {slot_data.tolist()} {'(zero)' if is_zero else ''}", flush=True)
+
+            tokens_checked += 1
+
+    if errors_found > 0:
+        raise AssertionError(
+            f"Rank {rank}: Dispatch data validation failed with {errors_found} errors"
+        )
+
+    print(f"[Rank {rank}] Dispatch data validation passed: checked {tokens_checked} tokens", flush=True)
 
 
 def validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type):

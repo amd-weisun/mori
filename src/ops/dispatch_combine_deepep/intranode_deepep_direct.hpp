@@ -136,18 +136,18 @@ __device__ inline float QuarterWarpReduceMax(float value) {
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
 }  // namespace detail
 
-// DeepEP-aligned dispatch kernel with SM-based token striding and expert-centric count/signal
-// Key features aligned with DeepEP internode_ll.cu:
+// DeepEP-aligned dispatch kernel with SM-based token striding
+// Key features:
 // 1. SM-based token striding: Each block handles tokens[blockIdx.x], tokens[blockIdx.x + gridDim.x], ...
 // 2. Warp-based top-k handling: Each warp handles one top-k destination per token
 // 3. All-thread FP8 quantization: All threads in block work on one token's FP8 quantization
-// 4. Per-expert finish counters: Each warp increments finishCounterPerExpert[destExpert] after copy
-// 5. Expert-centric count phase: Last warp per SM counts tokens for experts [smId*2, smId*2+2)
-// 6. Expert-centric signal phase: Each warp group (2 per SM) waits for its responsible expert
+// 4. Per-destPe finish counters: Simpler than per-expert (8 counters vs 288 for 8 ranks)
+// 5. Finish counter pattern: Each warp increments counter after copy, count warp adds offset
 //
-// Note on Phase 5 (Packed Buffers): Packed message format is primarily beneficial for internode
-// RDMA where bundling reduces per-message overhead. For intranode xGMI (cache-coherent),
-// separate buffers are kept as they provide simpler indexing without packing/unpacking overhead.
+// Note: DeepEP uses per-expert finish counters and LOCAL atomics for slot assignment.
+// MORI intranode still uses REMOTE atomics (on destPe's symmetric memory) which is the
+// main performance bottleneck. Full expert-centric restructure would require changing
+// the slot assignment to use local counters like DeepEP.
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
@@ -291,9 +291,9 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             destPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId] = fp8Packed;
           }
 
-          // Increment per-expert finish counter after copy (release semantics)
+          // Increment finish counter after copy (release semantics)
           if (laneId == 0) {
-            detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
+            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
           }
         }
       } else {
@@ -332,9 +332,9 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
                          args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
 
-          // Increment per-expert finish counter after copy (release semantics)
+          // Increment finish counter after copy (release semantics)
           if (laneId == 0) {
-            detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
+            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
           }
         }
       }
@@ -342,76 +342,40 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // DeepEP-aligned expert-centric count/signal phase
-  // Each SM is responsible for counting and signaling for experts [smId * kNumWarpGroups, smId * kNumWarpGroups + kNumWarpGroups)
-  constexpr int kNumWarpGroups = 2;  // Each SM handles 2 experts (AMD MI300X config)
-  constexpr int kNumWarpsPerGroup = 8;
-  const int warpGroupId = warpId / kNumWarpsPerGroup;
-  const int subWarpId = warpId % kNumWarpsPerGroup;
-  const int numExperts = config.numExpertPerRank * npes;
-  const int numLocalExperts = config.numExpertPerRank;
-  const int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
-
-  // Shared memory for per-warp-group expert token counts
-  __shared__ int sharedNumTokensSentPerExpert[kNumWarpGroups];
-
-  // Count phase: Last warp per SM counts tokens for this SM's responsible experts
-  // DeepEP pattern: warp_id == num_warps - 1 counts for expert_begin_idx = sm_id * kNumWarpGroups
-  if (warpId == warpNum - 1) {
-    int expertCount[kNumWarpGroups] = {0};
-    const int expertBeginIdx = smId * kNumWarpGroups;
-    const int expertEndIdx = min(expertBeginIdx + kNumWarpGroups, numExperts);
-
-    // Per-lane count: each lane counts tokens destined for this SM's experts
+  // Count warp: Computes expected tokens per destPe and adds offset to finish counters
+  // Uses the last global warp (simpler than per-SM, sufficient for intranode)
+  constexpr int kMaxGpuPerNode = 8;
+  assert(npes <= kMaxGpuPerNode && "Intranode dispatch assumes worldSize <= 8 GPUs per node");
+  if (globalWarpId == globalWarpNum - 1) {
+    int countPerDestPe[kMaxGpuPerNode] = {0};
     for (int i = laneId; i < args.curRankNumToken * config.numExpertPerToken; i += warpSize) {
       if (args.tokenIndices) {
         index_t destExpert = args.tokenIndices[i];
-        if (destExpert >= expertBeginIdx && destExpert < expertEndIdx) {
-          expertCount[destExpert - expertBeginIdx]++;
+        index_t destPe = destExpert / config.numExpertPerRank;
+        if (destPe < npes && destPe < kMaxGpuPerNode) {
+          countPerDestPe[destPe]++;
         }
       }
     }
-
-    // Warp reduce and update finish counters per expert
-    for (int i = expertBeginIdx; i < expertEndIdx; ++i) {
-      int count = expertCount[i - expertBeginIdx];
-      // Warp reduction sum
+    for (int pe = 0; pe < npes && pe < kMaxGpuPerNode; ++pe) {
+      int count = countPerDestPe[pe];
       for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         count += __shfl_xor(count, offset);
       }
       if (laneId == 0) {
-        sharedNumTokensSentPerExpert[i - expertBeginIdx] = count;
-        // Add (FINISHED_SUM_TAG - count) to make finish counter reach TAG when all tokens dispatched
         uint32_t finishOffset = detail::kFinishedSumTag - static_cast<uint32_t>(count);
-        detail::AtomicAddRelaxed(args.finishCounterPerExpert + i, finishOffset);
+        detail::AtomicAddRelease(args.finishCounterPerDestPe + pe, finishOffset);
       }
     }
   }
-  __syncthreads();
 
-  // Signal phase: Each warp group waits for its responsible expert's finish counter
-  // Then signals that this expert's tokens are all dispatched
-  // Pattern: One warp per expert (sub_warp_id == 0, lane_id == 0)
-  if (responsibleExpertIdx < numExperts && subWarpId == 0 && laneId == 0) {
-    // Wait for finish counter to reach FINISHED_SUM_TAG
-    while (detail::AtomicLoadAcquire(args.finishCounterPerExpert + responsibleExpertIdx) !=
-           detail::kFinishedSumTag) {
-    }
-
-    // Reset finish counter for next invocation
-    args.finishCounterPerExpert[responsibleExpertIdx] = 0;
-  }
-
-  // Grid barrier to ensure all expert finish counters have been checked
-  // before sending the aggregated per-destPe token count signals
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
-
-  // Final signal phase: Send token counts per destPe
-  // destPeTokenCounter was already updated during token dispatch loop
-  // Only first warp handles this (one signal per destPe, not per expert)
+  // Signal phase: Wait for finish counter per destPe, then send token counts
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t numTokenSignal = detail::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      while (detail::AtomicLoadAcquire(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
+      }
+
+      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       detail::AtomicStoreRelease(signal, numTokenSignal);
