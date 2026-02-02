@@ -490,6 +490,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     printf("[COMBINE-INIT] inpTokenBuf[0:4] = %.1f, %.1f, %.1f, %.1f\n",
            (float)args.inpTokenBuf[0], (float)args.inpTokenBuf[1],
            (float)args.inpTokenBuf[2], (float)args.inpTokenBuf[3]);
+    // Print weight buffer info
+    printf("[COMBINE-INIT] weightsBuf=%p kUseWeights=%d\n",
+           (void*)args.weightsBuf, (int)kUseWeights);
+    if (args.weightsBuf) {
+      printf("[COMBINE-INIT] weightsBuf[0:4] = %.4f, %.4f, %.4f, %.4f\n",
+             args.weightsBuf[0], args.weightsBuf[1], args.weightsBuf[2], args.weightsBuf[3]);
+    }
     // Print dispDestTokIdMap for token 0
     for (int k = 0; k < numTopK; ++k) {
       index_t destTokId = args.dispDestTokIdMap[k];
@@ -767,6 +774,17 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     // Debug: Check SELF tokens - do manual copy instead of WarpAccum to diagnose
     index_t destPeForDebug = (args.dispDestTokIdMap[tokenIdx * numTopK] / expertCapacity) / numLocalExperts;
     bool isSelf = (destPeForDebug == myPe);
+    bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPeForDebug, gpuPerNode);
+    const char* routeTypeDbg = isSelf ? "SELF" : (isRemoteDbg ? "RDMA" : "P2P");
+
+    // Print weight info for ALL token types on rank 0
+    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0) {
+      printf("[COMBINE-WEIGHT-DBG] token=%d %s: srcVal=%.1f weight=%.4f\n",
+             (int)tokenIdx, routeTypeDbg,
+             srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f,
+             kUseWeights ? srcWeightScales[0] : 1.0f);
+    }
+
     if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
       printf("[COMBINE-ACCUM-BEFORE] token=%d hiddenDimSize=%d srcVal=%.1f outVal=%.1f\n",
              (int)tokenIdx, (int)hiddenDimSize,
