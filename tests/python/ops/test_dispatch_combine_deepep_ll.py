@@ -219,27 +219,19 @@ def dequant_input_like_fp8(inputs: torch.Tensor, data_type: torch.dtype) -> torc
     return dequant.view(inputs.size(0), inputs.size(1)).to(data_type)
 
 
-def select_block_config(num_tokens: int, total_experts: int) -> tuple[int, int]:
-    """Select appropriate block_num and warp_num_per_block.
+def select_block_config(max_num_inp_token_per_rank: int, total_experts: int = 0) -> tuple[int, int]:
+    """Select appropriate block_num and warp_num_per_block based on token count.
 
-    Expert-centric configuration (aligned with DeepEP):
-        block_num = ceil(total_experts / kNumWarpGroups) = 144 for 288 experts
+    Follows the pattern from bench_dispatch_combine.py:
+    - High bandwidth (>1024 tokens): block_num=80, warp_num_per_block=16
+    - Low latency (<=1024 tokens): block_num=64, warp_num_per_block=16
 
-    Each SM "owns" kNumWarpGroups=2 experts based on blockIdx.x:
-        responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId
-
-    All SMs process all tokens, but only copy data for tokens going to their
-    responsible experts. This ensures all experts are covered regardless of
-    token count.
-
-    Block count is based solely on expert count, not token count.
+    Note: total_experts parameter is kept for API compatibility but not used.
     """
-    kNumWarpGroups = 2
-    kNumWarpsPerGroup = 8
-    # Expert-centric: block count based on experts only
-    block_num = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
-    warp_num_per_block = kNumWarpGroups * kNumWarpsPerGroup  # 16 warps
-    return block_num, warp_num_per_block
+    if max_num_inp_token_per_rank > 1024:
+        return 80, 16
+    else:
+        return 64, 16
 
 
 def create_op_for_setting(
