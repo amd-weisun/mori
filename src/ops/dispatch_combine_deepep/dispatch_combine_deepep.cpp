@@ -358,6 +358,9 @@ void EpDispatchCombineHandle::LaunchIntraNodeDispatchDeepepLL(int blockNum, int 
   HIP_RUNTIME_CHECK(hipMemsetAsync(finishCounterPerExpert, 0,
                                    numExpertsTotal * sizeof(uint32_t), stream));
 
+  // Reset grid barrier for expert-centric dispatch (used after per-expert signal phase)
+  HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, sizeof(uint32_t), stream));
+
   size_t expertCapacity = static_cast<size_t>(config.worldSize) * config.maxNumInpTokenPerRank;
   size_t totalTokenSlots = static_cast<size_t>(config.numExpertPerRank) * expertCapacity;
   HIP_RUNTIME_CHECK(hipMemsetAsync(dispTokIdToSrcTokIdMemObj->Get(), 0xFF,
