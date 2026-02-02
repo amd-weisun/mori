@@ -659,9 +659,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
     __syncwarp();
 
-    // Accumulate into the combine output buffer (shmemCombineOutTokMemObj)
-    // For internode, the Python binding returns shmemCombineOutTokMemObj as the output tensor
-    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+    // Accumulate into the dispatch output buffer (shmemDispatchOutTokMemObj)
+    // We can't use shmemCombineOutTokMemObj because it contains RDMA-received data
+    // that we might still need to read for later tokens. Using a separate buffer
+    // avoids read-after-write conflicts.
+    T* outPtr = args.shmemDispatchOutTokMemObj->template GetAs<T*>() +
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);

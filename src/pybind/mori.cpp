@@ -436,8 +436,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchInterNodeCombineDe
   handle.LaunchInterNodeCombineDeepepLL(blockNum, warpPerBlock, at::cuda::getCurrentHIPStream());
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
+  // Return tensor from shmemDispatchOutTokMemObj which the kernel writes to.
+  // We can't use shmemCombineOutTokMemObj because the kernel uses it for RDMA receive,
+  // and writing output there would cause read-after-write conflicts.
   torch::Tensor out =
-      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
                        {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
