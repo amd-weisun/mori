@@ -184,20 +184,24 @@ def dequant_input_like_fp8(inputs: torch.Tensor, data_type: torch.dtype) -> torc
 def select_block_config(num_tokens: int, total_experts: int) -> tuple[int, int]:
     """Select appropriate block_num and warp_num_per_block.
 
-    Token-centric configuration:
-        block_num = min(num_tokens, ceil(total_experts / 2))
+    Expert-centric configuration (aligned with DeepEP):
+        block_num = ceil(total_experts / kNumWarpGroups) = 144 for 288 experts
 
-    The kernel uses SM-based token striding:
-        for (tokenIdx = smId; tokenIdx < num_tokens; tokenIdx += numSms)
+    Each SM "owns" kNumWarpGroups=2 experts based on blockIdx.x:
+        responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId
 
-    Block count should not exceed num_tokens (otherwise some blocks have no work).
-    We also cap at ceil(experts/2) to match DeepEP's maximum block utilization.
+    All SMs process all tokens, but only copy data for tokens going to their
+    responsible experts. This ensures all experts are covered regardless of
+    token count.
+
+    Block count is based solely on expert count, not token count.
     """
     kNumWarpGroups = 2
-    expert_based_blocks = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
-    # Use minimum of token count and expert-based blocks
-    block_num = min(num_tokens, expert_based_blocks)
-    return block_num, 16  # 16 warps per block
+    kNumWarpsPerGroup = 8
+    # Expert-centric: block count based on experts only
+    block_num = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
+    warp_num_per_block = kNumWarpGroups * kNumWarpsPerGroup  # 16 warps
+    return block_num, warp_num_per_block
 
 
 def create_op_for_setting(
@@ -441,8 +445,11 @@ def run_test_impl(
     # In real multi-node mode, use rank % gpu_per_node to get local device.
     device_id = local_gpu_id if local_gpu_id is not None else (rank % gpu_per_node)
     device = torch.device("cuda", device_id)
-    rng = torch.Generator(device=device)
-    rng.manual_seed(123)
+
+    # Use CPU generator for deterministic random data across all ranks
+    # CUDA generators may produce different sequences on different GPUs
+    cpu_rng = torch.Generator()
+    cpu_rng.manual_seed(123)
 
     # Always create config (needed for validation even when op is provided)
     block_num, warp_num_per_block = select_block_config(max_num_inp_token_per_rank, total_experts)
@@ -471,7 +478,8 @@ def run_test_impl(
     if op is None:
         op = mori.ops.EpDispatchCombineDeepepOp(config)
 
-    # Generate test data (same RNG seed across all ranks for reproducibility)
+    # Generate test data using CPU RNG for deterministic values across all ranks
+    # CUDA generators may produce different sequences on different GPUs
     num_token = torch.tensor(
         [max_num_inp_token_per_rank for _ in range(world_size)]
     ).to(device)
@@ -480,7 +488,8 @@ def run_test_impl(
     for r in range(world_size):
         indices = torch.empty(num_token[r], num_experts_per_token, dtype=torch.int64)
         for i in range(num_token[r]):
-            perm = torch.randperm(total_experts, generator=rng, device=device)
+            # Generate permutation on CPU for determinism
+            perm = torch.randperm(total_experts, generator=cpu_rng)
             indices[i] = perm[:num_experts_per_token]
         all_rank_indices.append(indices.to(torch.int32).to(device))
 
@@ -490,7 +499,8 @@ def run_test_impl(
     ]
 
     all_rank_input = [
-        (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=rng, device=device) * 2 - 1).to(data_type)
+        # Generate on CPU then move to GPU for deterministic values across ranks
+        (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
         for r in range(world_size)
     ]
 
@@ -947,8 +957,10 @@ def run_benchmark(
     data_type = torch.bfloat16
 
     device = torch.device("cuda", torch.cuda.current_device())
-    rng = torch.Generator(device=device)
-    rng.manual_seed(123)
+
+    # Use CPU generator for deterministic random data across all ranks
+    cpu_rng = torch.Generator()
+    cpu_rng.manual_seed(123)
 
     assert total_experts % world_size == 0
     num_experts_per_rank = total_experts // world_size
@@ -970,7 +982,7 @@ def run_benchmark(
             flush=True,
         )
 
-    # Generate test data once
+    # Generate test data once using CPU RNG for determinism across ranks
     def gen_test_data():
         num_token = torch.tensor(
             [max_num_inp_token_per_rank for _ in range(world_size)]
@@ -980,7 +992,7 @@ def run_benchmark(
         for r in range(world_size):
             indices = torch.empty(num_token[r], num_experts_per_token, dtype=torch.int64)
             for i in range(num_token[r]):
-                perm = torch.randperm(total_experts, generator=rng, device=device)
+                perm = torch.randperm(total_experts, generator=cpu_rng)
                 indices[i] = perm[:num_experts_per_token]
             all_rank_indices.append(indices.to(torch.int32).to(device))
 
@@ -990,7 +1002,7 @@ def run_benchmark(
         ]
 
         all_rank_input = [
-            (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=rng, device=device) * 2 - 1).to(data_type)
+            (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
             for r in range(world_size)
         ]
 
