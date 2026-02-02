@@ -94,10 +94,7 @@ constexpr int kNumPerChannels = 128;
 constexpr int kElemsPerLoad = 8;  // uint4 = 16 bytes = 8 bf16 elements
 constexpr float kFP8Margin = 1e-4f;
 
-// Expert-centric constants (aligned with DeepEP)
-constexpr int kNumWarpGroups = 2;       // Each SM handles 2 experts (for count/signal phase)
-constexpr int kNumWarpsPerGroup = 8;    // 8 warps per warp group
-constexpr int kNumWarpsPerBlock = kNumWarpGroups * kNumWarpsPerGroup;  // 16 warps
+// Note: kNumWarpGroups and kNumWarpsPerGroup are defined in dispatch_combine_deepep.hpp
 
 // Finish counter pattern: when counter reaches this value, all tokens for that expert are dispatched
 // The pattern works as: finish_counter = dispatched_count + (FINISHED_SUM_TAG - expected_count)
@@ -138,13 +135,7 @@ __device__ inline float QuarterWarpReduceMax(float value) {
   return value;
 }
 
-// Warp-level sum reduction
-__device__ inline int WarpReduceSum(int value) {
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    value += __shfl_xor(value, offset);
-  }
-  return value;
-}
+// Note: WarpReduceSum is defined in dispatch_combine_deepep.hpp as a template
 
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
 }  // namespace detail
@@ -535,7 +526,8 @@ __global__ void EpCombineIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       if (destPe < config.worldSize) {
         // Step 4: read remote expert-major slot from symmetric buffers.
-        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+        // Include hiddenDimOffset to handle partial hidden dimension slices.
+        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim + hiddenDimOffset;
         srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) + baseOffset;
         if constexpr (kUseWeights) {
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
@@ -554,93 +546,24 @@ __global__ void EpCombineIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     __syncwarp();
 
     // Step 5: weighted accumulation of all top-k contributions.
+    // WarpAccum signature: (dest, srcs, srcScales, accumNum, nelems)
     if constexpr (kUseWeights) {
       core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
-                      srcWeightScales, config.numExpertPerToken, hiddenDimSize,
-                      hiddenDimOffset);
+                      srcWeightScales, config.numExpertPerToken, hiddenDimSize);
     } else {
-      core::WarpAccumNoWeights(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset,
-                                srcPtrs, nullptr, config.numExpertPerToken,
-                                hiddenDimSize, hiddenDimOffset);
-    }
-  }
-
-  // Copy back new weights / indices if caller provided combined-output buffers.
-  if (args.outWeights) {
-    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
-      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
-      index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
-
-      size_t baseWeightOff = (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
-      core::WarpCopy(args.outWeights + i * config.numExpertPerToken,
-                     args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) + baseWeightOff,
-                     config.numExpertPerToken);
-    }
-  }
-
-  if (args.outIndices) {
-    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
-      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
-      index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
-
-      size_t baseIdxOff = (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
-      core::WarpCopy(args.outIndices + i * config.numExpertPerToken,
-                     args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) + baseIdxOff,
-                     config.numExpertPerToken);
-    }
-  }
-
-  // Copy back scales if fp8
-  if (args.outScales) {
-    const int numScales = config.hiddenDim / detail::kNumPerChannels;
-    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
-      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
-      index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
-
-      size_t baseScaleOff = (localExpert * expertCapacity + destLocalTokId) * numScales;
-      core::WarpCopy(args.outScales + i * numScales,
-                     args.shmemOutScalesMemObj->template GetAs<float*>(destPe) + baseScaleOff,
-                     numScales);
-    }
-  }
-
-  // Copy out token data from fp8 symmetric buffer
-  if constexpr (kUseFP8) {
-    const int numScales = config.hiddenDim / detail::kNumPerChannels;
-    using FP8 = __hip_fp8_storage_t;
-    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
-      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
-      index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t localExpert = destExpert % config.numExpertPerRank;
-
-      size_t baseTokOff = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
-      core::WarpCopy(args.fp8OutTokenBuf + i * config.hiddenDim,
-                     args.shmemDispatchOutTokMemObj->template GetAs<FP8*>(destPe) + baseTokOff,
-                     config.hiddenDim);
-    }
-  } else {
-    // Standard path: copy non-fp8 to outTokenBuf via accumulation (already done above)
-    // Additional path for callers that just want raw dispatch output
-    if (args.fp8OutTokenBuf) {
-      for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
-        core::WarpCopyAccumTopK(
-                                args.outTokenBuf + i * config.hiddenDim, srcPtrs,
-                                srcWeightsPtr, nullptr, config.numExpertPerToken,
-                                config.numExpertPerToken);
+      // Without weights, use uniform weights of 1.0
+      float uniformWeights[MAX_EXPERTS_PER_TOKEN];
+      for (int w = 0; w < config.numExpertPerToken; ++w) {
+        uniformWeights[w] = 1.0f;
       }
+      core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
+                      uniformWeights, config.numExpertPerToken, hiddenDimSize);
     }
   }
+
+  // Note: The combine kernel does weighted accumulation above.
+  // Output weights/indices/scales are not copied back in the LL path since
+  // the caller already has this information from the dispatch phase.
 }
 
 }  // namespace deepep
