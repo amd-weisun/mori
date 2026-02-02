@@ -641,6 +641,11 @@ def validate_dispatch_data(
     - expert_capacity = max_num_inp_token_per_rank * world_size (for internode)
     - Each source rank has reserved slots: [srcPe * max_tokens, (srcPe+1) * max_tokens)
 
+    NOTE: Slot assignment within a source rank's partition is non-deterministic
+    due to SM-strided token processing with atomicAdd. We cannot predict the exact
+    slot, but we can verify that each expected token appears SOMEWHERE in the
+    source rank's partition.
+
     Args:
         rank: Current rank
         world_size: Total number of ranks
@@ -676,12 +681,9 @@ def validate_dispatch_data(
     print(f"  dispatch_output shape: {dispatch_out_bf16.shape}", flush=True)
     print(f"  is_internode: {is_internode}", flush=True)
 
-    # Track expected token positions per local expert
-    # expected_tokens[local_expert_idx] = list of (src_rank, src_token_idx, slot_idx)
-    expected_tokens = {e: [] for e in range(num_experts_per_rank)}
-
-    # For each source rank, track what tokens should go to which local expert
-    slot_counters = {e: {} for e in range(num_experts_per_rank)}  # local_expert -> {src_rank: count}
+    # Build expected tokens per (local_expert, src_rank)
+    # expected_tokens[local_expert][src_rank] = list of (src_token_idx, expected_tensor)
+    expected_tokens = {e: {r: [] for r in range(world_size)} for e in range(num_experts_per_rank)}
 
     for src_rank in range(world_size):
         indices = all_rank_indices[src_rank]  # [num_tokens, topk]
@@ -690,74 +692,81 @@ def validate_dispatch_data(
                 expert_id = indices[src_token_idx, k].item()
                 if rank_begin <= expert_id < rank_end:
                     local_expert = expert_id - rank_begin
-                    if src_rank not in slot_counters[local_expert]:
-                        slot_counters[local_expert][src_rank] = 0
-
-                    # Slot index for internode: srcPe * max_tokens + count
-                    slot_idx = src_rank * max_tokens_per_rank + slot_counters[local_expert][src_rank]
-                    slot_counters[local_expert][src_rank] += 1
-
-                    expected_tokens[local_expert].append((src_rank, src_token_idx, slot_idx))
+                    # Get expected value (from source rank's input)
+                    expected_input = all_rank_input[src_rank][src_token_idx]
+                    if use_fp8:
+                        expected_input = dequant_input_like_fp8(expected_input.unsqueeze(0), data_type).squeeze(0)
+                    expected_tokens[local_expert][src_rank].append((src_token_idx, expected_input))
 
     # Validate each local expert
     errors_found = 0
+    tokens_matched = 0
     tokens_checked = 0
 
     for local_expert in range(num_experts_per_rank):
-        expert_tokens = expected_tokens[local_expert]
-        expert_recv_count = recv_count[local_expert].item()
+        expert_recv_count = int(recv_count[local_expert].item())
+        total_expected = sum(len(expected_tokens[local_expert][r]) for r in range(world_size))
 
         # Check count matches
-        if len(expert_tokens) != expert_recv_count:
-            print(f"  [Expert {local_expert}] Count mismatch: expected {len(expert_tokens)}, got {expert_recv_count}", flush=True)
+        if total_expected != expert_recv_count:
+            print(f"  [Expert {local_expert}] Count mismatch: expected {total_expected}, got {expert_recv_count}", flush=True)
             errors_found += 1
             continue
 
-        # Check actual token data (limit for performance)
-        tokens_to_check = min(max_tokens_to_check, len(expert_tokens))
-        for i in range(tokens_to_check):
-            src_rank, src_token_idx, slot_idx = expert_tokens[i]
+        # For each source rank, get actual tokens in its partition and match against expected
+        for src_rank in range(world_size):
+            expected_list = expected_tokens[local_expert][src_rank]
+            if not expected_list:
+                continue
 
-            # Get expected value (from source rank's input)
-            expected_input = all_rank_input[src_rank][src_token_idx]
-            if use_fp8:
-                expected_input = dequant_input_like_fp8(expected_input.unsqueeze(0), data_type).squeeze(0)
+            num_expected = len(expected_list)
+            partition_start = src_rank * max_tokens_per_rank
+            partition_end = partition_start + num_expected  # Only check slots that should have data
 
-            # Get actual value from dispatch output
-            actual = dispatch_out_bf16[local_expert, slot_idx, :]
+            # Get actual tokens from this partition
+            actual_tokens = []
+            for slot_idx in range(partition_start, partition_end):
+                actual = dispatch_out_bf16[local_expert, slot_idx, :]
+                actual_tokens.append(actual)
 
-            # Compare with tolerance
+            # Match expected tokens against actual (order may differ)
+            # Use greedy matching: for each expected, find best match in actual
+            matched = [False] * num_expected
             atol = 0.5 if use_fp8 else 0.01
             rtol = 0.25 if use_fp8 else 0.01
 
-            if not torch.allclose(actual.float(), expected_input.float(), atol=atol, rtol=rtol):
-                # Print detailed mismatch info
-                print(f"  [Expert {local_expert}] Token mismatch at slot {slot_idx}:", flush=True)
-                print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
-                print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
-                print(f"    actual[:8]={actual[:8].tolist()}", flush=True)
-                errors_found += 1
+            for i, (src_token_idx, expected_input) in enumerate(expected_list):
+                if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
+                    break  # Limit total checks for performance
 
-                # Also check if data is zero (not written at all)
-                if actual.abs().max().item() < 1e-6:
-                    print(f"    WARNING: Slot appears to be all zeros - token may not have been written", flush=True)
+                found_match = False
+                for j, actual in enumerate(actual_tokens):
+                    if matched[j]:
+                        continue
+                    if torch.allclose(actual.float(), expected_input.float(), atol=atol, rtol=rtol):
+                        matched[j] = True
+                        found_match = True
+                        tokens_matched += 1
+                        break
 
-                # Check first 8 slots for this expert to see pattern
-                if i == 0:
-                    print(f"    First 8 slots for expert {local_expert}:", flush=True)
-                    for s in range(min(8, dispatch_out_bf16.shape[1])):
-                        slot_data = dispatch_out_bf16[local_expert, s, :8]
-                        is_zero = slot_data.abs().max().item() < 1e-6
-                        print(f"      slot[{s}]: {slot_data.tolist()} {'(zero)' if is_zero else ''}", flush=True)
+                tokens_checked += 1
 
-            tokens_checked += 1
+                if not found_match:
+                    print(f"  [Expert {local_expert}] Token not found in partition:", flush=True)
+                    print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
+                    print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
+                    print(f"    Partition [{partition_start}:{partition_end}] contents:", flush=True)
+                    for s_idx, actual in enumerate(actual_tokens[:4]):  # Show first 4 slots
+                        is_zero = actual.abs().max().item() < 1e-6
+                        print(f"      slot[{partition_start + s_idx}]: {actual[:8].tolist()} {'(zero)' if is_zero else ''}", flush=True)
+                    errors_found += 1
 
     if errors_found > 0:
         raise AssertionError(
             f"Rank {rank}: Dispatch data validation failed with {errors_found} errors"
         )
 
-    print(f"[Rank {rank}] Dispatch data validation passed: checked {tokens_checked} tokens", flush=True)
+    print(f"[Rank {rank}] Dispatch data validation passed: matched {tokens_matched}/{tokens_checked} tokens", flush=True)
 
 
 def validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type):
