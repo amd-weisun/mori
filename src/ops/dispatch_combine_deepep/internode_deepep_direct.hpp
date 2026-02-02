@@ -285,6 +285,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
         if (laneId == 0) {
           if (args.weightsBuf) {
+#ifdef ENABLE_DEBUG_PRINTF
+            // Debug: print what we're about to PUT for RDMA tokens to localExpert=0
+            int localExpertDbg = destExpert % numLocalExperts;
+            if (myPe == 0 && tokenIdx < 4 && localExpertDbg == 0) {
+              float srcW0 = args.shmemInpWeightsMemObj->template GetAs<float*>()[tokenIdx * numTopK + 0];
+              float srcW1 = args.shmemInpWeightsMemObj->template GetAs<float*>()[tokenIdx * numTopK + 1];
+              printf("[DISPATCH-RDMA-W] myPe=%d tok=%d destPe=%d destExp=%d destLinear=%d: staged_w[0]=%.4f staged_w[1]=%.4f\n",
+                     myPe, (int)tokenIdx, destPe, destExpert, (int)destLinearTok, srcW0, srcW1);
+            }
+#endif
             shmem::ShmemPutMemNbiThread(
                 args.shmemDispatchOutWeightsMemObj,
                 destLinearTok * numTopK * sizeof(float),
@@ -476,12 +486,27 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   // ========== PHASE 1: SEND EXPERT OUTPUTS ==========
   // Copy expert outputs to staging buffer and RDMA put to source ranks
 
+#ifdef ENABLE_DEBUG_PRINTF
+  // Debug: Check what weights are in shmemDispatchOutWeightsMemObj at linear=0 (localExp=0, srcPe=0, slot=0)
+  if (myPe == 7 && smId == 0 && threadId == 0) {
+    float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 0];
+    float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 1];
+    float w16 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[1 * numTopK + 0];  // linear=1
+    printf("[COMBINE-ENTRY] myPe=%d: weights at linear=0: w[0]=%.4f w[1]=%.4f | linear=1: w[0]=%.4f\n",
+           myPe, w0, w1, w16);
+  }
+#endif
+
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    // Convert localExpert to globalExpert for layoutRange indexing
+    // Dispatch stored layouts at layoutRange[globalExpert * npes + pe]
+    int globalExpert = myPe * numLocalExperts + localExpert;
+
     for (int srcPe = 0; srcPe < npes; ++srcPe) {
       if (srcPe == myPe) continue;
 
-      // Get layout info from dispatch phase
-      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
+      // Get layout info from dispatch phase (uses global expert indexing)
+      int64_t layout = args.layoutRange[globalExpert * npes + srcPe];
       int numTokensToSend, offset;
       internode_ll::Unpack2(layout, numTokensToSend, offset);
 
@@ -520,6 +545,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
             // Weights were stored at shmemDispatchOutWeightsMemObj[linear * numTopK]
             // Send to srcPe's shmemCombineOutWeightsMemObj at same offset
             if constexpr (kUseWeights) {
+#ifdef ENABLE_DEBUG_PRINTF
+              // Debug: print the weight values we're about to send
+              if (srcPe == 0 && localExpert == 0 && slotIdx < 2) {
+                float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[linear * numTopK + 0];
+                float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[linear * numTopK + 1];
+                printf("[COMBINE-P1-DBG] myPe=%d srcPe=%d localExp=%d slot=%d linear=%d: src_w[0]=%.4f src_w[1]=%.4f\n",
+                       myPe, srcPe, localExpert, slotIdx, (int)linear, w0, w1);
+              }
+#endif
               shmem::ShmemPutMemNbiThread(
                   args.shmemCombineOutWeightsMemObj,
                   linear * numTopK * sizeof(float),
@@ -560,17 +594,20 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #endif
 
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    // Convert localExpert to globalExpert for layoutRange indexing
+    int globalExpertIdx = myPe * numLocalExperts + localExpert;
+
     for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
       if (srcPe == myPe) continue;
 
-      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
+      // Get layout info from dispatch phase (uses global expert indexing)
+      int64_t layout = args.layoutRange[globalExpertIdx * npes + srcPe];
       int numTokensToSend, offset;
       internode_ll::Unpack2(layout, numTokensToSend, offset);
 
       if (numTokensToSend == 0) continue;
 
       bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-      int globalExpertIdx = myPe * numLocalExperts + localExpert;
 
 #ifdef ENABLE_DEBUG_PRINTF
       if (laneId == 0) {
@@ -614,6 +651,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   if (myPe == 0 && smId == 0 && threadId == 0) {
     printf("[COMBINE-PHASE3-ENTER] myPe=%d numSms=%d npes=%d numLocalExperts=%d\n",
            myPe, numSms, npes, numLocalExperts);
+    // Check what's in shmemCombineOutWeightsMemObj at linear=0 (received from rank 7 for localExp=0)
+    // For tokens from rank 0 to expert 56 on rank 7: linear = 0 * 32 + 0 * 4 + slot
+    float cw0 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 0];
+    float cw1 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 1];
+    float cw2 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[1 * numTopK + 0];  // linear=1
+    printf("[COMBINE-PHASE3] myPe=%d CombineOutWeights: linear=0: w[0]=%.4f w[1]=%.4f | linear=1: w[0]=%.4f\n",
+           myPe, cw0, cw1, cw2);
   }
 #endif
 
