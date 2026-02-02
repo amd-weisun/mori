@@ -497,7 +497,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         index_t linear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + slotIdx;
 
         if (isRemote) {
-          // Stage and RDMA put
+          // Stage and RDMA put token data
           // Use expert-major layout: linear = localExpert * expertCapacity + srcPe * maxTokens + slot
           // This matches what Phase 3 expects when reading via dispDestTokIdMap
           T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
@@ -507,14 +507,27 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           __syncwarp();
 
           if (laneId == 0) {
-            // Put at expert-major offset, not flat srcTokId offset
+            // Put token data at expert-major offset
             shmem::ShmemPutMemNbiThread(
                 args.shmemCombineOutTokMemObj,
-                linear * config.hiddenDim * sizeof(T),  // Use linear (expert-major), not srcTokId (flat)
+                linear * config.hiddenDim * sizeof(T),
                 args.shmemStagingTokMemObj,
                 linear * config.hiddenDim * sizeof(T),
                 config.hiddenDim * sizeof(T),
                 srcPe, 0);
+
+            // Also send weights back to srcPe for accumulation
+            // Weights were stored at shmemDispatchOutWeightsMemObj[linear * numTopK]
+            // Send to srcPe's shmemCombineOutWeightsMemObj at same offset
+            if constexpr (kUseWeights) {
+              shmem::ShmemPutMemNbiThread(
+                  args.shmemCombineOutWeightsMemObj,
+                  linear * numTopK * sizeof(float),
+                  args.shmemDispatchOutWeightsMemObj,
+                  linear * numTopK * sizeof(float),
+                  numTopK * sizeof(float),
+                  srcPe, 0);
+            }
           }
         } else {
           // Same-node: direct P2P copy to srcPe's combine input buffer
@@ -709,10 +722,21 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         if (j < numTopK && destPe < npes) {
           // Weights are stored in expert-major layout: [localExpert][expertCapacity][numTopK]
           // During dispatch, weights were written to shmemDispatchOutWeightsMemObj on destPe.
-          // For combine, we ARE on destPe (the destination of dispatch), so we read from
-          // our local shmemDispatchOutWeightsMemObj.
+          // For combine, we are on myPe (source rank), so we need to read from destPe's buffer.
           index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
-          w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
+          if (destPe == myPe) {
+            // SELF token: weight is in our local buffer
+            w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
+          } else {
+            bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+            if (isRemote) {
+              // RDMA token: weight was sent back to our shmemCombineOutWeightsMemObj in Phase 1
+              w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
+            } else {
+              // P2P token: read directly from destPe's buffer via xGMI
+              w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[destLinearTok * numTopK + j];
+            }
+          }
         }
         srcWeightScales[j] = w;
       }

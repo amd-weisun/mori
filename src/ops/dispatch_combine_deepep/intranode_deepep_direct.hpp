@@ -355,13 +355,6 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // Use dispatchGridBarrier (pre-reset to 0 by LaunchIntraNodeDispatchDeepepLL).
   detail::GridBarrier(args.dispatchGridBarrier, numSms);
 
-  // Reset dispatchGridBarrier for reuse in Phase 3 (signal phase barrier).
-  // All blocks are synchronized at this point, so a simple reset is safe.
-  if (threadIdx.x == 0) {
-    args.dispatchGridBarrier[0] = 0;
-  }
-  __syncthreads();
-
   // ==================== PHASE 2: Expert-centric Count Phase ====================
   // Last warp per SM counts tokens for this SM's 2 responsible experts
   constexpr int kLastWarpId = kNumWarpGroups * kNumWarpsPerGroup - 1;
@@ -416,8 +409,10 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     args.finishCounterPerExpert[responsibleExpertIdx] = 0;
   }
 
-  // Grid barrier to ensure all expert counters are updated before signal phase
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+  // Grid barrier to ensure all expert counters are updated before signal phase.
+  // Use combineGridBarrier (different from dispatchGridBarrier) to avoid reset race.
+  // Both counters are pre-reset to 0 by LaunchIntraNodeDispatchDeepepLL.
+  detail::GridBarrier(args.combineGridBarrier, numSms);
 
   // ==================== PHASE 4: Signal Phase (per-destPe) ====================
   // Warp 0 sends signals to all destination PEs with total token count
