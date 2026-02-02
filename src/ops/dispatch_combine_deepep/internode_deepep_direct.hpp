@@ -707,6 +707,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           // Self-token: expert output is in our own dispatch output buffer (inpTokenBuf)
           // No inter-rank transfer needed
           srcPtrs[j] = args.inpTokenBuf + baseOffset + hiddenDimOffset;
+          // Debug SELF tokens for rank 0
+          if (myPe == 0 && inTokenPartId == 0) {
+            printf("[COMBINE-SELF] rank=0 token=%d j=%d destTokId=%d baseOffset=%lu inpTokenBuf=%p srcPtr=%p val=%.1f\n",
+                   (int)tokenIdx, j, (int)destTokId, (unsigned long)baseOffset,
+                   (void*)args.inpTokenBuf, (void*)srcPtrs[j],
+                   (float)srcPtrs[j][0]);
+          }
         } else {
           bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
           if (isRemote) {
