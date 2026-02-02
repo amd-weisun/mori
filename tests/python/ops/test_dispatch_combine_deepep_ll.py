@@ -14,6 +14,9 @@ Usage (single node with mp.spawn):
   # Simulate 2-node topology (8 GPUs as 2 nodes × 4 GPUs):
   python tests/python/ops/test_dispatch_combine_deepep_ll.py --setting internode_2node
 
+ # Simulate 4-node topology (8 GPUs as 4 nodes × 2 GPUs, use_fp8 = false and 1024 hidden dim for easier debugging):
+  python tests/python/ops/test_dispatch_combine_deepep_ll.py --setting internode_2node_debug
+
   # Override gpu_per_node on any setting:
   python tests/python/ops/test_dispatch_combine_deepep_ll.py --gpu-per-node 4
 
@@ -114,6 +117,16 @@ PRESET_SETTINGS = {
         "num_experts_per_token": 8,
         "gpu_per_node": 4,  # Simulate 2 nodes with 4 GPUs each
         "use_fp8": True,
+    },
+    "internode_2node": {
+        "name": "internode_2node_debug",
+        "num_processes": 8,
+        "hidden_dim": 1028,
+        "max_num_inp_token_per_rank": 128,
+        "total_experts": 288,
+        "num_experts_per_token": 8,
+        "gpu_per_node": 4,  # Simulate 2 nodes with 4 GPUs each
+        "use_fp8": False,
     },
     "internode_4node": {
         "name": "internode_4node",
@@ -763,9 +776,25 @@ def validate_dispatch_data(
                 tokens_checked += 1
 
                 if not found_match:
+                    # Find the closest match to help diagnose the issue
+                    min_diff = float('inf')
+                    closest_slot = -1
+                    for j, actual in enumerate(actual_tokens):
+                        diff = (actual.float() - expected_input.float()).abs().max().item()
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_slot = j
+
                     print(f"  [Expert {local_expert}] Token not found in partition:", flush=True)
                     print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
                     print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
+                    print(f"    closest_slot={closest_slot}, max_diff={min_diff:.6f}, atol={atol}", flush=True)
+                    if closest_slot >= 0 and closest_slot < len(actual_tokens):
+                        closest = actual_tokens[closest_slot]
+                        print(f"    closest[:8]={closest[:8].tolist()}", flush=True)
+                        # Show element-wise diff for first 8
+                        diff8 = (closest[:8].float() - expected_input[:8].float()).abs()
+                        print(f"    diff[:8]={diff8.tolist()}", flush=True)
                     print(f"    Partition [{partition_start}:{partition_end}] contents:", flush=True)
                     for s_idx, actual in enumerate(actual_tokens[:4]):  # Show first 4 slots
                         is_zero = actual.abs().max().item() < 1e-6
