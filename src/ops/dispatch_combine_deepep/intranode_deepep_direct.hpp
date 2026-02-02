@@ -136,18 +136,16 @@ __device__ inline float QuarterWarpReduceMax(float value) {
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
 }  // namespace detail
 
-// DeepEP-aligned dispatch kernel with SM-based token striding
-// Key features:
-// 1. SM-based token striding: Each block handles tokens[blockIdx.x], tokens[blockIdx.x + gridDim.x], ...
-// 2. Warp-based top-k handling: Each warp handles one top-k destination per token
-// 3. All-thread FP8 quantization: All threads in block work on one token's FP8 quantization
-// 4. Per-destPe finish counters: Simpler than per-expert (8 counters vs 288 for 8 ranks)
-// 5. Finish counter pattern: Each warp increments counter after copy, count warp adds offset
-//
-// Note: DeepEP uses per-expert finish counters and LOCAL atomics for slot assignment.
-// MORI intranode still uses REMOTE atomics (on destPe's symmetric memory) which is the
-// main performance bottleneck. Full expert-centric restructure would require changing
-// the slot assignment to use local counters like DeepEP.
+// DeepEP-aligned dispatch kernel with LOCAL atomics for slot assignment
+// Key optimizations aligned with DeepEP internode_ll.cu:
+// 1. LOCAL atomic for slot assignment: atomicCounterPerExpert[destExpert] on device memory (~10 cycles)
+//    vs remote atomic on destPe's symmetric memory (~50+ cycles)
+// 2. Source-rank-partitioned buffer: destLinearTok = localExpert * capacity + myPe * maxTokens + slot
+//    Each source rank has its own slot range, avoiding conflicts
+// 3. Batched remote counter updates: Count warp updates destExpertTokenCounterMemObj once per expert
+//    instead of per-token atomic updates
+// 4. SM-based token striding: Each block handles tokens[blockIdx.x + i * gridDim.x]
+// 5. Per-destPe finish counters with finish counter pattern
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
@@ -191,18 +189,23 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         destPe = destExpert / config.numExpertPerRank;
         localExpert = destExpert % config.numExpertPerRank;
 
-        // Allocate slot and update counters (lane 0 only)
+        // Allocate slot using LOCAL atomic (key optimization: ~10 cycles vs ~50+ for remote)
+        // DeepEP pattern: each source rank has its own slot range [myPe * maxTokens, (myPe+1) * maxTokens)
         if (laneId == 0) {
-          index_t* expertCounter =
-              args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe);
-          destTokId = atomicAdd(expertCounter + localExpert, 1);
+          // LOCAL atomic on device memory (not symmetric memory on destPe)
+          destTokId = atomicAdd(args.atomicCounterPerExpert + destExpert, 1);
+          // Still update destPeTokenCounter for total count signaling (this is also local)
           atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[tokenIdx * config.numExpertPerToken + warpId] =
-              destExpert * expertCapacity + destTokId;
 
-          // Store to shared memory for other threads to access
+          // Source-rank-partitioned buffer layout (like DeepEP):
+          // destLinearTok = localExpert * expertCapacity + srcRank * maxTokensPerRank + localSlot
+          index_t srcRankOffset = myPe * config.maxNumInpTokenPerRank;
           sharedDestTokId[warpId] = destTokId;
-          sharedDestLinearTok[warpId] = localExpert * expertCapacity + destTokId;
+          sharedDestLinearTok[warpId] = localExpert * expertCapacity + srcRankOffset + destTokId;
+
+          // Store global mapping for combine phase
+          args.dispDestTokIdMap[tokenIdx * config.numExpertPerToken + warpId] =
+              destExpert * expertCapacity + srcRankOffset + destTokId;
         }
       }
       __syncthreads();
@@ -342,21 +345,38 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Count warp: Computes expected tokens per destPe and adds offset to finish counters
-  // Uses the last global warp (simpler than per-SM, sufficient for intranode)
+  // Count warp: Computes expected tokens per destPe, updates remote expert counters (batched),
+  // and adds offset to finish counters.
+  // Key optimization: Instead of per-token remote atomics, we read from local atomicCounterPerExpert
+  // and do ONE remote atomic per expert that received tokens from this rank.
   constexpr int kMaxGpuPerNode = 8;
+  const int numLocalExperts = config.numExpertPerRank;
   assert(npes <= kMaxGpuPerNode && "Intranode dispatch assumes worldSize <= 8 GPUs per node");
+
   if (globalWarpId == globalWarpNum - 1) {
     int countPerDestPe[kMaxGpuPerNode] = {0};
-    for (int i = laneId; i < args.curRankNumToken * config.numExpertPerToken; i += warpSize) {
-      if (args.tokenIndices) {
-        index_t destExpert = args.tokenIndices[i];
-        index_t destPe = destExpert / config.numExpertPerRank;
-        if (destPe < npes && destPe < kMaxGpuPerNode) {
-          countPerDestPe[destPe]++;
-        }
+
+    // First pass: count per destPe and update remote expert counters (batched)
+    // Each lane handles a subset of experts
+    const int numExperts = npes * numLocalExperts;
+    for (int expertIdx = laneId; expertIdx < numExperts; expertIdx += warpSize) {
+      // Read count from LOCAL atomicCounterPerExpert (already computed during dispatch)
+      index_t count = args.atomicCounterPerExpert[expertIdx];
+      if (count > 0) {
+        int destPe = expertIdx / numLocalExperts;
+        int localExpert = expertIdx % numLocalExperts;
+
+        // Batched remote atomic: ONE update per expert instead of per-token
+        // This is still O(experts) remote atomics, but much fewer than O(tokens * topk)
+        atomicAdd(args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe) + localExpert,
+                  count);
+
+        // Aggregate for per-destPe count
+        countPerDestPe[destPe] += count;
       }
     }
+
+    // Reduce per-destPe counts across lanes
     for (int pe = 0; pe < npes && pe < kMaxGpuPerNode; ++pe) {
       int count = countPerDestPe[pe];
       for (int offset = warpSize / 2; offset > 0; offset /= 2) {
