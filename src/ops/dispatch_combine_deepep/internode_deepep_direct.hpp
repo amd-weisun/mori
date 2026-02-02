@@ -764,23 +764,40 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
 
-    // Debug: Check SELF tokens before and after WarpAccum for rank 0
+    // Debug: Check SELF tokens - do manual copy instead of WarpAccum to diagnose
     index_t destPeForDebug = (args.dispDestTokIdMap[tokenIdx * numTopK] / expertCapacity) / numLocalExperts;
     bool isSelf = (destPeForDebug == myPe);
     if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
-      printf("[COMBINE-ACCUM-BEFORE] token=%d srcPtrs[0]=%p srcVal=%.1f outPtr=%p outVal=%.1f\n",
-             (int)tokenIdx, (void*)srcPtrs[0], srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f,
-             (void*)outPtr, (float)outPtr[0]);
+      printf("[COMBINE-ACCUM-BEFORE] token=%d hiddenDimSize=%d srcVal=%.1f outVal=%.1f\n",
+             (int)tokenIdx, (int)hiddenDimSize,
+             srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f, (float)outPtr[0]);
     }
 
-    core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
-                          numTopK, hiddenDimSize);
+    // Try simple manual copy for SELF tokens to verify buffer addresses work
+    if (isSelf && myPe == 0 && tokenIdx < 4) {
+      for (int elem = laneId; elem < hiddenDimSize; elem += warpSize) {
+        float val = 0.0f;
+        for (int k = 0; k < numTopK; ++k) {
+          if (srcPtrs[k]) {
+            float w = kUseWeights ? srcWeightScales[k] : 1.0f;
+            val += static_cast<float>(srcPtrs[k][elem]) * w;
+          }
+        }
+        outPtr[elem] = static_cast<T>(val);
+      }
+      __syncwarp();
+      if (laneId == 0) {
+        printf("[COMBINE-ACCUM-MANUAL] token=%d wrote outVal=%.1f\n",
+               (int)tokenIdx, (float)outPtr[0]);
+      }
+    } else {
+      core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
+                            numTopK, hiddenDimSize);
+    }
 
     __syncwarp();
     if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
-      printf("[COMBINE-ACCUM-AFTER] token=%d outPtr=%p outVal=%.1f shmemStagingBase=%p\n",
-             (int)tokenIdx, (void*)outPtr, (float)outPtr[0],
-             (void*)args.shmemStagingTokMemObj->template GetAs<T*>());
+      printf("[COMBINE-ACCUM-AFTER] token=%d outVal=%.1f\n", (int)tokenIdx, (float)outPtr[0]);
     }
   }
 
