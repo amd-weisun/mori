@@ -21,8 +21,8 @@
 // SOFTWARE.
 #pragma once
 
-// Temporarily enable debug prints for internode LL debugging
-#define ENABLE_DEBUG_PRINTF 1
+// Debug prints disabled - enable for debugging internode LL issues
+// #define ENABLE_DEBUG_PRINTF 1
 
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
