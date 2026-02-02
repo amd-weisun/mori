@@ -737,6 +737,14 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           w = args.weightsBuf[tokenIdx * numTopK + j];
         }
         srcWeightScales[j] = w;
+
+        // Debug: print raw weight buffer access for rank 0 tokens
+        if (myPe == 0 && tokenIdx < 4 && j == 0 && laneId == 0 && inTokenPartId == 0) {
+          int weightIdx = tokenIdx * numTopK + j;
+          printf("[WEIGHT-RAW] token=%d weightsBuf=%p idx=%d rawVal=%.4f w=%.4f\n",
+                 (int)tokenIdx, (void*)args.weightsBuf, weightIdx,
+                 args.weightsBuf ? args.weightsBuf[weightIdx] : -999.0f, w);
+        }
       }
     }
 
