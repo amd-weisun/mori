@@ -349,6 +349,19 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
+  // Grid barrier to ensure ALL SMs have finished dispatching before count phase.
+  // This is critical: the count phase adds (kFinishedSumTag - expectedCount) to the
+  // finish counter. If any SM is still dispatching, the counter could exceed kFinishedSumTag.
+  // Use dispatchGridBarrier (pre-reset to 0 by LaunchIntraNodeDispatchDeepepLL).
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+
+  // Reset dispatchGridBarrier for reuse in Phase 3 (signal phase barrier).
+  // All blocks are synchronized at this point, so a simple reset is safe.
+  if (threadIdx.x == 0) {
+    args.dispatchGridBarrier[0] = 0;
+  }
+  __syncthreads();
+
   // ==================== PHASE 2: Expert-centric Count Phase ====================
   // Last warp per SM counts tokens for this SM's 2 responsible experts
   constexpr int kLastWarpId = kNumWarpGroups * kNumWarpsPerGroup - 1;
