@@ -118,7 +118,7 @@ PRESET_SETTINGS = {
         "gpu_per_node": 4,  # Simulate 2 nodes with 4 GPUs each
         "use_fp8": True,
     },
-    "internode_2node": {
+    "internode_2node_debug": {
         "name": "internode_2node_debug",
         "num_processes": 8,
         "hidden_dim": 1028,
