@@ -303,12 +303,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   // ========== PHASE 2: RDMA QUIET + GRID BARRIER ==========
   // Ensure all RDMA puts are drained BEFORE grid barrier (following DeepEP pattern)
   // Grid barrier alone doesn't guarantee RDMA completion
+  //
+  // For same-node P2P writes: __threadfence_system() ensures visibility
+  // For remote RDMA puts: ShmemQuietThread() drains pending operations
 
-  // RDMA quiet FIRST to drain all pending puts
+  // System-wide fence for P2P write visibility + RDMA quiet for remote puts
   if (threadId == 0) {
     shmem::ShmemQuietThread();
-    __threadfence_system();  // System-wide visibility after quiet
   }
+  __threadfence_system();  // System-wide visibility for all P2P writes
   __syncthreads();
 
   // Then grid barrier to ensure all blocks have finished Phase 1 dispatch
@@ -509,10 +512,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Drain RDMA puts
-  if (laneId == 0) {
+  // Drain RDMA puts and ensure P2P writes are visible
+  if (threadId == 0) {
     shmem::ShmemQuietThread();
   }
+  __threadfence_system();  // System-wide visibility for all P2P writes
   __syncthreads();
 
   // ========== PHASE 2: SIGNAL COMPLETION ==========
