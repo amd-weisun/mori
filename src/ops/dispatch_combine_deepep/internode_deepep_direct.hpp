@@ -706,12 +706,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       if constexpr (kUseWeights) {
         float w = 1.0f;
-        if (args.weightsBuf && j < numTopK && destPe < npes) {
+        if (args.shmemDispatchOutWeightsMemObj && j < numTopK && destPe < npes) {
           // Weights are stored in expert-major layout: [localExpert][expertCapacity][numTopK]
-          // NOT token-major. We need to use the same destLinearTok indexing as token data.
-          // destLinearTok = localExpert * expertCapacity + destLocalTokId
+          // During dispatch, weights were written to shmemDispatchOutWeightsMemObj on destPe.
+          // For combine, we ARE on destPe (the destination of dispatch), so we read from
+          // our local shmemDispatchOutWeightsMemObj.
           index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
-          w = args.weightsBuf[destLinearTok * numTopK + j];
+          w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[destLinearTok * numTopK + j];
         }
         srcWeightScales[j] = w;
       }
