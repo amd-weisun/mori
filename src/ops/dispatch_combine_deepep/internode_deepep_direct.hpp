@@ -707,13 +707,6 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           // Self-token: expert output is in our own dispatch output buffer (inpTokenBuf)
           // No inter-rank transfer needed
           srcPtrs[j] = args.inpTokenBuf + baseOffset + hiddenDimOffset;
-          // Debug SELF tokens for rank 0
-          if (myPe == 0 && inTokenPartId == 0) {
-            printf("[COMBINE-SELF] rank=0 token=%d j=%d destTokId=%d baseOffset=%lu inpTokenBuf=%p srcPtr=%p val=%.1f\n",
-                   (int)tokenIdx, j, (int)destTokId, (unsigned long)baseOffset,
-                   (void*)args.inpTokenBuf, (void*)srcPtrs[j],
-                   (float)srcPtrs[j][0]);
-          }
         } else {
           bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
           if (isRemote) {
@@ -770,8 +763,25 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     // shmemStagingTokMemObj is safe because it's only used transiently in combine Phase 1
     T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
+
+    // Debug: Check SELF tokens before and after WarpAccum for rank 0
+    index_t destPeForDebug = (args.dispDestTokIdMap[tokenIdx * numTopK] / expertCapacity) / numLocalExperts;
+    bool isSelf = (destPeForDebug == myPe);
+    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
+      printf("[COMBINE-ACCUM-BEFORE] token=%d srcPtrs[0]=%p srcVal=%.1f outPtr=%p outVal=%.1f\n",
+             (int)tokenIdx, (void*)srcPtrs[0], srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f,
+             (void*)outPtr, (float)outPtr[0]);
+    }
+
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);
+
+    __syncwarp();
+    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
+      printf("[COMBINE-ACCUM-AFTER] token=%d outPtr=%p outVal=%.1f shmemStagingBase=%p\n",
+             (int)tokenIdx, (void*)outPtr, (float)outPtr[0],
+             (void*)args.shmemStagingTokMemObj->template GetAs<T*>());
+    }
   }
 
   // Debug: Kernel complete (all ranks)
