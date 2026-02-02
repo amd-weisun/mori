@@ -393,11 +393,14 @@ LaunchInterNodeDispatchDeepepLL(mori::moe::deepep::EpDispatchCombineHandle& hand
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   std::optional<torch::Tensor> outScales{std::nullopt};
-  if (scales.has_value() && handle.config.scaleDim > 0) {
+  // Return scales if FP8 mode is enabled (scaleDim > 0)
+  // The kernel computes scales internally, so we don't need input scales
+  if (handle.config.scaleDim > 0) {
+    auto scaleDtype = (handle.config.scaleTypeSize == 4) ? torch::kFloat32 : torch::kFloat16;
     outScales =
         torch::from_blob(handle.shmemOutScalesMemObj->Get(),
                {handle.config.numExpertPerRank, expertCapacity, handle.config.scaleDim},
-                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+                         torch::TensorOptions().dtype(scaleDtype).device(torch::kCUDA));
   }
 
   torch::Tensor outIndices =
