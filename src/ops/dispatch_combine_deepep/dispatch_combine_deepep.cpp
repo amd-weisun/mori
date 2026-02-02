@@ -536,7 +536,10 @@ void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int w
   // Reset internode LL combine buffers
   int numExpertsTotal = config.worldSize * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvFlagMemObj->Get(), 0, numExpertsTotal * sizeof(int64_t), stream));
-  // Reset grid barrier counter for combine
+  // Reset grid barrier counters for combine
+  // We use both barriers in the combine kernel: dispatchGridBarrier after Phase 2 signals,
+  // and combineGridBarrier after Phase 3 wait
+  HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, sizeof(uint32_t), stream));
   HIP_RUNTIME_CHECK(hipMemsetAsync(combineGridBarrier, 0, sizeof(uint32_t), stream));
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);

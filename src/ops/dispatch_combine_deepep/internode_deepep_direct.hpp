@@ -591,6 +591,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   __threadfence_system();
   __syncthreads();
 
+  // Grid barrier to ensure ALL blocks have sent their signals before ANY block starts waiting
+  // This prevents deadlock where block 0 (which sends signals) is slow and other blocks
+  // start waiting for signals that haven't been sent yet
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
 
