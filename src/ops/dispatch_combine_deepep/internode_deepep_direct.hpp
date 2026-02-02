@@ -502,8 +502,9 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
                 srcPe, 0);
           }
         } else {
-          // Same-node: direct copy to combine buffer
-          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
+          // Same-node: direct P2P copy to srcPe's combine input buffer
+          // srcPe will read from their shmemCombineInpTokMemObj at this offset
+          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>(srcPe) + linear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             destPtr[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
           }
@@ -545,17 +546,49 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
               srcPe, 0);
           shmem::ShmemQuietThread(srcPe);
         } else {
-          int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
+          // Same-node: write to srcPe's buffer via P2P (not local buffer!)
+          int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>(srcPe) + globalExpertIdx;
           detail::AtomicAddReleaseSystem(flagSlot, int64_t{1});
         }
       }
     }
   }
 
+  // Ensure all signals are sent and visible
+  __threadfence_system();
+  __syncthreads();
+
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
 
-  // Grid barrier to ensure all sends are complete
+  // Wait for completion signals from all destination ranks before reading
+  // Each destination rank signals to rdmaRecvFlagMemObj when it finishes sending expert outputs back
+  // We need to wait for signals from each expert we sent tokens to
+  for (int destPe = 0; destPe < npes; ++destPe) {
+    if (destPe == myPe) continue;
+
+    for (int localExpert = globalWarpId; localExpert < numLocalExperts; localExpert += globalWarpNum) {
+      int globalExpert = destPe * numLocalExperts + localExpert;
+      // Check if we sent tokens to this expert (in dispatch phase)
+      index_t count = args.atomicCounterPerExpert[globalExpert];
+      if (count == 0) continue;
+
+      if (laneId == 0) {
+        // Wait for completion signal from destPe for this expert
+        // destPe signals our buffer at index (destPe * numLocalExperts + localExpert)
+        int globalExpertIdx = destPe * numLocalExperts + localExpert;
+        int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
+
+        // Poll until signal arrives (acquire for visibility of data)
+        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
+          // spin
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // Grid barrier to ensure all blocks have received their signals
   detail::GridBarrier(args.combineGridBarrier, numSms);
 
   // Shared memory for source pointers
@@ -591,14 +624,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
 
         if (isRemote) {
-          // Data was sent to our combine out buffer at expert-major offset
-          // Phase 1 put data at: linear * hiddenDim where linear = localExpert * capacity + srcPe * maxTokens + slot
-          // destLocalTokId = srcPe * maxTokens + slot, so baseOffset matches
+          // Data was sent to our combine out buffer via RDMA
           srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                        baseOffset + hiddenDimOffset;
         } else {
-          // Data is in the remote rank's combine input buffer (accessible via P2P)
-          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+          // Data was written to our combine input buffer via P2P by destPe
+          // (Phase 1 on destPe wrote to args.shmemCombineInpTokMemObj->GetAs<T*>(myPe))
+          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
                        baseOffset + hiddenDimOffset;
         }
       } else {
