@@ -74,6 +74,9 @@ SKIP_CHECKS = os.getenv("MORI_DEEPEP_SKIP_CHECKS", "0") == "1"
 SKIP_DISPATCH_CHECKS = SKIP_CHECKS or os.getenv("MORI_DEEPEP_SKIP_DISPATCH_CHECKS", "0") == "1"
 SKIP_COMBINE_CHECKS = SKIP_CHECKS or os.getenv("MORI_DEEPEP_SKIP_COMBINE_CHECKS", "0") == "1"
 DEBUG_LOG = os.getenv("MORI_DEEPEP_DEBUG_LOG", "0") == "1"
+# Debug mode: use simplified input data (global_token_id repeated across hidden_dim)
+# This makes it easy to trace which token's data appears in the output
+DEBUG_SIMPLE_DATA = os.getenv("MORI_DEEPEP_DEBUG_SIMPLE_DATA", "0") == "1"
 
 
 
@@ -511,11 +514,29 @@ def run_test_impl(
         for r in range(world_size)
     ]
 
-    all_rank_input = [
-        # Generate on CPU then move to GPU for deterministic values across ranks
-        (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
-        for r in range(world_size)
-    ]
+    if DEBUG_SIMPLE_DATA:
+        # Debug mode: each token's value = global_token_id (rank * max_tokens + token_idx)
+        # repeated across the entire hidden dimension. This makes it easy to identify
+        # which token's data appears in the output.
+        all_rank_input = []
+        for r in range(world_size):
+            n = int(num_token[r].item()) if num_token[r].dim() == 0 else int(num_token[r])
+            token_data = torch.zeros(n, hidden_dim, dtype=data_type, device=device)
+            for token_idx in range(n):
+                global_token_id = r * max_num_inp_token_per_rank + token_idx
+                # Use float value so we can distinguish tokens
+                token_data[token_idx, :] = float(global_token_id)
+            all_rank_input.append(token_data)
+        if rank == 0:
+            print(f"[DEBUG] Using simplified input data: token values = global_token_id", flush=True)
+            print(f"  Rank 0 token 0 value: {all_rank_input[0][0, 0].item()}", flush=True)
+            print(f"  Rank 0 token 1 value: {all_rank_input[0][1, 0].item()}", flush=True)
+    else:
+        all_rank_input = [
+            # Generate on CPU then move to GPU for deterministic values across ranks
+            (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
+            for r in range(world_size)
+        ]
 
     # Ensure all ranks finish setup before dispatch
     dist.barrier()
@@ -818,6 +839,8 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
     if use_fp8:
         base_input = dequant_input_like_fp8(base_input, data_type)
 
+    topk = config.num_experts_per_token
+
     for i in range(num_tokens_to_check):
         got = combine_output[i]
         weights = all_rank_weights[0][i].to(torch.float32)
@@ -828,6 +851,22 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
         atol = 0.25 if use_fp8 else 1e-2
         rtol = 0.25 if use_fp8 else 1e-2
         if not torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol):
+            # Enhanced debug output for DEBUG_SIMPLE_DATA mode
+            if DEBUG_SIMPLE_DATA:
+                # In simple data mode, expected value = topk * token_id (since all weights are 1)
+                expected_simple = float(i * topk)
+                got_val = got[0].item()
+                print(f"[DEBUG] Combine mismatch at token {i}:", flush=True)
+                print(f"  Expected (simple): {expected_simple} (= token_id {i} * topk {topk})", flush=True)
+                print(f"  Got value[0]: {got_val}", flush=True)
+                # Try to infer which token's data this might be
+                if got_val > 0:
+                    inferred_token_id = got_val / topk
+                    inferred_rank = int(inferred_token_id // config.max_num_inp_token_per_rank)
+                    inferred_local_token = int(inferred_token_id % config.max_num_inp_token_per_rank)
+                    print(f"  Inferred source: rank={inferred_rank}, local_token={inferred_local_token}", flush=True)
+                print(f"  got[:8]={got[:8].tolist()}", flush=True)
+                print(f"  expected[:8]={expected[:8].tolist()}", flush=True)
             raise AssertionError(
                 f"Combine mismatch at token {i}: "
                 f"got={got[:8].tolist()}, expected={expected[:8].tolist()}"
@@ -1033,10 +1072,21 @@ def run_benchmark(
             for r in range(world_size)
         ]
 
-        all_rank_input = [
-            (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
-            for r in range(world_size)
-        ]
+        if DEBUG_SIMPLE_DATA:
+            # Debug mode: each token's value = global_token_id
+            all_rank_input = []
+            for r in range(world_size):
+                n = int(num_token[r].item()) if num_token[r].dim() == 0 else int(num_token[r])
+                token_data = torch.zeros(n, hidden_dim, dtype=data_type, device=device)
+                for token_idx in range(n):
+                    global_token_id = r * max_num_inp_token_per_rank + token_idx
+                    token_data[token_idx, :] = float(global_token_id)
+                all_rank_input.append(token_data)
+        else:
+            all_rank_input = [
+                (torch.rand(num_token[r], hidden_dim, dtype=torch.float32, generator=cpu_rng) * 2 - 1).to(data_type).to(device)
+                for r in range(world_size)
+            ]
 
         return all_rank_input, all_rank_indices, all_rank_weights
 

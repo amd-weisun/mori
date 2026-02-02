@@ -657,9 +657,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
     __syncwarp();
 
-    // Accumulate
-    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                tokenIdx * config.hiddenDim + hiddenDimOffset;
+    // Accumulate into the actual output buffer (not the RDMA receive buffer!)
+    T* outPtr = args.outTokenBuf + tokenIdx * config.hiddenDim + hiddenDimOffset;
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);
   }
