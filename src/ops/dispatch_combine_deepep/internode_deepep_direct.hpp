@@ -659,11 +659,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
     __syncwarp();
 
-    // Accumulate into the dispatch output buffer (shmemDispatchOutTokMemObj)
-    // We can't use shmemCombineOutTokMemObj because it contains RDMA-received data
-    // that we might still need to read for later tokens. Using a separate buffer
-    // avoids read-after-write conflicts.
-    T* outPtr = args.shmemDispatchOutTokMemObj->template GetAs<T*>() +
+    // Accumulate into the staging buffer (shmemStagingTokMemObj)
+    // We can't use:
+    // - shmemCombineOutTokMemObj: contains RDMA-received expert outputs
+    // - shmemCombineInpTokMemObj: contains P2P-received expert outputs
+    // - shmemDispatchOutTokMemObj: contains self-token expert outputs (inpTokenBuf points here)
+    // shmemStagingTokMemObj is safe because it's only used transiently in combine Phase 1
+    T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);

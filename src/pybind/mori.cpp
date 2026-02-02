@@ -436,11 +436,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchInterNodeCombineDe
   handle.LaunchInterNodeCombineDeepepLL(blockNum, warpPerBlock, at::cuda::getCurrentHIPStream());
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
-  // Return tensor from shmemDispatchOutTokMemObj which the kernel writes to.
-  // We can't use shmemCombineOutTokMemObj because the kernel uses it for RDMA receive,
-  // and writing output there would cause read-after-write conflicts.
+  // Return tensor from shmemStagingTokMemObj which the kernel writes to.
+  // We can't use:
+  // - shmemCombineOutTokMemObj: contains RDMA-received expert outputs
+  // - shmemCombineInpTokMemObj: contains P2P-received expert outputs
+  // - shmemDispatchOutTokMemObj: contains self-token expert outputs (inpTokenBuf points here)
+  // shmemStagingTokMemObj is safe because it's only used transiently in combine Phase 1.
   torch::Tensor out =
-      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
+      torch::from_blob(handle.shmemStagingTokMemObj->Get(),
                        {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
