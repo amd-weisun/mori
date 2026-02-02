@@ -498,15 +498,12 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #endif
 
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
-    // Convert localExpert to globalExpert for layoutRange indexing
-    // Dispatch stored layouts at layoutRange[globalExpert * npes + pe]
-    int globalExpert = myPe * numLocalExperts + localExpert;
-
     for (int srcPe = 0; srcPe < npes; ++srcPe) {
       if (srcPe == myPe) continue;
 
-      // Get layout info from dispatch phase (uses global expert indexing)
-      int64_t layout = args.layoutRange[globalExpert * npes + srcPe];
+      // Get layout info from dispatch phase (uses LOCAL expert indexing)
+      // Dispatch stores at: layoutRange[localExpert * npes + srcPe]
+      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
       int numTokensToSend, offset;
       internode_ll::Unpack2(layout, numTokensToSend, offset);
 
@@ -594,14 +591,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #endif
 
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
-    // Convert localExpert to globalExpert for layoutRange indexing
+    // globalExpertIdx is for signaling, but layoutRange uses local expert indexing
     int globalExpertIdx = myPe * numLocalExperts + localExpert;
 
     for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
       if (srcPe == myPe) continue;
 
-      // Get layout info from dispatch phase (uses global expert indexing)
-      int64_t layout = args.layoutRange[globalExpertIdx * npes + srcPe];
+      // Get layout info from dispatch phase (uses LOCAL expert indexing)
+      // Dispatch stores at: layoutRange[localExpert * npes + srcPe]
+      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
       int numTokensToSend, offset;
       internode_ll::Unpack2(layout, numTokensToSend, offset);
 
