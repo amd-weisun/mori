@@ -775,6 +775,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
     // Try simple manual copy for SELF tokens to verify buffer addresses work
     if (isSelf && myPe == 0 && tokenIdx < 4) {
+      // Debug: print loop parameters BEFORE executing
+      if (laneId == 0 && inTokenPartId == 0) {
+        printf("[COMBINE-LOOP-DBG] token=%d laneId=%d hiddenDimSize=%d kUseWeights=%d srcPtrs[0]=%p w=%.4f srcVal=%.1f\n",
+               (int)tokenIdx, laneId, (int)hiddenDimSize, (int)kUseWeights,
+               (void*)srcPtrs[0], kUseWeights ? srcWeightScales[0] : 1.0f,
+               srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f);
+      }
       for (int elem = laneId; elem < hiddenDimSize; elem += warpSize) {
         float val = 0.0f;
         for (int k = 0; k < numTopK; ++k) {
@@ -782,6 +789,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
             float w = kUseWeights ? srcWeightScales[k] : 1.0f;
             val += static_cast<float>(srcPtrs[k][elem]) * w;
           }
+        }
+        // Debug: print what we're writing
+        if (elem == 0) {
+          printf("[COMBINE-WRITE-DBG] token=%d elem=%d val=%.1f srcPtrs[0][0]=%.1f\n",
+                 (int)tokenIdx, elem, val, srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f);
         }
         outPtr[elem] = static_cast<T>(val);
       }
