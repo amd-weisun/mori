@@ -470,6 +470,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   const int numTokens = args.curRankNumToken;
   const index_t expertCapacity = npes * config.maxNumInpTokenPerRank;
 
+  // Unconditional debug: verify kernel is launched
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-ENTRY] Kernel started: rank=%d numSms=%d numTokens=%d\n",
+           myPe, numSms, numTokens);
+  }
+  __syncthreads();
+
 #ifdef ENABLE_DEBUG_PRINTF
   // Debug: print input buffer info and first few values
   if (myPe == 0 && smId == 0 && threadId == 0) {
@@ -554,6 +561,12 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   __threadfence_system();  // System-wide visibility for all P2P writes
   __syncthreads();
 
+  // Debug: Phase 1 complete
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-PHASE1] Phase 1 complete: data sent\n");
+  }
+  __syncthreads();
+
   // ========== PHASE 2: SIGNAL COMPLETION ==========
   // Send completion flag to each source rank
 
@@ -592,10 +605,22 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   __threadfence_system();
   __syncthreads();
 
+  // Debug: Phase 2 complete
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-PHASE2] Phase 2 complete: signals sent, entering grid barrier\n");
+  }
+  __syncthreads();
+
   // Grid barrier to ensure ALL blocks have sent their signals before ANY block starts waiting
   // This prevents deadlock where block 0 (which sends signals) is slow and other blocks
   // start waiting for signals that haven't been sent yet
   detail::GridBarrier(args.dispatchGridBarrier, numSms);
+
+  // Debug: Grid barrier complete
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-PHASE2] Grid barrier complete, entering Phase 3\n");
+  }
+  __syncthreads();
 
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
@@ -621,9 +646,27 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         int globalExpertIdx = destPe * numLocalExperts + localExpert;
         int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
 
+        // Debug: about to wait for signal
+        if (myPe == 0) {
+          printf("[COMBINE-WAIT] rank=%d smId=%d waiting for signal from destPe=%d expert=%d flagSlot=%p count=%d\n",
+                 myPe, smId, destPe, globalExpertIdx, (void*)flagSlot, (int)count);
+        }
+
         // Poll until signal arrives (acquire for visibility of data)
+        int64_t spinCount = 0;
         while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
-          // spin
+          spinCount++;
+          if (myPe == 0 && spinCount == 100000000) {
+            printf("[COMBINE-WAIT] rank=%d smId=%d TIMEOUT waiting for destPe=%d expert=%d\n",
+                   myPe, smId, destPe, globalExpertIdx);
+            spinCount = 0;  // Reset to print again
+          }
+        }
+
+        // Debug: signal received
+        if (myPe == 0) {
+          printf("[COMBINE-WAIT] rank=%d smId=%d received signal from destPe=%d expert=%d\n",
+                 myPe, smId, destPe, globalExpertIdx);
         }
       }
     }
@@ -726,6 +769,12 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);
+  }
+
+  // Debug: Kernel complete
+  __syncthreads();
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-DONE] Kernel completed successfully\n");
   }
 
   // Reset total recv token for next iteration
