@@ -539,8 +539,9 @@ def run_test_impl(
         validate_dispatch(
             rank, num_experts_per_rank, world_size, recv_count, all_rank_indices
         )
-        # Also validate data placement (only on rank 0 for performance)
-        if rank == 0:
+        # Also validate data placement (only for internode on rank 0)
+        # Internode uses different buffer layout than intranode
+        if rank == 0 and is_internode:
             validate_dispatch_data(
                 rank=rank,
                 world_size=world_size,

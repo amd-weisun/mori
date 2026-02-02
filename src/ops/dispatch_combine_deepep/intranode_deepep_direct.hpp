@@ -94,7 +94,12 @@ constexpr int kNumPerChannels = 128;
 constexpr int kElemsPerLoad = 8;  // uint4 = 16 bytes = 8 bf16 elements
 constexpr float kFP8Margin = 1e-4f;
 
-// Finish counter pattern: when counter reaches this value, all tokens for that destPe are dispatched
+// Expert-centric constants (aligned with DeepEP)
+constexpr int kNumWarpGroups = 2;       // Each SM handles 2 experts (for count/signal phase)
+constexpr int kNumWarpsPerGroup = 8;    // 8 warps per warp group
+constexpr int kNumWarpsPerBlock = kNumWarpGroups * kNumWarpsPerGroup;  // 16 warps
+
+// Finish counter pattern: when counter reaches this value, all tokens for that expert are dispatched
 // The pattern works as: finish_counter = dispatched_count + (FINISHED_SUM_TAG - expected_count)
 // When dispatched_count == expected_count, finish_counter == FINISHED_SUM_TAG
 // Note: kFinishedSumTag is defined in dispatch_combine_deepep.hpp
@@ -133,19 +138,26 @@ __device__ inline float QuarterWarpReduceMax(float value) {
   return value;
 }
 
+// Warp-level sum reduction
+__device__ inline int WarpReduceSum(int value) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor(value, offset);
+  }
+  return value;
+}
+
 // CastFp8ToFloat unused in current LL combine path (caller dequantizes fp8 outputs).
 }  // namespace detail
 
-// DeepEP-aligned dispatch kernel with LOCAL atomics for slot assignment
-// Key optimizations aligned with DeepEP internode_ll.cu:
-// 1. LOCAL atomic for slot assignment: atomicCounterPerExpert[destExpert] on device memory (~10 cycles)
-//    vs remote atomic on destPe's symmetric memory (~50+ cycles)
-// 2. Source-rank-partitioned buffer: destLinearTok = localExpert * capacity + myPe * maxTokens + slot
-//    Each source rank has its own slot range, avoiding conflicts
-// 3. Batched remote counter updates: Count warp updates destExpertTokenCounterMemObj once per expert
-//    instead of per-token atomic updates
-// 4. SM-based token striding: Each block handles tokens[blockIdx.x + i * gridDim.x]
-// 5. Per-destPe finish counters with finish counter pattern
+// DeepEP-aligned dispatch kernel with expert-centric count/signal phases
+// Key design:
+// 1. ALL SMs process ALL tokens (SM-based token striding)
+// 2. ALL warps with valid top-k destinations do the data copy (no filtering by responsible expert)
+// 3. Expert-centric count phase: each SM counts tokens for its 2 responsible experts
+// 4. Expert-centric signal phase: each SM's warp groups wait for their experts' finish counters
+// 5. LOCAL atomics for slot assignment (~10 cycles vs ~50+ for remote xGMI atomics)
+// 6. Source-rank-partitioned buffer layout: each rank writes to its own slot range
+// 7. Per-expert finish counters for fine-grained completion detection
 template <typename T, bool kUseFP8>
 __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
@@ -153,7 +165,6 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const int laneId = threadIdx.x & (warpSize - 1);
   const int warpId = thdId / warpSize;
   const int warpNum = blockDim.x / warpSize;
-  const int numThreads = blockDim.x;
   const int smId = static_cast<int>(blockIdx.x);
   const int numSms = static_cast<int>(gridDim.x);
   const int globalWarpId = smId * warpNum + warpId;
@@ -163,21 +174,32 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
   const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
 
-  // Synchronize all ranks before accessing remote symmetric memory.
-  // Note: Counter buffers are already reset by hipMemsetAsync before kernel launch.
-  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+  // Expert-centric warp group assignment (for count/signal phases)
+  constexpr int kNumWarpGroups = detail::kNumWarpGroups;
+  constexpr int kNumWarpsPerGroup = detail::kNumWarpsPerGroup;
+  const int warpGroupId = warpId / kNumWarpsPerGroup;
+  const int subWarpId = warpId % kNumWarpsPerGroup;
+  const int numLocalExperts = config.numExpertPerRank;
+  const int numExperts = npes * numLocalExperts;
 
-  // Shared memory for per-warp destination info (DeepEP-style)
-  // Each warp needs: destExpert, destPe, localExpert, destTokId, destLinearTok
+  // Each SM is responsible for 2 experts (for count/signal phases)
+  const int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
+  const bool hasResponsibleExpert = (responsibleExpertIdx < numExperts);
+
+  // Shared memory for coordination (DeepEP-style)
+  __shared__ index_t sharedNumTokensSentPerExpert[kNumWarpGroups];
   __shared__ index_t sharedDestTokId[16];      // Max 16 warps per block
   __shared__ index_t sharedDestLinearTok[16];
 
+  // Synchronize all ranks before accessing remote symmetric memory.
+  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+
+  // ==================== PHASE 1: Token Dispatch ====================
+  // ALL SMs process ALL tokens. Each warp with valid destExpert does the copy.
   if (args.tokenIndices && args.inpTokenBuf) {
-    // DeepEP-style: SM-based token striding
-    // Each block handles tokens[smId], tokens[smId + numSms], ...
+    // SM-based token striding: each SM handles tokens[smId], tokens[smId + numSms], ...
     for (int tokenIdx = smId; tokenIdx < args.curRankNumToken; tokenIdx += numSms) {
-      // Each warp reads its own top-k index (similar to DeepEP)
-      // Warps with warpId >= numExpertPerToken will have invalid destExpert (-1)
+      // Each warp reads its own top-k index (warpId < numTopk)
       index_t destExpert = -1;
       index_t destPe = -1;
       index_t localExpert = -1;
@@ -186,53 +208,44 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       if (warpId < config.numExpertPerToken) {
         destExpert = args.tokenIndices[tokenIdx * config.numExpertPerToken + warpId];
-        destPe = destExpert / config.numExpertPerRank;
-        localExpert = destExpert % config.numExpertPerRank;
+        if (destExpert >= 0) {
+          destPe = destExpert / numLocalExperts;
+          localExpert = destExpert % numLocalExperts;
 
-        // Allocate slot using LOCAL atomic (key optimization: ~10 cycles vs ~50+ for remote)
-        // DeepEP pattern: each source rank has its own slot range [myPe * maxTokens, (myPe+1) * maxTokens)
-        if (laneId == 0) {
-          // LOCAL atomic on device memory (not symmetric memory on destPe)
-          destTokId = atomicAdd(args.atomicCounterPerExpert + destExpert, 1);
-          // Still update destPeTokenCounter for total count signaling (this is also local)
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          // Allocate slot using LOCAL atomic
+          if (laneId == 0) {
+            destTokId = atomicAdd(args.atomicCounterPerExpert + destExpert, 1);
+            atomicAdd(args.destPeTokenCounter + destPe, 1);
 
-          // Source-rank-partitioned buffer layout (like DeepEP):
-          // destLinearTok = localExpert * expertCapacity + srcRank * maxTokensPerRank + localSlot
-          index_t srcRankOffset = myPe * config.maxNumInpTokenPerRank;
-          sharedDestTokId[warpId] = destTokId;
-          sharedDestLinearTok[warpId] = localExpert * expertCapacity + srcRankOffset + destTokId;
+            // Source-rank-partitioned buffer layout
+            index_t srcRankOffset = myPe * config.maxNumInpTokenPerRank;
+            sharedDestTokId[warpId] = destTokId;
+            sharedDestLinearTok[warpId] = localExpert * expertCapacity + srcRankOffset + destTokId;
 
-          // Store global mapping for combine phase
-          args.dispDestTokIdMap[tokenIdx * config.numExpertPerToken + warpId] =
-              destExpert * expertCapacity + srcRankOffset + destTokId;
+            // Store mapping for combine phase
+            args.dispDestTokIdMap[tokenIdx * config.numExpertPerToken + warpId] =
+                destExpert * expertCapacity + srcRankOffset + destTokId;
+          }
         }
       }
       __syncthreads();
 
       // Read back from shared memory
-      if (warpId < config.numExpertPerToken) {
+      if (warpId < config.numExpertPerToken && destExpert >= 0) {
         destTokId = sharedDestTokId[warpId];
         destLinearTok = sharedDestLinearTok[warpId];
       }
 
-      // FP8 quantization: All threads in block work on the token's data
-      // This is the key DeepEP optimization - better parallelism for FP8 cast
+      // FP8 quantization path
       if constexpr (kUseFP8) {
-        // All threads participate in FP8 quantization for this token
-        // The quantized data is written to a temporary location, then copied by each warp
-        constexpr int kNumElemsPerRead = sizeof(uint4) / sizeof(T);  // 8 bf16 elements
-        const int hiddenBf16Int4 = config.hiddenDim / kNumElemsPerRead;
+        constexpr int kNumElemsPerRead = sizeof(uint4) / sizeof(T);
         const int numScales = config.hiddenDim / detail::kNumPerChannels;
-        const auto* srcInt4 = reinterpret_cast<const uint4*>(args.inpTokenBuf + tokenIdx * config.hiddenDim);
+        const auto* srcPtr = reinterpret_cast<const uint4*>(args.inpTokenBuf + tokenIdx * config.hiddenDim);
 
-        // Each warp that has a valid destination does its own FP8 quantization and copy
-        // This maintains the per-warp independence while using the same loop structure as DeepEP
-        if (warpId < config.numExpertPerToken && destPe >= 0) {
+        if (warpId < config.numExpertPerToken && destExpert >= 0) {
           auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
               args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) +
               destLinearTok * config.hiddenDim;
-          auto* srcPtr = reinterpret_cast<const uint4*>(args.inpTokenBuf + tokenIdx * config.hiddenDim);
           auto* destPtr = reinterpret_cast<uint64_t*>(destFp8);
           float* scalePtr = args.shmemOutScalesMemObj->template GetAs<float*>(destPe) +
                             destLinearTok * numScales;
@@ -294,14 +307,14 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             destPtr[scaleBase * detail::kNumPerChannels / detail::kElemsPerLoad + laneId] = fp8Packed;
           }
 
-          // Increment finish counter after copy (release semantics)
+          // Increment per-expert finish counter after copy (release semantics)
           if (laneId == 0) {
-            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
+            detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
           }
         }
       } else {
-        // Non-FP8 path: Each warp handles its destination independently
-        if (warpId < config.numExpertPerToken && destPe >= 0) {
+        // Non-FP8 path
+        if (warpId < config.numExpertPerToken && destExpert >= 0) {
           // Store source token mapping
           if (laneId == 0) {
             detail::AtomicStoreRelease(
@@ -335,9 +348,9 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + baseOffset,
                          args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
 
-          // Increment finish counter after copy (release semantics)
+          // Increment per-expert finish counter after copy (release semantics)
           if (laneId == 0) {
-            detail::AtomicAddRelease(args.finishCounterPerDestPe + destPe, 1u);
+            detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
           }
         }
       }
@@ -345,70 +358,86 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Count warp: Computes expected tokens per destPe, updates remote expert counters (batched),
-  // and adds offset to finish counters.
-  // Key optimization: Instead of per-token remote atomics, we read from local atomicCounterPerExpert
-  // and do ONE remote atomic per expert that received tokens from this rank.
-  constexpr int kMaxGpuPerNode = 8;
-  const int numLocalExperts = config.numExpertPerRank;
-  assert(npes <= kMaxGpuPerNode && "Intranode dispatch assumes worldSize <= 8 GPUs per node");
+  // ==================== PHASE 2: Expert-centric Count Phase ====================
+  // Last warp per SM counts tokens for this SM's 2 responsible experts
+  constexpr int kLastWarpId = kNumWarpGroups * kNumWarpsPerGroup - 1;
+  if (warpId == kLastWarpId) {
+    const int expertBeginIdx = smId * kNumWarpGroups;
+    const int expertEndIdx = min(expertBeginIdx + kNumWarpGroups, numExperts);
 
-  if (globalWarpId == globalWarpNum - 1) {
-    int countPerDestPe[kMaxGpuPerNode] = {0};
+    // Per-lane count for each responsible expert
+    int expertCount[kNumWarpGroups] = {0};
 
-    // First pass: count per destPe and update remote expert counters (batched)
-    // Each lane handles a subset of experts
-    const int numExperts = npes * numLocalExperts;
-    for (int expertIdx = laneId; expertIdx < numExperts; expertIdx += warpSize) {
-      // Read count from LOCAL atomicCounterPerExpert (already computed during dispatch)
-      index_t count = args.atomicCounterPerExpert[expertIdx];
-      if (count > 0) {
-        int destPe = expertIdx / numLocalExperts;
-        int localExpert = expertIdx % numLocalExperts;
-
-        // Batched remote atomic: ONE update per expert instead of per-token
-        // This is still O(experts) remote atomics, but much fewer than O(tokens * topk)
-        atomicAdd(args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe) + localExpert,
-                  count);
-
-        // Aggregate for per-destPe count
-        countPerDestPe[destPe] += count;
+    #pragma unroll 2
+    for (int i = laneId; i < args.curRankNumToken * config.numExpertPerToken; i += warpSize) {
+      index_t idx = args.tokenIndices ? args.tokenIndices[i] : -1;
+      if (idx >= expertBeginIdx && idx < expertEndIdx) {
+        expertCount[idx - expertBeginIdx]++;
       }
     }
 
-    // Reduce per-destPe counts across lanes
-    for (int pe = 0; pe < npes && pe < kMaxGpuPerNode; ++pe) {
-      int count = countPerDestPe[pe];
-      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-        count += __shfl_xor(count, offset);
-      }
+    // Warp-reduce and update finish counter
+    #pragma unroll 2
+    for (int i = expertBeginIdx; i < expertEndIdx; ++i) {
+      int sum = detail::WarpReduceSum(expertCount[i - expertBeginIdx]);
       if (laneId == 0) {
-        uint32_t finishOffset = detail::kFinishedSumTag - static_cast<uint32_t>(count);
-        detail::AtomicAddRelease(args.finishCounterPerDestPe + pe, finishOffset);
+        sharedNumTokensSentPerExpert[i - expertBeginIdx] = sum;
+        // Add offset to reach FINISHED_SUM_TAG when all dispatches complete
+        detail::AtomicAddRelaxed(args.finishCounterPerExpert + i,
+                                 detail::kFinishedSumTag - static_cast<uint32_t>(sum));
       }
     }
   }
+  __syncthreads();
 
-  // Signal phase: Wait for finish counter per destPe, then send token counts
-  if (globalWarpId == 0) {
+  // ==================== PHASE 3: Expert-centric Wait Phase ====================
+  // Each warp group's first warp waits for its responsible expert's finish counter
+  // and updates the remote expert token counter
+  if (hasResponsibleExpert && subWarpId == 0 && laneId == 0) {
+    const int destPe = responsibleExpertIdx / numLocalExperts;
+    const int localExpertIdx = responsibleExpertIdx % numLocalExperts;
+    const int numTokensSent = sharedNumTokensSentPerExpert[warpGroupId];
+
+    // Wait for per-expert finish counter to reach FINISHED_SUM_TAG
+    while (detail::AtomicLoadAcquire(args.finishCounterPerExpert + responsibleExpertIdx)
+           != detail::kFinishedSumTag) {
+    }
+
+    // Update remote expert token counter (batched: one update per expert)
+    atomicAdd(args.destExpertTokenCounterMemObj->template GetAs<index_t*>(destPe) + localExpertIdx,
+              numTokensSent);
+
+    // Clean workspace for next use
+    args.atomicCounterPerExpert[responsibleExpertIdx] = 0;
+    args.finishCounterPerExpert[responsibleExpertIdx] = 0;
+  }
+
+  // Grid barrier to ensure all expert counters are updated before signal phase
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+
+  // ==================== PHASE 4: Signal Phase (per-destPe) ====================
+  // Warp 0 sends signals to all destination PEs with total token count
+  if (warpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      while (detail::AtomicLoadAcquire(args.finishCounterPerDestPe + destPe) != detail::kFinishedSumTag) {
-      }
+      // Sum up tokens sent to this destPe from destPeTokenCounter
+      index_t numTokensSent = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+      index_t numTokenSignal = numTokensSent + 1;
 
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      // Send signal to destination PE
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       detail::AtomicStoreRelease(signal, numTokenSignal);
     }
   }
 
-  // Receive phase: Wait for signals from other ranks
+  // ==================== PHASE 5: Receive Phase ====================
+  // Wait for signals from all source ranks
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
+  if (warpId == 0) {
+    for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
+      index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      detail::AtomicStoreRelease(signal, static_cast<index_t>(0));
+      detail::AtomicStoreRelease(signal, static_cast<index_t>(0));  // Reset for next use
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
     }
     if (laneId == 0) {
@@ -507,36 +536,109 @@ __global__ void EpCombineIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       if (destPe < config.worldSize) {
         // Step 4: read remote expert-major slot from symmetric buffers.
         size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
-        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                     baseOffset + hiddenDimOffset;
-        srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                   (localExpert * expertCapacity + destLocalTokId) *
-                               config.numExpertPerToken;
+        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) + baseOffset;
+        if constexpr (kUseWeights) {
+          srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+              (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
+          srcWeightScales[j] =
+              srcWeightsPtr[j][j];  // weight at column j for this expert
+        }
       } else {
         srcPtrs[j] = nullptr;
-        srcWeightsPtr[j] = nullptr;
-      }
-
-      if constexpr (kUseWeights) {
-        float w = 1.0f;
-        if (args.weightsBuf && srcWeightsPtr[j] != nullptr) {
-          w = srcWeightsPtr[j][j];
+        if constexpr (kUseWeights) {
+          srcWeightsPtr[j] = nullptr;
+          srcWeightScales[j] = 0.0f;
         }
-        srcWeightScales[j] = w;
       }
     }
+    __syncwarp();
 
-    // Step 5: accumulate into local output buffer.
-    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                  tokenId * config.hiddenDim + hiddenDimOffset,
-                srcPtrs, kUseWeights ? srcWeightScales : nullptr,
-                config.numExpertPerToken, hiddenDimSize);
+    // Step 5: weighted accumulation of all top-k contributions.
+    if constexpr (kUseWeights) {
+      core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
+                      srcWeightScales, config.numExpertPerToken, hiddenDimSize,
+                      hiddenDimOffset);
+    } else {
+      core::WarpAccumNoWeights(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset,
+                                srcPtrs, nullptr, config.numExpertPerToken,
+                                hiddenDimSize, hiddenDimOffset);
+    }
+  }
 
-    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
+  // Copy back new weights / indices if caller provided combined-output buffers.
+  if (args.outWeights) {
+    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
+      index_t destExpert = destTokId / expertCapacity;
+      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t localExpert = destExpert % config.numExpertPerRank;
+
+      size_t baseWeightOff = (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
+      core::WarpCopy(args.outWeights + i * config.numExpertPerToken,
+                     args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) + baseWeightOff,
+                     config.numExpertPerToken);
+    }
+  }
+
+  if (args.outIndices) {
+    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
+      index_t destExpert = destTokId / expertCapacity;
+      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t localExpert = destExpert % config.numExpertPerRank;
+
+      size_t baseIdxOff = (localExpert * expertCapacity + destLocalTokId) * config.numExpertPerToken;
+      core::WarpCopy(args.outIndices + i * config.numExpertPerToken,
+                     args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) + baseIdxOff,
+                     config.numExpertPerToken);
+    }
+  }
+
+  // Copy back scales if fp8
+  if (args.outScales) {
+    const int numScales = config.hiddenDim / detail::kNumPerChannels;
+    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
+      index_t destExpert = destTokId / expertCapacity;
+      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t localExpert = destExpert % config.numExpertPerRank;
+
+      size_t baseScaleOff = (localExpert * expertCapacity + destLocalTokId) * numScales;
+      core::WarpCopy(args.outScales + i * numScales,
+                     args.shmemOutScalesMemObj->template GetAs<float*>(destPe) + baseScaleOff,
+                     numScales);
+    }
+  }
+
+  // Copy out token data from fp8 symmetric buffer
+  if constexpr (kUseFP8) {
+    const int numScales = config.hiddenDim / detail::kNumPerChannels;
+    using FP8 = __hip_fp8_storage_t;
+    for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+      index_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken];
+      index_t destExpert = destTokId / expertCapacity;
+      index_t destLocalTokId = destTokId - destExpert * expertCapacity;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t localExpert = destExpert % config.numExpertPerRank;
+
+      size_t baseTokOff = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+      core::WarpCopy(args.fp8OutTokenBuf + i * config.hiddenDim,
+                     args.shmemDispatchOutTokMemObj->template GetAs<FP8*>(destPe) + baseTokOff,
+                     config.hiddenDim);
+    }
+  } else {
+    // Standard path: copy non-fp8 to outTokenBuf via accumulation (already done above)
+    // Additional path for callers that just want raw dispatch output
+    if (args.fp8OutTokenBuf) {
+      for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+        core::WarpCopyAccumTopK(
+                                args.outTokenBuf + i * config.hiddenDim, srcPtrs,
                                 srcWeightsPtr, nullptr, config.numExpertPerToken,
                                 config.numExpertPerToken);
+      }
     }
   }
 }
