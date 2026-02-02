@@ -546,18 +546,21 @@ __global__ void EpCombineIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     __syncwarp();
 
     // Step 5: weighted accumulation of all top-k contributions.
-    // WarpAccum signature: (dest, srcs, srcScales, accumNum, nelems)
+    // WarpAccum signature: WarpAccum<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems)
+    // VecBytes = 16 for optimal vectorized loads
     if constexpr (kUseWeights) {
-      core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
-                      srcWeightScales, config.numExpertPerToken, hiddenDimSize);
+      core::WarpAccum<T, 16>(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
+                             srcWeightScales, static_cast<size_t>(config.numExpertPerToken),
+                             static_cast<size_t>(hiddenDimSize));
     } else {
       // Without weights, use uniform weights of 1.0
       float uniformWeights[MAX_EXPERTS_PER_TOKEN];
       for (int w = 0; w < config.numExpertPerToken; ++w) {
         uniformWeights[w] = 1.0f;
       }
-      core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
-                      uniformWeights, config.numExpertPerToken, hiddenDimSize);
+      core::WarpAccum<T, 16>(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
+                             uniformWeights, static_cast<size_t>(config.numExpertPerToken),
+                             static_cast<size_t>(hiddenDimSize));
     }
   }
 
