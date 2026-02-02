@@ -142,6 +142,17 @@ PRESET_SETTINGS = {
         "gpu_per_node": 4,             # 2 nodes with 4 GPUs each
         "use_fp8": False,
     },
+    # Minimal test with topk=8 to isolate multi-expert accumulation issues
+    "internode_minimal_8topk": {
+        "name": "internode_minimal_8topk",
+        "num_processes": 8,
+        "hidden_dim": 64,              # Small hidden dim
+        "max_num_inp_token_per_rank": 4,  # Just 4 tokens per rank
+        "total_experts": 64,           # 8 experts per GPU
+        "num_experts_per_token": 8,    # topk=8 like production
+        "gpu_per_node": 4,             # 2 nodes with 4 GPUs each
+        "use_fp8": False,
+    },
     "internode_4node": {
         "name": "internode_4node",
         "num_processes": 8,

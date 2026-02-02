@@ -470,42 +470,6 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   const int numTokens = args.curRankNumToken;
   const index_t expertCapacity = npes * config.maxNumInpTokenPerRank;
 
-  // Unconditional debug: verify kernel is launched (all ranks)
-  if (smId == 0 && threadId == 0) {
-    printf("[COMBINE-ENTRY] rank=%d numSms=%d numTokens=%d\n",
-           myPe, numSms, numTokens);
-  }
-  __syncthreads();
-
-#ifdef ENABLE_DEBUG_PRINTF
-  // Debug: print input buffer info and first few values
-  if (myPe == 0 && smId == 0 && threadId == 0) {
-    printf("[COMBINE-INIT] myPe=%d numTokens=%d expertCapacity=%d numLocalExperts=%d numTopK=%d\n",
-           myPe, numTokens, (int)expertCapacity, numLocalExperts, numTopK);
-    printf("[COMBINE-INIT] inpTokenBuf=%p shmemCombineOutTokMemObj=%p shmemCombineInpTokMemObj=%p\n",
-           (void*)args.inpTokenBuf,
-           (void*)args.shmemCombineOutTokMemObj->template GetAs<T*>(),
-           (void*)args.shmemCombineInpTokMemObj->template GetAs<T*>());
-    // Print first few values from inpTokenBuf (should be dispatch output)
-    printf("[COMBINE-INIT] inpTokenBuf[0:4] = %.1f, %.1f, %.1f, %.1f\n",
-           (float)args.inpTokenBuf[0], (float)args.inpTokenBuf[1],
-           (float)args.inpTokenBuf[2], (float)args.inpTokenBuf[3]);
-    // Print weight buffer info
-    printf("[COMBINE-INIT] weightsBuf=%p kUseWeights=%d\n",
-           (void*)args.weightsBuf, (int)kUseWeights);
-    if (args.weightsBuf) {
-      printf("[COMBINE-INIT] weightsBuf[0:4] = %.4f, %.4f, %.4f, %.4f\n",
-             args.weightsBuf[0], args.weightsBuf[1], args.weightsBuf[2], args.weightsBuf[3]);
-    }
-    // Print dispDestTokIdMap for token 0
-    for (int k = 0; k < numTopK; ++k) {
-      index_t destTokId = args.dispDestTokIdMap[k];
-      printf("[COMBINE-INIT] dispDestTokIdMap[0*%d+%d] = %d\n", numTopK, k, (int)destTokId);
-    }
-  }
-  __syncthreads();
-#endif
-
   // ========== PHASE 1: SEND EXPERT OUTPUTS ==========
   // Copy expert outputs to staging buffer and RDMA put to source ranks
 
@@ -568,11 +532,6 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   __threadfence_system();  // System-wide visibility for all P2P writes
   __syncthreads();
 
-  // Debug: Phase 1 complete (all ranks)
-  if (smId == 0 && threadId == 0) {
-    printf("[COMBINE-PHASE1] rank=%d Phase 1 complete: data sent\n", myPe);
-  }
-  __syncthreads();
 
   // ========== PHASE 2: SIGNAL COMPLETION ==========
   // Send completion flag to each source rank
@@ -612,22 +571,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   __threadfence_system();
   __syncthreads();
 
-  // Debug: Phase 2 complete (all ranks)
-  if (smId == 0 && threadId == 0) {
-    printf("[COMBINE-PHASE2] rank=%d Phase 2 complete: signals sent, entering grid barrier\n", myPe);
-  }
-  __syncthreads();
-
   // Grid barrier to ensure ALL blocks have sent their signals before ANY block starts waiting
   // This prevents deadlock where block 0 (which sends signals) is slow and other blocks
   // start waiting for signals that haven't been sent yet
   detail::GridBarrier(args.dispatchGridBarrier, numSms);
-
-  // Debug: Grid barrier complete (all ranks)
-  if (smId == 0 && threadId == 0) {
-    printf("[COMBINE-PHASE2] rank=%d Grid barrier complete, entering Phase 3\n", myPe);
-  }
-  __syncthreads();
 
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
@@ -653,24 +600,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         int globalExpertIdx = destPe * numLocalExperts + localExpert;
         int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
 
-        // Debug: about to wait for signal (all ranks)
-        printf("[COMBINE-WAIT] rank=%d smId=%d waiting for destPe=%d expert=%d count=%d\n",
-               myPe, smId, destPe, globalExpertIdx, (int)count);
-
         // Poll until signal arrives (acquire for visibility of data)
-        int64_t spinCount = 0;
-        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
-          spinCount++;
-          if (spinCount == 100000000) {
-            printf("[COMBINE-WAIT] rank=%d smId=%d TIMEOUT destPe=%d expert=%d\n",
-                   myPe, smId, destPe, globalExpertIdx);
-            spinCount = 0;  // Reset to print again
-          }
-        }
-
-        // Debug: signal received
-        printf("[COMBINE-WAIT] rank=%d smId=%d received from destPe=%d expert=%d\n",
-               myPe, smId, destPe, globalExpertIdx);
+        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0);
       }
     }
   }
@@ -741,15 +672,6 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           w = args.weightsBuf[destLinearTok * numTopK + j];
         }
         srcWeightScales[j] = w;
-
-        // Debug: print raw weight buffer access for rank 0 tokens
-        if (myPe == 0 && tokenIdx < 4 && j == 0 && laneId == 0 && inTokenPartId == 0) {
-          index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
-          int weightIdx = destLinearTok * numTopK + j;
-          printf("[WEIGHT-RAW] token=%d destLinearTok=%d weightsBuf=%p idx=%d rawVal=%.4f w=%.4f\n",
-                 (int)tokenIdx, (int)destLinearTok, (void*)args.weightsBuf, weightIdx,
-                 args.weightsBuf ? args.weightsBuf[weightIdx] : -999.0f, w);
-        }
       }
     }
 
@@ -758,19 +680,20 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #ifdef ENABLE_DEBUG_PRINTF
     // Debug: print srcPtrs and first value for all tokens on rank 0
     if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0) {
-      for (int j = 0; j < numTopK; ++j) {
-        index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
-        index_t destExpert = destTokId / expertCapacity;
-        index_t destLocalTokId = destTokId % expertCapacity;
-        index_t destPe = destExpert / numLocalExperts;
-        index_t localExpert = destExpert % numLocalExperts;
-        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
-        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-        float val = srcPtrs[j] ? static_cast<float>(srcPtrs[j][0]) : -999.0f;
-        const char* srcType = (destPe == myPe) ? "SELF" : (isRemote ? "RDMA" : "P2P");
-        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d baseOffset=%lu %s srcVal=%.1f\n",
-               (int)tokenIdx, j, (int)destTokId, (int)destPe,
-               (unsigned long)baseOffset, srcType, val);
+      for (int jj = 0; jj < numTopK; ++jj) {
+        index_t dTokId = args.dispDestTokIdMap[tokenIdx * numTopK + jj];
+        index_t dExpert = dTokId / expertCapacity;
+        index_t dLocalTokId = dTokId % expertCapacity;
+        index_t dPe = dExpert / numLocalExperts;
+        index_t lExpert = dExpert % numLocalExperts;
+        size_t bOffset = (lExpert * expertCapacity + dLocalTokId) * config.hiddenDim;
+        bool isRem = internode_ll::IsRemoteRank(myPe, dPe, gpuPerNode);
+        float val = srcPtrs[jj] ? static_cast<float>(srcPtrs[jj][0]) : -999.0f;
+        float w = kUseWeights ? srcWeightScales[jj] : 1.0f;
+        const char* srcType = (dPe == myPe) ? "SELF" : (isRem ? "RDMA" : "P2P");
+        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d localExp=%d baseOffset=%lu %s srcVal=%.1f w=%.4f\n",
+               (int)tokenIdx, jj, (int)dTokId, (int)dPe, (int)lExpert,
+               (unsigned long)bOffset, srcType, val, w);
       }
     }
 #endif
@@ -784,70 +707,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
                 tokenIdx * config.hiddenDim + hiddenDimOffset;
 
-    // Debug: Check SELF tokens - do manual copy instead of WarpAccum to diagnose
-    index_t destPeForDebug = (args.dispDestTokIdMap[tokenIdx * numTopK] / expertCapacity) / numLocalExperts;
-    bool isSelf = (destPeForDebug == myPe);
-    bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPeForDebug, gpuPerNode);
-    const char* routeTypeDbg = isSelf ? "SELF" : (isRemoteDbg ? "RDMA" : "P2P");
-
-    // Print weight info for ALL token types on rank 0
-    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0) {
-      printf("[COMBINE-WEIGHT-DBG] token=%d %s: srcVal=%.1f weight=%.4f\n",
-             (int)tokenIdx, routeTypeDbg,
-             srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f,
-             kUseWeights ? srcWeightScales[0] : 1.0f);
-    }
-
-    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
-      printf("[COMBINE-ACCUM-BEFORE] token=%d hiddenDimSize=%d srcVal=%.1f outVal=%.1f\n",
-             (int)tokenIdx, (int)hiddenDimSize,
-             srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f, (float)outPtr[0]);
-    }
-
-    // Try simple manual copy for SELF tokens to verify buffer addresses work
-    if (isSelf && myPe == 0 && tokenIdx < 4) {
-      // Debug: print loop parameters BEFORE executing
-      if (laneId == 0 && inTokenPartId == 0) {
-        printf("[COMBINE-LOOP-DBG] token=%d laneId=%d hiddenDimSize=%d kUseWeights=%d srcPtrs[0]=%p w=%.4f srcVal=%.1f\n",
-               (int)tokenIdx, laneId, (int)hiddenDimSize, (int)kUseWeights,
-               (void*)srcPtrs[0], kUseWeights ? srcWeightScales[0] : 1.0f,
-               srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f);
-      }
-      for (int elem = laneId; elem < hiddenDimSize; elem += warpSize) {
-        float val = 0.0f;
-        for (int k = 0; k < numTopK; ++k) {
-          if (srcPtrs[k]) {
-            float w = kUseWeights ? srcWeightScales[k] : 1.0f;
-            val += static_cast<float>(srcPtrs[k][elem]) * w;
-          }
-        }
-        // Debug: print what we're writing
-        if (elem == 0) {
-          printf("[COMBINE-WRITE-DBG] token=%d elem=%d val=%.1f srcPtrs[0][0]=%.1f\n",
-                 (int)tokenIdx, elem, val, srcPtrs[0] ? (float)srcPtrs[0][0] : -999.0f);
-        }
-        outPtr[elem] = static_cast<T>(val);
-      }
-      __syncwarp();
-      if (laneId == 0) {
-        printf("[COMBINE-ACCUM-MANUAL] token=%d wrote outVal=%.1f\n",
-               (int)tokenIdx, (float)outPtr[0]);
-      }
-    } else {
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
-                            numTopK, hiddenDimSize);
-    }
-
-    __syncwarp();
-    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0 && isSelf) {
-      printf("[COMBINE-ACCUM-AFTER] token=%d outVal=%.1f\n", (int)tokenIdx, (float)outPtr[0]);
-    }
-  }
-
-  // Debug: Kernel complete (all ranks)
-  __syncthreads();
-  if (smId == 0 && threadId == 0) {
-    printf("[COMBINE-DONE] rank=%d Kernel completed\n", myPe);
+    core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
+                          numTopK, hiddenDimSize);
   }
 
   // Reset total recv token for next iteration
