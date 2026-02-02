@@ -99,6 +99,26 @@ __device__ inline T AtomicLoadRelaxedSystem(T* ptr) {
 // For multinode, counter reaches FINISHED_SUM_TAG * 2 when both local and remote are done
 constexpr uint32_t kFinishedSumTag = 0x20000000u;
 
+// Expert-centric kernel constants (aligned with DeepEP internode_ll.cu)
+// Each SM handles kNumWarpGroups experts, with kNumWarpsPerGroup warps per expert
+constexpr int kNumWarpGroups = 2;        // Each SM handles 2 experts (AMD config)
+constexpr int kNumWarpsPerGroup = 8;     // 8 warps per warp group
+constexpr int kExpertCentricWarpSize = 64;  // AMD MI300X warp size
+
+// Calculate block count for expert-centric kernels: ceil(totalExperts / kNumWarpGroups)
+__host__ __device__ inline int GetExpertCentricBlockCount(int totalExperts) {
+  return (totalExperts + kNumWarpGroups - 1) / kNumWarpGroups;
+}
+
+// Warp reduction sum (for count aggregation in expert-centric kernels)
+template <typename T>
+__device__ inline T WarpReduceSum(T val) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    val += __shfl_xor(val, offset);
+  }
+  return val;
+}
+
 // Grid-level barrier using device-scope atomics (for internode LL kernels)
 // All blocks must call this function. Thread 0 of each block participates in the barrier.
 // The counter must be reset to 0 before each kernel invocation.

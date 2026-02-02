@@ -181,21 +181,24 @@ def dequant_input_like_fp8(inputs: torch.Tensor, data_type: torch.dtype) -> torc
     return dequant.view(inputs.size(0), inputs.size(1)).to(data_type)
 
 
-def select_block_config(total_experts: int) -> tuple[int, int]:
-    """Select appropriate block_num and warp_num_per_block based on expert count.
+def select_block_config(num_tokens: int, total_experts: int) -> tuple[int, int]:
+    """Select appropriate block_num and warp_num_per_block.
 
-    Aligned with DeepEP's launch configuration (internode_ll.cu:467-477):
-    - kNumWarpGroups = 2 (AMD)
-    - num_sms = ceil(num_experts / kNumWarpGroups)
-    - For 288 experts: ceil(288/2) = 144 blocks
+    DeepEP-aligned expert-centric configuration:
+        block_num = ceil(total_experts / kNumWarpGroups)
 
-    This ensures SM utilization scales with expert count for better performance.
+    Each SM (block) is responsible for kNumWarpGroups=2 experts in the count/signal phase.
+    For 288 experts: block_num = ceil(288/2) = 144 blocks.
+
+    The token dispatch phase uses SM-based striding:
+        for (tokenIdx = smId; tokenIdx < num_tokens; tokenIdx += numSms)
+
+    Blocks beyond num_tokens have no tokens to dispatch, but they still participate
+    in the expert-centric count/signal phase (counting tokens for their responsible experts).
     """
-    # DeepEP uses: num_sms = cell_div(num_experts, kNumWarpGroups)
-    # where kNumWarpGroups = 2 for AMD
     kNumWarpGroups = 2
-    block_num = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
-    return block_num, 16  # 16 warps per block (same as DeepEP)
+    expert_based_blocks = (total_experts + kNumWarpGroups - 1) // kNumWarpGroups
+    return expert_based_blocks, 16  # 16 warps per block
 
 
 def create_op_for_setting(
@@ -228,7 +231,7 @@ def create_op_for_setting(
         else mori.ops.EpDispatchCombineDeepepKernelType.IntraNode
     )
 
-    block_num, warp_num_per_block = select_block_config(total_experts)
+    block_num, warp_num_per_block = select_block_config(max_num_inp_token_per_rank, total_experts)
 
     config = mori.ops.EpDispatchCombineDeepepConfig(
         data_type=data_type,
@@ -443,7 +446,7 @@ def run_test_impl(
     rng.manual_seed(123)
 
     # Always create config (needed for validation even when op is provided)
-    block_num, warp_num_per_block = select_block_config(total_experts)
+    block_num, warp_num_per_block = select_block_config(max_num_inp_token_per_rank, total_experts)
     config = mori.ops.EpDispatchCombineDeepepConfig(
         data_type=data_type,
         rank=rank,
@@ -714,7 +717,7 @@ def run_once_benchmark(
 
         # Validate combine if requested
         if check_result and rank == 0:
-            block_num, warp_num_per_block = select_block_config(total_experts)
+            block_num, warp_num_per_block = select_block_config(max_num_inp_token_per_rank, total_experts)
             config = mori.ops.EpDispatchCombineDeepepConfig(
                 data_type=torch.bfloat16,
                 rank=rank,

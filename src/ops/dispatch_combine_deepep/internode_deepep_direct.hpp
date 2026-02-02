@@ -480,6 +480,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
         if (isRemote) {
           // Stage and RDMA put
+          // Use expert-major layout: linear = localExpert * expertCapacity + srcPe * maxTokens + slot
+          // This matches what Phase 3 expects when reading via dispDestTokIdMap
           T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + linear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             localStaging[j] = args.inpTokenBuf[linear * config.hiddenDim + j];
@@ -487,9 +489,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           __syncwarp();
 
           if (laneId == 0) {
+            // Put at expert-major offset, not flat srcTokId offset
             shmem::ShmemPutMemNbiThread(
                 args.shmemCombineOutTokMemObj,
-                srcTokId * config.hiddenDim * sizeof(T),
+                linear * config.hiddenDim * sizeof(T),  // Use linear (expert-major), not srcTokId (flat)
                 args.shmemStagingTokMemObj,
                 linear * config.hiddenDim * sizeof(T),
                 config.hiddenDim * sizeof(T),
@@ -580,12 +583,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       if (destPe < npes) {
         bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+        // baseOffset uses expert-major layout matching dispatch and Phase 1 send
         size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
 
         if (isRemote) {
-          // Data was sent to our combine out buffer
+          // Data was sent to our combine out buffer at expert-major offset
+          // Phase 1 put data at: linear * hiddenDim where linear = localExpert * capacity + srcPe * maxTokens + slot
+          // destLocalTokId = srcPe * maxTokens + slot, so baseOffset matches
           srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                       tokenIdx * config.hiddenDim + hiddenDimOffset;
+                       baseOffset + hiddenDimOffset;
         } else {
           // Data is in the remote rank's combine input buffer (accessible via P2P)
           srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
