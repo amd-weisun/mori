@@ -733,16 +733,21 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       if constexpr (kUseWeights) {
         float w = 1.0f;
-        if (args.weightsBuf && j < numTopK) {
-          w = args.weightsBuf[tokenIdx * numTopK + j];
+        if (args.weightsBuf && j < numTopK && destPe < npes) {
+          // Weights are stored in expert-major layout: [localExpert][expertCapacity][numTopK]
+          // NOT token-major. We need to use the same destLinearTok indexing as token data.
+          // destLinearTok = localExpert * expertCapacity + destLocalTokId
+          index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
+          w = args.weightsBuf[destLinearTok * numTopK + j];
         }
         srcWeightScales[j] = w;
 
         // Debug: print raw weight buffer access for rank 0 tokens
         if (myPe == 0 && tokenIdx < 4 && j == 0 && laneId == 0 && inTokenPartId == 0) {
-          int weightIdx = tokenIdx * numTopK + j;
-          printf("[WEIGHT-RAW] token=%d weightsBuf=%p idx=%d rawVal=%.4f w=%.4f\n",
-                 (int)tokenIdx, (void*)args.weightsBuf, weightIdx,
+          index_t destLinearTok = localExpert * expertCapacity + destLocalTokId;
+          int weightIdx = destLinearTok * numTopK + j;
+          printf("[WEIGHT-RAW] token=%d destLinearTok=%d weightsBuf=%p idx=%d rawVal=%.4f w=%.4f\n",
+                 (int)tokenIdx, (int)destLinearTok, (void*)args.weightsBuf, weightIdx,
                  args.weightsBuf ? args.weightsBuf[weightIdx] : -999.0f, w);
         }
       }
