@@ -477,9 +477,11 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
 
       // Each warp handles a subset of tokens
-      for (int tokenIdx = offset + globalWarpId; tokenIdx < offset + numTokensToSend; tokenIdx += globalWarpNum) {
-        index_t srcTokId = tokenIdx;  // Linear index in packed buffer
-        index_t linear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + (tokenIdx - offset);
+      // slotIdx iterates from 0 to numTokensToSend-1, representing the slot within srcPe's partition
+      // offset is the packed buffer offset (not used for reading input)
+      for (int slotIdx = globalWarpId; slotIdx < numTokensToSend; slotIdx += globalWarpNum) {
+        // Linear index in expert-major layout: localExpert * expertCapacity + srcPe * maxTokens + slot
+        index_t linear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + slotIdx;
 
         if (isRemote) {
           // Stage and RDMA put
@@ -657,8 +659,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
     __syncwarp();
 
-    // Accumulate into the actual output buffer (not the RDMA receive buffer!)
-    T* outPtr = args.outTokenBuf + tokenIdx * config.hiddenDim + hiddenDimOffset;
+    // Accumulate into the combine output buffer (shmemCombineOutTokMemObj)
+    // For internode, the Python binding returns shmemCombineOutTokMemObj as the output tensor
+    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                tokenIdx * config.hiddenDim + hiddenDimOffset;
     core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
                           numTopK, hiddenDimSize);
   }
