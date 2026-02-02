@@ -706,7 +706,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       if constexpr (kUseWeights) {
         float w = 1.0f;
-        if (args.shmemDispatchOutWeightsMemObj && j < numTopK && destPe < npes) {
+        if (j < numTopK && destPe < npes) {
           // Weights are stored in expert-major layout: [localExpert][expertCapacity][numTopK]
           // During dispatch, weights were written to shmemDispatchOutWeightsMemObj on destPe.
           // For combine, we ARE on destPe (the destination of dispatch), so we read from
