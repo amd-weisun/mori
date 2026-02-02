@@ -137,6 +137,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Store mapping for combine phase
       if (laneId == 0) {
         args.dispDestTokIdMap[tokenIdx * numTopK + warpId] = destExpert * expertCapacity + destTokId;
+#ifdef ENABLE_DEBUG_PRINTF
+        if (myPe == 0 && tokenIdx == 0) {
+          printf("[DISPATCH-DBG] token=0 k=%d: destExpert=%d destPe=%d localExpert=%d "
+                 "slotIdx=%d destTokId=%d destLinearTok=%d stored=%d baseOffset=%lu\n",
+                 warpId, destExpert, destPe, localExpert, (int)slotIdx, (int)destTokId,
+                 (int)destLinearTok, (int)(destExpert * expertCapacity + destTokId),
+                 (unsigned long)(destLinearTok * config.hiddenDim));
+        }
+#endif
       }
 
       // Store source token ID mapping at destination
@@ -460,6 +469,28 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   const int numTokens = args.curRankNumToken;
   const index_t expertCapacity = npes * config.maxNumInpTokenPerRank;
 
+#ifdef ENABLE_DEBUG_PRINTF
+  // Debug: print input buffer info and first few values
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-INIT] myPe=%d numTokens=%d expertCapacity=%d numLocalExperts=%d numTopK=%d\n",
+           myPe, numTokens, (int)expertCapacity, numLocalExperts, numTopK);
+    printf("[COMBINE-INIT] inpTokenBuf=%p shmemCombineOutTokMemObj=%p shmemCombineInpTokMemObj=%p\n",
+           (void*)args.inpTokenBuf,
+           (void*)args.shmemCombineOutTokMemObj->template GetAs<T*>(),
+           (void*)args.shmemCombineInpTokMemObj->template GetAs<T*>());
+    // Print first few values from inpTokenBuf (should be dispatch output)
+    printf("[COMBINE-INIT] inpTokenBuf[0:4] = %.1f, %.1f, %.1f, %.1f\n",
+           (float)args.inpTokenBuf[0], (float)args.inpTokenBuf[1],
+           (float)args.inpTokenBuf[2], (float)args.inpTokenBuf[3]);
+    // Print dispDestTokIdMap for token 0
+    for (int k = 0; k < numTopK; ++k) {
+      index_t destTokId = args.dispDestTokIdMap[k];
+      printf("[COMBINE-INIT] dispDestTokIdMap[0*%d+%d] = %d\n", numTopK, k, (int)destTokId);
+    }
+  }
+  __syncthreads();
+#endif
+
   // ========== PHASE 1: SEND EXPERT OUTPUTS ==========
   // Copy expert outputs to staging buffer and RDMA put to source ranks
 
@@ -658,6 +689,26 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
 
     __syncwarp();
+
+#ifdef ENABLE_DEBUG_PRINTF
+    // Debug: print srcPtrs and first value for token 0 on rank 0
+    if (myPe == 0 && tokenIdx == 0 && inTokenPartId == 0 && laneId == 0) {
+      for (int j = 0; j < numTopK; ++j) {
+        index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
+        index_t destExpert = destTokId / expertCapacity;
+        index_t destLocalTokId = destTokId % expertCapacity;
+        index_t destPe = destExpert / numLocalExperts;
+        index_t localExpert = destExpert % numLocalExperts;
+        size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
+        bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+        float val = srcPtrs[j] ? static_cast<float>(srcPtrs[j][0]) : -999.0f;
+        printf("[COMBINE-DBG] token=0 j=%d: destTokId=%d destPe=%d localExp=%d destLocalTokId=%d "
+               "baseOffset=%lu isRemote=%d srcPtr=%p val=%.1f\n",
+               j, (int)destTokId, (int)destPe, (int)localExpert, (int)destLocalTokId,
+               (unsigned long)baseOffset, isRemote ? 1 : 0, (void*)srcPtrs[j], val);
+      }
+    }
+#endif
 
     // Accumulate into the staging buffer (shmemStagingTokMemObj)
     // We can't use:

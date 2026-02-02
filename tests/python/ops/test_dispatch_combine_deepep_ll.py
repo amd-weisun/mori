@@ -131,6 +131,17 @@ PRESET_SETTINGS = {
         "gpu_per_node": 4,  # Simulate 2 nodes with 4 GPUs each
         "use_fp8": False,
     },
+    # Minimal test for isolating combine issues - very simple data flow
+    "internode_minimal": {
+        "name": "internode_minimal",
+        "num_processes": 8,
+        "hidden_dim": 64,              # Small hidden dim
+        "max_num_inp_token_per_rank": 4,  # Just 4 tokens per rank
+        "total_experts": 8,            # 1 expert per GPU
+        "num_experts_per_token": 1,    # topk=1 for simplest flow
+        "gpu_per_node": 4,             # 2 nodes with 4 GPUs each
+        "use_fp8": False,
+    },
     "internode_4node": {
         "name": "internode_4node",
         "num_processes": 8,
