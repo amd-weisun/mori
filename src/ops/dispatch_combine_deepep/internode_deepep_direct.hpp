@@ -138,11 +138,12 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (laneId == 0) {
         args.dispDestTokIdMap[tokenIdx * numTopK + warpId] = destExpert * expertCapacity + destTokId;
 #ifdef ENABLE_DEBUG_PRINTF
-        if (myPe == 0 && tokenIdx == 0) {
-          printf("[DISPATCH-DBG] token=0 k=%d: destExpert=%d destPe=%d localExpert=%d "
-                 "slotIdx=%d destTokId=%d destLinearTok=%d stored=%d baseOffset=%lu\n",
-                 warpId, destExpert, destPe, localExpert, (int)slotIdx, (int)destTokId,
-                 (int)destLinearTok, (int)(destExpert * expertCapacity + destTokId),
+        if (myPe == 0 && tokenIdx < 4) {
+          bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+          const char* destType = (destPe == myPe) ? "SELF" : (isRemoteDbg ? "RDMA" : "P2P");
+          printf("[DISPATCH-DBG] token=%d k=%d: destExpert=%d destPe=%d %s stored=%d offset=%lu\n",
+                 (int)tokenIdx, warpId, destExpert, destPe, destType,
+                 (int)(destExpert * expertCapacity + destTokId),
                  (unsigned long)(destLinearTok * config.hiddenDim));
         }
 #endif
@@ -696,8 +697,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     __syncwarp();
 
 #ifdef ENABLE_DEBUG_PRINTF
-    // Debug: print srcPtrs and first value for token 0 on rank 0
-    if (myPe == 0 && tokenIdx == 0 && inTokenPartId == 0 && laneId == 0) {
+    // Debug: print srcPtrs and first value for all tokens on rank 0
+    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0) {
       for (int j = 0; j < numTopK; ++j) {
         index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
         index_t destExpert = destTokId / expertCapacity;
@@ -707,10 +708,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         size_t baseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
         bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
         float val = srcPtrs[j] ? static_cast<float>(srcPtrs[j][0]) : -999.0f;
-        printf("[COMBINE-DBG] token=0 j=%d: destTokId=%d destPe=%d localExp=%d destLocalTokId=%d "
-               "baseOffset=%lu isRemote=%d srcPtr=%p val=%.1f\n",
-               j, (int)destTokId, (int)destPe, (int)localExpert, (int)destLocalTokId,
-               (unsigned long)baseOffset, isRemote ? 1 : 0, (void*)srcPtrs[j], val);
+        const char* srcType = (destPe == myPe) ? "SELF" : (isRemote ? "RDMA" : "P2P");
+        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d baseOffset=%lu %s srcVal=%.1f\n",
+               (int)tokenIdx, j, (int)destTokId, (int)destPe,
+               (unsigned long)baseOffset, srcType, val);
       }
     }
 #endif
