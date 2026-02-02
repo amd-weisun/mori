@@ -536,6 +536,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   // ========== PHASE 2: SIGNAL COMPLETION ==========
   // Send completion flag to each source rank
 
+#ifdef ENABLE_DEBUG_PRINTF
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-PHASE2-ENTER] myPe=%d globalWarpId=%d globalWarpNum=%d\n",
+           myPe, globalWarpId, globalWarpNum);
+  }
+#endif
+
   for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
     for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
       if (srcPe == myPe) continue;
@@ -548,6 +555,14 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 
       bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
       int globalExpertIdx = myPe * numLocalExperts + localExpert;
+
+#ifdef ENABLE_DEBUG_PRINTF
+      if (laneId == 0) {
+        const char* type = isRemote ? "RDMA" : "P2P";
+        printf("[COMBINE-SIGNAL] myPe=%d sending signal to srcPe=%d for globalExpert=%d (%s) numTok=%d\n",
+               myPe, srcPe, globalExpertIdx, type, numTokensToSend);
+      }
+#endif
 
       if (laneId == 0) {
         if (isRemote) {
@@ -579,6 +594,13 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for all expert outputs, then accumulate with weights
 
+#ifdef ENABLE_DEBUG_PRINTF
+  if (myPe == 0 && smId == 0 && threadId == 0) {
+    printf("[COMBINE-PHASE3-ENTER] myPe=%d numSms=%d npes=%d numLocalExperts=%d\n",
+           myPe, numSms, npes, numLocalExperts);
+  }
+#endif
+
   // Wait for completion signals using per-block expert assignment (like DeepEP)
   // Each block is responsible for specific experts based on blockIdx.x
   // This avoids deadlock by ensuring we only wait for our responsible experts
@@ -600,8 +622,25 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         int globalExpertIdx = destPe * numLocalExperts + localExpert;
         int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
 
+#ifdef ENABLE_DEBUG_PRINTF
+        printf("[COMBINE-WAIT] myPe=%d smId=%d waiting for expert=%d (destPe=%d localExp=%d) count=%d\n",
+               myPe, smId, globalExpert, destPe, localExpert, (int)count);
+#endif
+
         // Poll until signal arrives (acquire for visibility of data)
-        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0);
+        int waitIter = 0;
+        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
+          waitIter++;
+#ifdef ENABLE_DEBUG_PRINTF
+          if (waitIter % 100000000 == 0) {
+            printf("[COMBINE-WAIT-TIMEOUT] myPe=%d smId=%d expert=%d iter=%d\n",
+                   myPe, smId, globalExpert, waitIter);
+          }
+#endif
+        }
+#ifdef ENABLE_DEBUG_PRINTF
+        printf("[COMBINE-WAIT-DONE] myPe=%d smId=%d expert=%d\n", myPe, smId, globalExpert);
+#endif
       }
     }
   }
