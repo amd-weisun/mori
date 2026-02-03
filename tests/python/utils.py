@@ -97,17 +97,12 @@ class TorchDistContext:
         torch.cuda.set_device(self.device_id)
         device = torch.device("cuda", self.device_id)
 
-        print(
-            f"[TorchDist] rank {self.rank} init_process_group start (backend={self.backend})",
-            flush=True,
-        )
         dist.init_process_group(
             backend=self.backend,
             rank=self.rank,
             world_size=self.world_size,
             device_id=device,
         )
-        print(f"[TorchDist] rank {self.rank} init_process_group done", flush=True)
 
         world_group = torch.distributed.group.WORLD
         assert world_group is not None
@@ -128,22 +123,16 @@ class TorchDistProcessManager:
 
     @staticmethod
     def _worker(rank, world_size, port, init_shmem, task_queue, result_queue):
-        print(f"[TorchDist] rank {rank} starting worker", flush=True)
         with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-            print(f"[TorchDist] rank {rank} process group ready", flush=True)
             if init_shmem:
-                print(f"[TorchDist] rank {rank} shmem init", flush=True)
                 mori.shmem.shmem_torch_process_group_init("default")
-                print(f"[TorchDist] rank {rank} shmem ready", flush=True)
             while True:
-                print(f"[TorchDist] rank {rank} waiting for task", flush=True)
                 task = task_queue.get()
                 if task == "STOP":
                     if init_shmem:
                         mori.shmem.shmem_finalize()
                     break
                 func, args = task
-                print(f"[TorchDist] rank {rank} running task", flush=True)
                 try:
                     result = func(rank, *args)
                     result_queue.put((rank, result))
