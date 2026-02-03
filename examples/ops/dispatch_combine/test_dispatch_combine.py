@@ -28,12 +28,6 @@ import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
-kernel_type_map = {
-    "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
-    "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
-    "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-}
-
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=torch.bfloat16):
         self.rank = rank
@@ -42,19 +36,17 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=4096,
+            hidden_dim=7168,
             # scale_dim=32,
             scale_dim=0,
             scale_type_size=torch.tensor(
                 [], dtype=torch.float8_e4m3fnuz
             ).element_size(),
             max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
-            max_num_inp_token_per_rank=16,
+            max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            kernel_type = EpDispatchCombineKernelType.InterNodeV1LL,
-            gpu_per_node = 2,
-            # use_external_inp_buf=False,
+            use_external_inp_buf=False,
         )
 
     def setup(self):
@@ -152,21 +144,13 @@ class EpDispatchCombineTestCase:
         indices = indices.to(self.device).to(torch.int32)
 
         # gen weights
-        # weights = torch.rand(
-        #     num_tokens,
-        #     self.config.num_experts_per_token,
-        #     dtype=torch.float32,
-        #     generator=self.rng,
-        #     device=self.device,
-        # )
-
-        weights = torch.zeros(
+        weights = torch.rand(
             num_tokens,
             self.config.num_experts_per_token,
             dtype=torch.float32,
+            generator=self.rng,
             device=self.device,
         )
-    
         weights_list = self._allgather_with_token_num_padding(
             weights, self.config.max_num_inp_token_per_rank
         )
@@ -278,14 +262,6 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
 
-        if self.config.rank == 0:
-            print(f"rank {self.rank} combining {num_tokens} tokens")
-            print(f"combine_output dtype = {combine_output.dtype}, shape = {combine_output.shape}")
-            print(f"combine_output = {combine_output}")
-            print(f"combine_output_weight dtype = {combine_output_weight.dtype}, shape = {combine_output_weight.shape}")
-            print(f"combine_output_weight = {combine_output_weight}")
-
-
         for i in range(num_tokens):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -342,7 +318,7 @@ def test_dispatch_combine(rank, world_size):
 
 
 if __name__ == "__main__":
-    world_size = 2
+    world_size = 8
     torch.multiprocessing.spawn(
         test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
     )

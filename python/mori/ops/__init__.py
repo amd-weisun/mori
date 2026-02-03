@@ -29,10 +29,6 @@ from .dispatch_combine_deepep import (
     EpDispatchCombineDeepepOp,
     EpDispatchCombineDeepepKernelType,
 )
-from .triton_kernels import (
-    triton_transform_dispatch_output,
-    triton_inverse_transform_dispatch_output,
-)
 from .gpu_kernels import (
     transform_dispatch_output_gpu,
     inverse_transform_dispatch_output_gpu,

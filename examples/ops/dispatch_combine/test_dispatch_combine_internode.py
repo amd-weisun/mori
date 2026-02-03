@@ -44,7 +44,6 @@ class EpDispatchCombineTestCase:
         gpu_per_node,
         world_size,
         max_tokens,
-        total_experts,
         kernel_type,
         num_qp,
         dtype=torch.bfloat16,
@@ -52,7 +51,6 @@ class EpDispatchCombineTestCase:
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
-        self.total_experts = total_experts
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
@@ -60,8 +58,8 @@ class EpDispatchCombineTestCase:
             hidden_dim=7168,
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=max_tokens,
-            num_experts_per_rank= self.total_experts//self.world_size,
+            max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
+            num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=8,
             block_num=64,
@@ -952,29 +950,50 @@ def sweep_bench_dispatch_combine(
 
 
 def test_dispatch_combine(
-    local_rank, num_node, gpu_per_node, max_tokens,total_experts, kernel_type, cmd="test"
+    local_rank,
+    num_node,
+    gpu_per_node,
+    max_tokens,
+    kernel_type,
+    num_qp,
+    cmd="test",
+    sweep_token_interval=64,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    test_case = EpDispatchCombineTestCase(
-        global_rank,
-        gpu_per_node,
-        world_size,
-        max_tokens,
-        total_experts,
-        kernel_type,
-        torch.bfloat16,
-        # torch.float8_e4m3fnuz,
-    )
-    test_case.setup()
-    if cmd == "test":
-        test_case.test_dispatch_combine()
-    elif cmd == "bench":
-        test_case.bench_dispatch_combine()
-    elif cmd == "stress":
-        test_case.stress_dispatch_combine()
+    if cmd in ("test", "bench", "stress", "profile"):
+        test_case = EpDispatchCombineTestCase(
+            global_rank,
+            gpu_per_node,
+            world_size,
+            max_tokens,
+            kernel_type,
+            num_qp,
+            torch.bfloat16,
+            # torch.float8_e4m3fnuz,
+        )
+        test_case.setup()
+        if cmd == "test":
+            test_case.test_dispatch_combine()
+        elif cmd == "bench":
+            test_case.bench_dispatch_combine(max_tokens)
+        elif cmd == "stress":
+            test_case.stress_dispatch_combine()
+        elif cmd == "profile":
+            test_case.profile_dispatch_combine(max_tokens)
+        test_case.cleanup()
+    elif cmd == "sweep_bench":
+        sweep_bench_dispatch_combine(
+            local_rank,
+            num_node,
+            gpu_per_node,
+            max_tokens,
+            kernel_type,
+            num_qp,
+            sweep_token_interval,
+        )
     else:
         raise ValueError(f"unsupported command: {cmd}")
 
@@ -1006,12 +1025,11 @@ parser.add_argument(
     help="Type of kernel to test",
     choices=["v0", "v1", "v1_ll"],
 )
-
 parser.add_argument(
-    "--total-experts",
+    "--num-qp",
     type=int,
-    default=288, # 
-    help="Maximum number of input tokens per rank (default: 288)",
+    default=1,
+    help="Number of qp per processing endpoint",
 )
 args_cli = parser.parse_args()
 
@@ -1021,16 +1039,12 @@ if __name__ == "__main__":
     num_node = int(os.environ["WORLD_SIZE"])
 
     world_size = num_node * gpu_per_node
-    assert args_cli.total_experts % world_size == 0, "num_experts must be divisible by world_size"
-    num_experts_per_rank = args_cli.total_experts // world_size
-    print(f"num_experts_per_rank: {num_experts_per_rank} | world_size: {world_size} | gpu_per_node: {gpu_per_node} | num_node: {num_node}")
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(
             num_node,
             gpu_per_node,
             args_cli.max_tokens,
-            args_cli.total_experts,
             args_cli.kernel_type,
             args_cli.num_qp,
             args_cli.cmd,
