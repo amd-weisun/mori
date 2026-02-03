@@ -674,13 +674,18 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #endif
 
   // Wait for completion signals using per-block expert assignment (like DeepEP)
-  // Each block is responsible for specific experts based on blockIdx.x
-  // This avoids deadlock by ensuring we only wait for our responsible experts
+  // Each warp group is responsible for specific experts based on smId and warpGroupId.
+  // When numSms * kNumWarpGroups < totalExpertsToWait, each warp group handles multiple experts.
   constexpr int kNumWarpGroups = 2;
   int warpGroupId = warpId / (warpNum / kNumWarpGroups);
-  int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
+  int numWarpGroupsTotal = numSms * kNumWarpGroups;
+  int numExpertsTotal = npes * numLocalExperts;
 
-  if (responsibleExpertIdx < npes * numLocalExperts) {
+  // Each warp group loops over its assigned experts (strided by numWarpGroupsTotal)
+  for (int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
+       responsibleExpertIdx < numExpertsTotal;
+       responsibleExpertIdx += numWarpGroupsTotal) {
+
     int destPe = responsibleExpertIdx / numLocalExperts;
     int localExpert = responsibleExpertIdx % numLocalExperts;
 
