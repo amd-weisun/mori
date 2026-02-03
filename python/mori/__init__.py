@@ -28,8 +28,6 @@ from . import kernel_profiler
 from .ops import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
-    triton_transform_dispatch_output,
-    triton_inverse_transform_dispatch_output,
     transform_dispatch_output_gpu,
     inverse_transform_dispatch_output_gpu,
     Buffer,
