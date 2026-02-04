@@ -36,12 +36,13 @@ Usage (multi-node with torchrun):
 
     --------------------------------
   # Node 0 (2 nodes, 1 GPUs per node, dispatch only):
+  # note we use MORI_DEEPEP_DEBUG_SIMPLE_DATA=1 for fp8 due to low precision issues with random data for fp8 - simplified data makes it easier to debug dispatch without worrying about fp8 quantization artifacts
   MORI_DEEPEP_DEBUG_SIMPLE_DATA=1 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=${RANK} --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
 
   # Node 1:
   MORI_DEEPEP_DEBUG_SIMPLE_DATA=1 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=${RANK} --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
   -------------------------------
-  
+
   --------------------------------
   # Node 0 (2 nodes, 1 GPUs per node, dispatch only, bf16 as input):
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=${RANK} --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --setting production_bf16 --iterations 5
