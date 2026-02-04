@@ -36,10 +36,10 @@ Usage (multi-node with torchrun):
 
     --------------------------------
   # Node 0 (2 nodes, 1 GPUs per node, dispatch only):
-  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
+  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=${RANK} --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
 
   # Node 1:
-  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
+  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=${RANK} --master_addr=${MASTER_ADDR} --master_port=29500 tests/python/ops/test_dispatch_combine_deepep_ll.py --multinode --dispatch-only --iterations 5
     -------------------------------
   # Override gpu_per_node (defaults to nproc_per_node):
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
@@ -110,6 +110,16 @@ PRESET_SETTINGS = {
         "num_experts_per_token": 8,
         "gpu_per_node": 8,
         "use_fp8": True,
+    },
+    "production_bf16": {
+        "name": "production",
+        "num_processes": 8,
+        "hidden_dim": 7168,
+        "max_num_inp_token_per_rank": 128,
+        "total_experts": 288,
+        "num_experts_per_token": 8,
+        "gpu_per_node": 8,
+        "use_fp8": False,
     },
     "internode_2node": {
         "name": "internode_2node",
@@ -594,6 +604,7 @@ def run_test_impl(
 
     # Validate dispatch result
     if not SKIP_DISPATCH_CHECKS:
+        print(f"[Rank {rank}] Validating dispatch results...", flush=True)
         validate_dispatch(
             rank, num_experts_per_rank, world_size, recv_count, all_rank_indices
         )
@@ -665,7 +676,8 @@ def run_test_impl(
             print(f"    combine_out[token={t}][0] = {val:.1f}", flush=True)
 
     # Validate combine result
-    if not SKIP_COMBINE_CHECKS and rank == 0:
+    if not SKIP_COMBINE_CHECKS:
+        print(f"[Rank {rank}] Validating combine results...", flush=True)
         validate_combine(
             config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type
         )
