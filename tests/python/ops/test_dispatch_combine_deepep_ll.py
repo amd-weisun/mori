@@ -786,10 +786,10 @@ def validate_dispatch_data(
     rank_begin = rank * num_experts_per_rank
     rank_end = rank_begin + num_experts_per_rank
 
-    print(f"[Rank {rank}] Validating dispatch data placement...", flush=True)
-    print(f"  Local experts: {rank_begin} to {rank_end - 1}", flush=True)
-    print(f"  dispatch_output shape: {dispatch_out_bf16.shape}", flush=True)
-    print(f"  is_internode: {is_internode}", flush=True)
+    # print(f"[Rank {rank}] Validating dispatch data placement...", flush=True)
+    # print(f"  Local experts: {rank_begin} to {rank_end - 1}", flush=True)
+    # print(f"  dispatch_output shape: {dispatch_out_bf16.shape}", flush=True)
+    # print(f"  is_internode: {is_internode}", flush=True)
 
     # Build expected tokens per (local_expert, src_rank)
     # expected_tokens[local_expert][src_rank] = list of (src_token_idx, expected_tensor)
