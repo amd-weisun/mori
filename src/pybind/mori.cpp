@@ -245,8 +245,8 @@ void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
 
-void LaunchResetDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle) {
-  handle.LaunchReset(at::cuda::getCurrentHIPStream());
+void LaunchResetDeepep(mori::moe::deepep::EpDispatchCombineHandle& handle, bool syncBarrier = true) {
+  handle.LaunchReset(at::cuda::getCurrentHIPStream(), syncBarrier);
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
@@ -628,7 +628,8 @@ void DeclareEpDispatchCombineDeepepHandle(pybind11::module& m) {
   m.def(funcName.c_str(), &LaunchCombineDeepep);
 
   funcName = std::string("launch_reset_deepep");
-  m.def(funcName.c_str(), &LaunchResetDeepep);
+  m.def(funcName.c_str(), &LaunchResetDeepep,
+    py::arg("handle"), py::arg("sync_barrier") = true);
 
       funcName = std::string("launch_intra_node_dispatch_deepep_ll");
       m.def(funcName.c_str(), &LaunchIntraNodeDispatchDeepepLL,

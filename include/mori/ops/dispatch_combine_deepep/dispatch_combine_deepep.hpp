@@ -273,7 +273,11 @@ class EpDispatchCombineHandle {
 
   void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchReset(hipStream_t = 0);
+  // Reset buffers between iterations.
+  // If syncBarrier is true (default), launches a cross-device barrier kernel to synchronize
+  // all ranks before returning. This prevents race conditions between buffer resets and
+  // RDMA writes from other ranks. Set to false only if external synchronization is provided.
+  void LaunchReset(hipStream_t = 0, bool syncBarrier = true);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
 

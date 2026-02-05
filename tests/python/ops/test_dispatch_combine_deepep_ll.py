@@ -641,13 +641,9 @@ def run_test_impl(
     if dispatch_only:
         # Barrier to ensure all ranks complete validation before reset
         dist.barrier()
+        # reset() with sync_barrier=True (default) launches cross-device barrier kernel
+        # to synchronize all ranks at GPU level, preventing race conditions.
         op.reset()
-        # CRITICAL: Sync + Barrier after reset to ensure all ranks are ready before next dispatch.
-        # 1. cuda.synchronize() ensures GPU operations complete (including P2P/xGMI visibility)
-        # 2. dist.barrier() ensures all ranks have completed their reset
-        # Required when kernel's bypassStartBarrier=True (default for performance).
-        torch.cuda.synchronize()
-        dist.barrier()
         # Only cleanup if we created the op (not passed in from caller)
         if owns_op:
             del op
@@ -697,13 +693,9 @@ def run_test_impl(
         )
     torch.cuda.synchronize()
     dist.barrier()
+    # reset() with sync_barrier=True (default) launches cross-device barrier kernel
+    # to synchronize all ranks at GPU level, preventing race conditions.
     op.reset()
-    # CRITICAL: Sync + Barrier after reset to ensure all ranks are ready before next dispatch.
-    # 1. cuda.synchronize() ensures GPU operations complete (including P2P/xGMI visibility)
-    # 2. dist.barrier() ensures all ranks have completed their reset
-    # Required when kernel's bypassStartBarrier=True (default for performance).
-    torch.cuda.synchronize()
-    dist.barrier()
 
     # Only cleanup if we created the op (not passed in from caller)
     if owns_op:
@@ -1160,13 +1152,9 @@ def run_once_benchmark(
         torch.cuda.synchronize()
         dist.barrier()
 
+    # reset() with sync_barrier=True (default) launches cross-device barrier kernel
+    # to synchronize all ranks at GPU level, preventing race conditions.
     op.reset()
-    # CRITICAL: Sync + Barrier after reset to ensure all ranks are ready before next dispatch.
-    # 1. cuda.synchronize() ensures GPU operations complete (including P2P/xGMI visibility)
-    # 2. dist.barrier() ensures all ranks have completed their reset
-    # Required when kernel's bypassStartBarrier=True (default for performance).
-    torch.cuda.synchronize()
-    dist.barrier()
 
     return {
         'disp_duration_ms': disp_duration_ms,

@@ -201,6 +201,22 @@ __device__ inline void CrossDeviceBarrierInterNode(
 }  // namespace internode_ll
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                           Cross-Device Barrier Kernel (for reset sync)                         */
+/* ---------------------------------------------------------------------------------------------- */
+
+// Lightweight kernel that performs cross-device barrier only.
+// Used by LaunchReset() to synchronize all ranks before next iteration.
+// This ensures all ranks have completed their buffer resets before any rank
+// starts RDMA writes for the next dispatch.
+template <typename T>
+__global__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
+  const int numSms = gridDim.x;
+  // Use combineGridBarrier for the reset barrier since it's reset at the start of LaunchReset
+  // The barrier uses barrierIdx=0 which maps to grid index 1 in CrossDeviceBarrierInterNode
+  internode_ll::CrossDeviceBarrierInterNode(args, numSms, 0, args.combineGridBarrier);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                              Multi-Node Dispatch Kernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 

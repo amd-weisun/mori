@@ -604,7 +604,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 }
 
 // Reset buffers between iterations for correctness
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream, bool syncBarrier) {
   int numExpertsTotal = config.worldSize * config.numExpertPerRank;
 
   // Grid barrier counters must be reset between iterations - otherwise barriers
@@ -639,6 +639,35 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
   // This prevents races between async memset and subsequent RDMA operations on
   // symmetric memory that may not obey stream ordering.
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+
+  // Optionally launch cross-device barrier to synchronize all ranks.
+  // This ensures all ranks have completed their buffer resets before any rank
+  // starts RDMA writes for the next dispatch iteration.
+  if (syncBarrier && config.worldSize > 1) {
+    // Determine if we need internode barrier (world_size > gpu_per_node means multi-node)
+    bool isInterNode = config.worldSize > config.gpuPerNode;
+
+    if (isInterNode) {
+      // Launch barrier kernel with minimal resources (just need 1 SM worth of threads)
+      // Using 1 block with enough threads for the barrier logic
+      int blockSize = 256;  // Enough threads for barrier polling (needs >= worldSize threads)
+      dim3 grid(config.blockNum);  // Use same block count as dispatch for grid barrier compatibility
+      dim3 block(blockSize);
+
+      auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+      std::visit(
+          [&](auto& args) {
+            using ArgsT = std::decay_t<decltype(args)>;
+            using DataT = typename ArgsT::data_type;
+            CrossDeviceBarrierKernel<DataT><<<grid, block, 0, stream>>>(args);
+          },
+          argsVariant);
+
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+    }
+    // For intranode-only, hipStreamSynchronize above is sufficient since all GPUs
+    // share the same xGMI coherency domain and memset visibility is guaranteed.
+  }
 }
 
 }  // namespace deepep

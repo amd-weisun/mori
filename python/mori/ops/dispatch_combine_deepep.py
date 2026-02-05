@@ -352,8 +352,16 @@ class EpDispatchCombineDeepepOp:
         )
         return combine_output, None, None
 
-    def reset(self):
-        self._reset_func(self._handle)
+    def reset(self, sync_barrier: bool = True):
+        """Reset buffers between iterations.
+
+        Args:
+            sync_barrier: If True (default), launches a cross-device barrier kernel to
+                synchronize all ranks before returning. This prevents race conditions
+                between buffer resets and RDMA writes from other ranks. Set to False
+                only if external synchronization (e.g., dist.barrier()) is provided.
+        """
+        self._reset_func(self._handle, sync_barrier)
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
         shape = list(input.shape)
