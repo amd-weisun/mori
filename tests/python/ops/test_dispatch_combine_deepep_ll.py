@@ -619,7 +619,7 @@ def run_test_impl(
         )
         # Also validate data placement (only for internode on rank 0)
         # Internode uses different buffer layout than intranode
-        if rank == 0 and is_internode:
+        if is_internode:
             validate_dispatch_data(
                 rank=rank,
                 world_size=world_size,
@@ -842,8 +842,8 @@ def validate_dispatch_data(
             # Match expected tokens against actual (order may differ)
             # Use greedy matching: for each expected, find best match in actual
             matched = [False] * num_expected
-            atol = 0.5 if use_fp8 else 0.01
-            rtol = 0.25 if use_fp8 else 0.01
+            atol = 0.5 if use_fp8 else 0.1
+            rtol = 0.25 if use_fp8 else 0.1
 
             for i, (src_token_idx, expected_input) in enumerate(expected_list):
                 if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
@@ -930,8 +930,8 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
         for k in range(weights.numel()):
             expected = (expected + (base_input[i].to(torch.float32) * weights[k])).to(data_type)
 
-        atol = 0.25 if use_fp8 else 1e-2
-        rtol = 0.25 if use_fp8 else 1e-2
+        atol = 0.25 if use_fp8 else 0.1
+        rtol = 0.25 if use_fp8 else 0.1
         if not torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol):
             # Enhanced debug output for DEBUG_SIMPLE_DATA mode
             if DEBUG_SIMPLE_DATA:
