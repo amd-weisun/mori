@@ -255,7 +255,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         if (isRemote) {
           shmem::ShmemPutTypeImmNbiThread<index_t>(
               args.dispTokIdToSrcTokIdMemObj,
-              destLinearTok,
+              destLinearTok * sizeof(index_t),  // Byte offset, not array index
               srcTokMapping,
               destPe);
         } else {
