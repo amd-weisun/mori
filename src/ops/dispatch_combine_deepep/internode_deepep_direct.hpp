@@ -566,6 +566,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Synchronize warp group after sending
+  shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
 
@@ -611,6 +612,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Sync after Phase 2 signaling
+  shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
 
@@ -673,6 +675,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Sync after Phase 3 wait
+  shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
 
@@ -789,6 +792,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Sync after accumulation
+  shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
 
