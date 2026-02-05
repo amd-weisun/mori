@@ -690,7 +690,8 @@ def run_test_impl(
         validate_combine(
             config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type, rank
         )
-
+    torch.cuda.synchronize()
+    dist.barrier()
     op.reset()
 
     # Only cleanup if we created the op (not passed in from caller)
@@ -1052,7 +1053,7 @@ def run_once_benchmark(
         comb_duration_ms = start_event.elapsed_time(end_event)
 
         # Validate combine if requested
-        if check_result and rank == 0:
+        if check_result:
             block_num, warp_num_per_block = select_block_config(max_num_inp_token_per_rank, total_experts)
             config = mori.ops.EpDispatchCombineDeepepConfig(
                 data_type=torch.bfloat16,
@@ -1081,6 +1082,9 @@ def run_once_benchmark(
             validate_combine(
                 config, combine_output, all_rank_input, all_rank_weights, use_fp8, torch.bfloat16, rank
             )
+
+        torch.cuda.synchronize()
+        dist.barrier()
 
     op.reset()
 
