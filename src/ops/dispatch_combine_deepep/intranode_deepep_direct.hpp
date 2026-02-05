@@ -44,6 +44,11 @@ namespace deepep {
 // Phase 4: Optimized CrossDeviceBarrier with device-scope atomics
 // Aligned with DeepEP's grid_barrier pattern but extended for cross-device synchronization.
 // Uses device-scope relaxed atomics for counters (xGMI is cache-coherent).
+//
+// IMPORTANT: We signal and wait with (crossDeviceBarrierFlag + 1), not the passed-in value.
+// This ensures the first iteration actually waits (initial barrier memory = 0).
+// - Iteration 1: flag=0, signal 1, wait for 1 (actually waits)
+// - Iteration 2: flag=1, signal 2, wait for 2 (actually waits)
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
                                                          const uint32_t crossDeviceBarrierFlag) {
@@ -52,6 +57,9 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   const int warpNum = blockDim.x / warpSize;
   const int globalWarpNum = gridDim.x * warpNum;
+
+  // The barrier value to signal and wait for is the NEW value (flag + 1)
+  const uint32_t signalValue = crossDeviceBarrierFlag + 1;
 
   // Step 1: Intra-grid barrier (all warps arrive)
   // Use device-scope relaxed atomic for counter increment
@@ -67,9 +75,10 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     // Reset barrier for next use
     args.combineGridBarrier[0] = 0;
     // Signal to remote rank using device-scope release (xGMI is cache-coherent)
+    // Signal with NEW value so first iteration actually waits
     detail::AtomicStoreRelease(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
-        crossDeviceBarrierFlag);
+        signalValue);
   }
 
   // Step 3: Increment flag counter (device-scope release for next iteration visibility)
@@ -80,9 +89,10 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   __threadfence();
 
   // Step 4: Wait for signals from all remote ranks (device-scope acquire)
+  // Wait for signalValue (the NEW value) to ensure fresh signals
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    while (detail::AtomicLoadAcquire(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+    while (detail::AtomicLoadAcquire(localBarrierPtr + thdId) < signalValue) {
     }
   }
   __syncthreads();

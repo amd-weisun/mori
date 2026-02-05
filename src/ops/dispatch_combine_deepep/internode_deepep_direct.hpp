@@ -139,11 +139,19 @@ __device__ inline void CrossDeviceBarrierInterNode(
 
   // Increment the flag for next barrier call (only block 0 thread 0)
   // Use release semantics to ensure the increment is visible to subsequent kernel launches.
+  // IMPORTANT: We increment FIRST, then signal with the NEW value. This ensures:
+  // - Iteration 1: barrierFlag=0 → increment to 1 → signal 1 → wait for >=1 (actually waits)
+  // - Iteration 2: barrierFlag=1 → increment to 2 → signal 2 → wait for >=2 (actually waits)
+  // The old approach signaled with the OLD value, causing iteration 1 to not wait at all
+  // (since initial values are 0 and we waited for >=0).
   if (threadId == 0 && smId == 0) {
     detail::AtomicAddRelease(args.crossDeviceBarrierFlag, 1u);
   }
   // Ensure the increment is visible before proceeding
   __threadfence();
+
+  // The barrier value to signal and wait for is the NEW value (barrierFlag + 1)
+  uint32_t signalValue = barrierFlag + 1;
 
   // Signal all other ranks that we're at the barrier
   if (threadId == 0 && smId == 0) {
@@ -155,17 +163,17 @@ __device__ inline void CrossDeviceBarrierInterNode(
         shmem::ShmemPutTypeImmNbiThread<uint32_t>(
             args.crossDeviceBarrierMemObj,
             myPe * sizeof(uint32_t),
-            barrierFlag,
+            signalValue,
             destPe, 0);
       } else {
         // P2P direct write
         uint32_t* remotePtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe;
-        detail::AtomicStoreReleaseSystem(remotePtr, barrierFlag);
+        detail::AtomicStoreReleaseSystem(remotePtr, signalValue);
       }
     }
     // Also set our own flag
     uint32_t* localPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + myPe;
-    detail::AtomicStoreReleaseSystem(localPtr, barrierFlag);
+    detail::AtomicStoreReleaseSystem(localPtr, signalValue);
 
     // Drain the RDMA signals
     shmem::ShmemQuietThread();
@@ -173,9 +181,10 @@ __device__ inline void CrossDeviceBarrierInterNode(
   __syncthreads();
 
   // Wait for all ranks to arrive (check that all ranks reached this barrier value)
+  // Wait for signalValue (the new incremented value) to ensure fresh signals
   if (threadId < npes) {
     uint32_t* localPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + threadId;
-    while (detail::AtomicLoadAcquireSystem(localPtr) < barrierFlag) {
+    while (detail::AtomicLoadAcquireSystem(localPtr) < signalValue) {
       // spin
     }
   }
