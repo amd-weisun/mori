@@ -21,8 +21,8 @@
 // SOFTWARE.
 #pragma once
 
-// Debug prints disabled - enable for debugging internode LL issues
-// #define ENABLE_DEBUG_PRINTF 1
+// Debug prints for dispatch phase - enable via cmake -DENABLE_DISPATCH_DEBUG_PRINTF=ON
+// #define ENABLE_DISPATCH_DEBUG_PRINTF 1
 
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -149,6 +149,14 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       index_t slotIdx = 0;
       if (laneId == 0) {
         slotIdx = atomicAdd(args.atomicCounterPerExpert + destExpert, 1);
+#ifdef ENABLE_DISPATCH_DEBUG_PRINTF
+        // Track slot allocation for problematic tokens (ranks 4-5 to experts 14-17)
+        if ((myPe == 4 || myPe == 5) && destExpert >= 14 && destExpert <= 17 && slotIdx < 3) {
+          float srcVal = static_cast<float>(args.inpTokenBuf[tokenIdx * config.hiddenDim]);
+          printf("[SLOT] myPe=%d tok=%d exp=%d slot=%d srcVal=%.1f\n",
+                 myPe, (int)tokenIdx, destExpert, (int)slotIdx, srcVal);
+        }
+#endif
       }
       slotIdx = __shfl(slotIdx, 0);
 
@@ -159,16 +167,6 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       // Store mapping for combine phase
       if (laneId == 0) {
         args.dispDestTokIdMap[tokenIdx * numTopK + warpId] = destExpert * expertCapacity + destTokId;
-#ifdef ENABLE_DEBUG_PRINTF
-        // Debug: trace RDMA dispatch to node 1 (ranks 8-15) for tokens that might be problematic
-        bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-        if (myPe == 0 && isRemoteDbg && destPe >= 8 && localExpert == 0) {
-          printf("[DISPATCH-RDMA] myPe=%d tok=%d slotIdx=%d destPe=%d localExp=%d destLinear=%lu srcVal=%.1f\n",
-                 myPe, (int)tokenIdx, (int)slotIdx, destPe, localExpert,
-                 (unsigned long)destLinearTok,
-                 static_cast<float>(args.inpTokenBuf[tokenIdx * config.hiddenDim]));
-        }
-#endif
       }
 
       // Store source token ID mapping at destination
@@ -247,6 +245,18 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         if (isRemote && laneId == 0) {
           // Put FP8 data from staging buffer to destination
           size_t stagingOffset = stagingIdx * config.hiddenDim * sizeof(__hip_fp8_storage_t);
+
+#ifdef ENABLE_DISPATCH_DEBUG_PRINTF
+          // Targeted debug: track tokens from ranks 4-5 to local experts that map to global 14-17
+          int globalExp = destPe * numLocalExperts + localExpert;
+          if ((myPe == 4 || myPe == 5) && globalExp >= 14 && globalExp <= 17 && slotIdx < 3) {
+            float stagedVal = static_cast<float>(destFp8[0]);
+            printf("[FP8-PUT] myPe=%d tok=%d exp=%d slot=%d stagingIdx=%d baseOff=%lu stagingOff=%lu destPe=%d val=%.1f\n",
+                   myPe, (int)tokenIdx, globalExp, (int)slotIdx, (int)stagingIdx,
+                   (unsigned long)baseOffset, (unsigned long)stagingOffset, destPe, stagedVal);
+          }
+#endif
+
           shmem::ShmemPutMemNbiThread(
               args.shmemDispatchOutTokMemObj,
               baseOffset * sizeof(__hip_fp8_storage_t),
@@ -281,6 +291,16 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
           // RDMA put
           if (laneId == 0) {
+#ifdef ENABLE_DISPATCH_DEBUG_PRINTF
+          // Targeted debug: track tokens from ranks 4-5 to local experts that map to global 14-17
+          int globalExp = destPe * numLocalExperts + localExpert;
+          if ((myPe == 4 || myPe == 5) && globalExp >= 14 && globalExp <= 17 && slotIdx < 3) {
+            float stagedVal = static_cast<float>(localStaging[0]);
+            printf("[BF16-PUT] myPe=%d tok=%d exp=%d slot=%d stagingIdx=%d baseOff=%lu destPe=%d val=%.1f\n",
+                   myPe, (int)tokenIdx, globalExp, (int)slotIdx, (int)stagingIdx,
+                   (unsigned long)baseOffset, destPe, stagedVal);
+          }
+#endif
             shmem::ShmemPutMemNbiThread(
                 args.shmemDispatchOutTokMemObj,
                 baseOffset * sizeof(T),
@@ -323,16 +343,6 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
         if (laneId == 0) {
           if (args.weightsBuf) {
-#ifdef ENABLE_DEBUG_PRINTF
-            // Debug: print what we're about to PUT for RDMA tokens to localExpert=0
-            int localExpertDbg = destExpert % numLocalExperts;
-            if (myPe == 0 && tokenIdx < 4 && localExpertDbg == 0) {
-              float srcW0 = args.shmemInpWeightsMemObj->template GetAs<float*>()[tokenIdx * numTopK + 0];
-              float srcW1 = args.shmemInpWeightsMemObj->template GetAs<float*>()[tokenIdx * numTopK + 1];
-              printf("[DISPATCH-RDMA-W] myPe=%d tok=%d destPe=%d destExp=%d destLinear=%d: staged_w[0]=%.4f staged_w[1]=%.4f\n",
-                     myPe, (int)tokenIdx, destPe, destExpert, (int)destLinearTok, srcW0, srcW1);
-            }
-#endif
             shmem::ShmemPutMemNbiThread(
                 args.shmemDispatchOutWeightsMemObj,
                 destLinearTok * numTopK * sizeof(float),
@@ -643,7 +653,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     if (numTokensToSend > 0 && subWarpId == 0 && laneId == 0) {
       bool isRemote = internode_ll::IsRemoteRank(myPe, dstRank, gpuPerNode);
 
-#ifdef ENABLE_DEBUG_PRINTF
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
       printf("[COMBINE-SIGNAL] myPe=%d -> dstRank=%d globalExpert=%d numTok=%d isRemote=%d\n",
              myPe, dstRank, globalExpertIdx, numTokensToSend, isRemote);
 #endif
@@ -713,7 +723,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       // Wait for completion signal from srcPe
       int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + srcGlobalExpert;
 
-#ifdef ENABLE_DEBUG_PRINTF
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
       printf("[COMBINE-WAIT] myPe=%d waiting for srcPe=%d expert=%d count=%d\n",
              myPe, srcPe, srcGlobalExpert, (int)count);
 #endif
@@ -722,7 +732,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       int waitIter = 0;
       while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
         waitIter++;
-#ifdef ENABLE_DEBUG_PRINTF
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
         if (waitIter % 100000000 == 0) {
           printf("[COMBINE-WAIT-TIMEOUT] myPe=%d srcPe=%d expert=%d iter=%d\n",
                  myPe, srcPe, srcGlobalExpert, waitIter);
@@ -730,7 +740,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
 #endif
       }
 
-#ifdef ENABLE_DEBUG_PRINTF
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
       printf("[COMBINE-WAIT-DONE] myPe=%d srcPe=%d expert=%d\n", myPe, srcPe, srcGlobalExpert);
 #endif
     }
