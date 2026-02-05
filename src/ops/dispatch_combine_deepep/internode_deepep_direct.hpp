@@ -106,16 +106,23 @@ __device__ __forceinline__ void syncwarp_system() {
 // Similar to DeepEP's shmem_device_barrier_all() but using MORI primitives.
 // All ranks must call this. Uses crossDeviceBarrierFlag to track barrier count.
 // The barrier waits for all ranks to signal with the same flag value.
+// Parameters:
+//   - barrierIdx: Index for the grid barrier (default 0)
+//   - gridBarrier: Counter for local grid barrier (default combineGridBarrier)
 template <typename T>
 __device__ inline void CrossDeviceBarrierInterNode(
     mori::moe::deepep::EpDispatchCombineArgs<T>& args,
     int numSms,
-    int barrierIdx = 0) {
+    int barrierIdx = 0,
+    uint32_t* gridBarrier = nullptr) {
   const int myPe = args.config.rank;
   const int npes = args.config.worldSize;
   const int gpuPerNode = args.config.gpuPerNode;
   const int threadId = threadIdx.x;
   const int smId = blockIdx.x;
+
+  // Use provided grid barrier or default to combineGridBarrier
+  uint32_t* barrierCounter = gridBarrier ? gridBarrier : args.combineGridBarrier;
 
   // Read current barrier flag BEFORE grid barrier to ensure all blocks see the same value.
   // CRITICAL: If we read after the grid barrier, there's a race where block 0 increments
@@ -126,7 +133,7 @@ __device__ inline void CrossDeviceBarrierInterNode(
   // Grid barrier to ensure all blocks on this rank are done with their RDMA operations
   // Use barrier index 1 since combineGridBarrier index 0 is used in dispatch Phase 4
   // CrossDeviceBarrier is called with barrierIdx=0 by default, so we use 1+barrierIdx
-  detail::GridBarrier(args.combineGridBarrier, numSms, 1 + barrierIdx);
+  detail::GridBarrier(barrierCounter, numSms, 1 + barrierIdx);
 
   // System-wide fence to ensure all writes are visible
   __threadfence_system();
@@ -217,6 +224,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const int numTokens = args.curRankNumToken;
   const int maxTokensPerRank = config.maxNumInpTokenPerRank;
   const index_t expertCapacity = npes * maxTokensPerRank;
+
+  // ========== PHASE 0: CROSS-DEVICE BARRIER (START) ==========
+  // CRITICAL: Synchronize all ranks BEFORE starting dispatch to ensure:
+  // 1. All ranks have completed their buffer resets (hipMemsetAsync on symmetric memory)
+  // 2. No race between one rank's reset and another rank's RDMA writes from previous iteration
+  // Without this barrier, rank A might still be resetting its buffer while rank B starts
+  // sending RDMA writes to rank A, causing stale data in the output buffer.
+  //
+  // We use dispatchGridBarrier for this barrier since combineGridBarrier is used later.
+  // The dispatchGridBarrier is reset between iterations. Barrier index progression:
+  // - Phase 0 (START): barrierIdx=-1 → grid index 0 → target numBlocks
+  // - Phase 2:         barrierIdx=1  → grid index 1 → target 2*numBlocks
+  internode_ll::CrossDeviceBarrierInterNode(args, numSms, -1, args.dispatchGridBarrier);
 
   // ========== PHASE 1: TOKEN DISPATCH ==========
   // SM-strided token processing: each SM handles tokens[smId, smId+numSms, smId+2*numSms, ...]
@@ -473,7 +493,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __syncthreads();
 
   // Grid barrier to ensure all blocks have finished Phase 1 dispatch (all RDMA posted)
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+  // Use barrierIdx=1 since Phase 0 uses barrierIdx=0 (via CrossDeviceBarrier with -1 offset)
+  detail::GridBarrier(args.dispatchGridBarrier, numSms, 1);
 
   // Now drain all RDMA puts - safe because all blocks have finished posting
   if (threadId == 0) {
