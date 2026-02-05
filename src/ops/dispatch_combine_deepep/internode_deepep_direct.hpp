@@ -463,7 +463,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 /*                              Multi-Node Combine Kernel                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool kUseFP8, bool kUseWeights>
+template <typename T, bool kUseFP8, bool kUseWeights, int kNumWarpGroups, int kNumWarpsPerGroup>
 __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineDeepepConfig& config = args.config;
   const int smId = blockIdx.x;
@@ -482,60 +482,47 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   const int numTopK = config.numExpertPerToken;
   const int numTokens = args.curRankNumToken;
   const index_t expertCapacity = npes * config.maxNumInpTokenPerRank;
+  const int numExpertsTotal = npes * numLocalExperts;
+
+  // DeepEP-style work distribution: each warp group is responsible for specific experts
+  // responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id
+  static_assert(kNumWarpGroups > 0, "kNumWarpGroups must be positive");
+  static_assert(kNumWarpsPerGroup > 0, "kNumWarpsPerGroup must be positive");
+  const int warpGroupId = warpId / kNumWarpsPerGroup;
+  const int subWarpId = warpId % kNumWarpsPerGroup;
+  const int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
+
+  // Compute destination rank and local expert for this warp group's responsible expert
+  const int dstRank = responsibleExpertIdx / numLocalExperts;
+  const int localExpertIdx = responsibleExpertIdx % numLocalExperts;
+  const int globalExpertIdx = myPe * numLocalExperts + localExpertIdx;
 
   // ========== PHASE 1: SEND EXPERT OUTPUTS ==========
-  // Copy expert outputs to staging buffer and RDMA put to source ranks
+  // DeepEP style: each warp group handles one expert, sub-warps handle different tokens
+  // Buffer layout: [global_expert_idx * max_tokens + src_idx] (matches DeepEP)
 
-#ifdef ENABLE_DEBUG_PRINTF
-  // Debug: Check what weights are in shmemDispatchOutWeightsMemObj at linear=0 (localExp=0, srcPe=0, slot=0)
-  if (myPe == 7 && smId == 0 && threadId == 0) {
-    float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 0];
-    float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[0 * numTopK + 1];
-    float w16 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[1 * numTopK + 0];  // linear=1
-    printf("[COMBINE-ENTRY] myPe=%d: weights at linear=0: w[0]=%.4f w[1]=%.4f | linear=1: w[0]=%.4f\n",
-           myPe, w0, w1, w16);
-    // Debug: Check layoutRange contents for localExpert=0
-    for (int sp = 0; sp < npes; ++sp) {
-      int64_t layout = args.layoutRange[0 * npes + sp];
-      int numTok, off;
-      internode_ll::Unpack2(layout, numTok, off);
-      if (numTok > 0) {
-        printf("[COMBINE-LAYOUT] myPe=%d localExp=0 srcPe=%d: numTok=%d offset=%d\n",
-               myPe, sp, numTok, off);
-      }
-    }
-  }
-#endif
+  if (responsibleExpertIdx < numExpertsTotal) {
+    // Get layout info for this expert -> destination rank
+    int64_t layout = args.layoutRange[localExpertIdx * npes + dstRank];
+    int numTokensToSend, offset;
+    internode_ll::Unpack2(layout, numTokensToSend, offset);
 
-  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
-    for (int srcPe = 0; srcPe < npes; ++srcPe) {
-      if (srcPe == myPe) continue;
+    if (numTokensToSend > 0 && dstRank != myPe) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, dstRank, gpuPerNode);
 
-      // Get layout info from dispatch phase (uses LOCAL expert indexing)
-      // Dispatch stores at: layoutRange[localExpert * npes + srcPe]
-      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
-      int numTokensToSend, offset;
-      internode_ll::Unpack2(layout, numTokensToSend, offset);
+      // Sub-warps handle different tokens (strided by kNumWarpsPerGroup)
+      for (int tokenIdx = subWarpId; tokenIdx < numTokensToSend; tokenIdx += kNumWarpsPerGroup) {
+        // Source token index from src_info (slot in source PE's token stream)
+        // srcIdx is the token's position in dstRank's token stream that was dispatched to this expert
+        // For combine, we need to map back: srcLinear is where we stored the output
+        index_t srcLinear = localExpertIdx * expertCapacity + dstRank * config.maxNumInpTokenPerRank + tokenIdx;
 
-      if (numTokensToSend == 0) continue;
-
-      bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-
-      // Each warp handles a subset of tokens
-      // slotIdx iterates from 0 to numTokensToSend-1, representing the slot within srcPe's partition
-      // offset is the packed buffer offset (not used for reading input)
-      for (int slotIdx = globalWarpId; slotIdx < numTokensToSend; slotIdx += globalWarpNum) {
-        // Source linear index (on this PE's buffer): localExpert * expertCapacity + srcPe * maxTokens + slot
-        index_t srcLinear = localExpert * expertCapacity + srcPe * config.maxNumInpTokenPerRank + slotIdx;
-
-        // Destination linear index (on srcPe's receive buffer): must include myPe to avoid collisions
-        // Layout: [destPe][localExpert][slot] where destPe is myPe (the rank sending back)
-        // This ensures data from different destination PEs goes to different offsets
-        index_t destLinear = myPe * numLocalExperts * config.maxNumInpTokenPerRank +
-                             localExpert * config.maxNumInpTokenPerRank + slotIdx;
+        // Destination layout: [global_expert_idx * max_tokens + src_idx]
+        // This matches DeepEP's buffer layout for rdma_recv_x
+        index_t destLinear = globalExpertIdx * config.maxNumInpTokenPerRank + tokenIdx;
 
         if (isRemote) {
-          // Stage and RDMA put token data
+          // Stage to local buffer, then RDMA PUT
           T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + srcLinear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             localStaging[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
@@ -543,39 +530,33 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           __syncwarp();
 
           if (laneId == 0) {
-            // Put token data - use destLinear for destination offset
             shmem::ShmemPutMemNbiThread(
                 args.shmemCombineOutTokMemObj,
                 destLinear * config.hiddenDim * sizeof(T),
                 args.shmemStagingTokMemObj,
                 srcLinear * config.hiddenDim * sizeof(T),
                 config.hiddenDim * sizeof(T),
-                srcPe, 0);
+                dstRank, 0);
 
-            // Also send weights back to srcPe for accumulation
+            // Also send weights back for accumulation
             if constexpr (kUseWeights) {
-#ifdef ENABLE_DEBUG_PRINTF
-              // Debug: print the weight values we're about to send
-              if (srcPe == 0 && localExpert == 0 && slotIdx < 2) {
-                float w0 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[srcLinear * numTopK + 0];
-                float w1 = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[srcLinear * numTopK + 1];
-                printf("[COMBINE-P1-DBG] myPe=%d srcPe=%d localExp=%d slot=%d srcLinear=%d destLinear=%d: src_w[0]=%.4f src_w[1]=%.4f\n",
-                       myPe, srcPe, localExpert, slotIdx, (int)srcLinear, (int)destLinear, w0, w1);
-              }
-#endif
               shmem::ShmemPutMemNbiThread(
                   args.shmemCombineOutWeightsMemObj,
                   destLinear * numTopK * sizeof(float),
                   args.shmemDispatchOutWeightsMemObj,
                   srcLinear * numTopK * sizeof(float),
                   numTopK * sizeof(float),
-                  srcPe, 0);
+                  dstRank, 0);
             }
           }
+
+          // Fence after each PUT (like DeepEP with ROCM_DISABLE_CTX)
+          if (laneId == 0) {
+            shmem::ShmemFenceThread();
+          }
         } else {
-          // Same-node: direct P2P copy to srcPe's combine input buffer
-          // Use destLinear for the destination offset (includes myPe)
-          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>(srcPe) + destLinear * config.hiddenDim;
+          // Same-node: direct P2P copy using the same destination layout
+          T* destPtr = args.shmemCombineInpTokMemObj->template GetAs<T*>(dstRank) + destLinear * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             destPtr[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
           }
@@ -584,144 +565,87 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Drain RDMA puts and ensure P2P writes are visible
-  if (threadId == 0) {
-    shmem::ShmemQuietThread();
-  }
-  __threadfence_system();  // System-wide visibility for all P2P writes
+  // Synchronize warp group after sending
+#ifdef USE_ROCM
   __syncthreads();
-
+#else
+  asm volatile("bar.sync %0, %1;" :: "r"(warpGroupId + 1), "r"(kNumWarpsPerGroup * 32));
+#endif
 
   // ========== PHASE 2: SIGNAL COMPLETION ==========
-  // Send completion flag to each source rank
+  // DeepEP style: each warp group signals for its responsible expert
+
+  if (responsibleExpertIdx < numExpertsTotal && dstRank != myPe) {
+    int64_t layout = args.layoutRange[localExpertIdx * npes + dstRank];
+    int numTokensToSend, offset;
+    internode_ll::Unpack2(layout, numTokensToSend, offset);
+
+    if (numTokensToSend > 0 && subWarpId == 0 && laneId == 0) {
+      bool isRemote = internode_ll::IsRemoteRank(myPe, dstRank, gpuPerNode);
 
 #ifdef ENABLE_DEBUG_PRINTF
-  if (myPe == 0 && smId == 0 && threadId == 0) {
-    printf("[COMBINE-PHASE2-ENTER] myPe=%d globalWarpId=%d globalWarpNum=%d\n",
-           myPe, globalWarpId, globalWarpNum);
-  }
+      printf("[COMBINE-SIGNAL] myPe=%d -> dstRank=%d globalExpert=%d numTok=%d isRemote=%d\n",
+             myPe, dstRank, globalExpertIdx, numTokensToSend, isRemote);
 #endif
 
-  for (int localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
-    // globalExpertIdx is for signaling, but layoutRange uses local expert indexing
-    int globalExpertIdx = myPe * numLocalExperts + localExpert;
-
-    for (int srcPe = globalWarpId; srcPe < npes; srcPe += globalWarpNum) {
-      if (srcPe == myPe) continue;
-
-      // Get layout info from dispatch phase (uses LOCAL expert indexing)
-      // Dispatch stores at: layoutRange[localExpert * npes + srcPe]
-      int64_t layout = args.layoutRange[localExpert * npes + srcPe];
-      int numTokensToSend, offset;
-      internode_ll::Unpack2(layout, numTokensToSend, offset);
-
-      if (numTokensToSend == 0) continue;
-
-      bool isRemote = internode_ll::IsRemoteRank(myPe, srcPe, gpuPerNode);
-
-#ifdef ENABLE_DEBUG_PRINTF
-      if (laneId == 0) {
-        const char* type = isRemote ? "RDMA" : "P2P";
-        printf("[COMBINE-SIGNAL] myPe=%d sending signal to srcPe=%d for globalExpert=%d (%s) numTok=%d\n",
-               myPe, srcPe, globalExpertIdx, type, numTokensToSend);
-      }
-#endif
-
-      if (laneId == 0) {
-        if (isRemote) {
-          shmem::ShmemAtomicTypeNonFetchThread<int64_t>(
-              args.rdmaRecvFlagMemObj,
-              globalExpertIdx * sizeof(int64_t),
-              int64_t{1},
-              core::atomicType::AMO_ADD,
-              srcPe, 0);
-          shmem::ShmemQuietThread(srcPe);
-        } else {
-          // Same-node: write to srcPe's buffer via P2P (not local buffer!)
-          int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>(srcPe) + globalExpertIdx;
-          detail::AtomicAddReleaseSystem(flagSlot, int64_t{1});
-        }
+      if (isRemote) {
+        // RDMA atomic add to signal completion
+        shmem::ShmemAtomicTypeNonFetchThread<int64_t>(
+            args.rdmaRecvFlagMemObj,
+            globalExpertIdx * sizeof(int64_t),
+            int64_t{1},
+            core::atomicType::AMO_ADD,
+            dstRank, 0);
+        shmem::ShmemFenceThread();  // Fence after signal (like DeepEP)
+      } else {
+        // P2P: write directly to dstRank's flag buffer
+        int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>(dstRank) + globalExpertIdx;
+        detail::AtomicStoreReleaseSystem(flagSlot, int64_t{1});
       }
     }
   }
-
-  // Ensure all signals are sent and visible
-  __threadfence_system();
-  __syncthreads();
-
-  // Grid barrier to ensure ALL blocks have sent their signals before ANY block starts waiting
-  // This prevents deadlock where block 0 (which sends signals) is slow and other blocks
-  // start waiting for signals that haven't been sent yet
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
 
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
-  // Wait for all expert outputs, then accumulate with weights
+  // Wait for signals from ranks that sent us data
+
+  // Each warp group waits for its responsible expert (like DeepEP)
+  if (responsibleExpertIdx < numExpertsTotal && dstRank != myPe) {
+    // We need to wait for signal from dstRank telling us data for globalExpertIdx has arrived
+    // Actually, we need to wait for OTHER ranks to signal US
+    // responsibleExpertIdx tells us which (destPe, localExpert) pair we're responsible for waiting on
+    int srcPe = dstRank;  // The PE that would send to us
+    int srcGlobalExpert = srcPe * numLocalExperts + localExpertIdx;
+
+    // Check if srcPe actually sent us tokens for this expert
+    // During dispatch, tokens from myPe to srcPe's expert were counted
+    index_t count = args.atomicCounterPerExpert[srcGlobalExpert];
+
+    if (count > 0 && subWarpId == 0 && laneId == 0) {
+      // Wait for completion signal from srcPe
+      int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + srcGlobalExpert;
 
 #ifdef ENABLE_DEBUG_PRINTF
-  if (myPe == 0 && smId == 0 && threadId == 0) {
-    printf("[COMBINE-PHASE3-ENTER] myPe=%d numSms=%d npes=%d numLocalExperts=%d\n",
-           myPe, numSms, npes, numLocalExperts);
-    // Check weights with new layout: [destPe][localExpert][slot]
-    // For destPe=7, localExpert=0, slot=0: linear = 7 * 8 * 4 + 0 * 4 + 0 = 224
-    // For destPe=4, localExpert=0, slot=0: linear = 4 * 8 * 4 + 0 * 4 + 0 = 128
-    index_t linear_r7 = 7 * numLocalExperts * config.maxNumInpTokenPerRank + 0 * config.maxNumInpTokenPerRank + 0;
-    index_t linear_r4 = 4 * numLocalExperts * config.maxNumInpTokenPerRank + 0 * config.maxNumInpTokenPerRank + 0;
-    float cw_r7 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[linear_r7 * numTopK + 0];
-    float cw_r4 = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[linear_r4 * numTopK + 0];
-    printf("[COMBINE-PHASE3] myPe=%d CombineOutWeights: destPe=7 w=%.4f | destPe=4 w=%.4f\n",
-           myPe, cw_r7, cw_r4);
-  }
+      printf("[COMBINE-WAIT] myPe=%d waiting for srcPe=%d expert=%d count=%d\n",
+             myPe, srcPe, srcGlobalExpert, (int)count);
 #endif
 
-  // Wait for completion signals using per-block expert assignment (like DeepEP)
-  // Each warp group is responsible for specific experts based on smId and warpGroupId.
-  // When numSms * kNumWarpGroups < totalExpertsToWait, each warp group handles multiple experts.
-  constexpr int kNumWarpGroups = 2;
-  int warpGroupId = warpId / (warpNum / kNumWarpGroups);
-  int numWarpGroupsTotal = numSms * kNumWarpGroups;
-  int numExpertsTotal = npes * numLocalExperts;
-
-  // Each warp group loops over its assigned experts (strided by numWarpGroupsTotal)
-  for (int responsibleExpertIdx = smId * kNumWarpGroups + warpGroupId;
-       responsibleExpertIdx < numExpertsTotal;
-       responsibleExpertIdx += numWarpGroupsTotal) {
-
-    int destPe = responsibleExpertIdx / numLocalExperts;
-    int localExpert = responsibleExpertIdx % numLocalExperts;
-
-    // Only wait if this is a remote expert we sent tokens to
-    if (destPe != myPe) {
-      int globalExpert = destPe * numLocalExperts + localExpert;
-      index_t count = args.atomicCounterPerExpert[globalExpert];
-
-      if (count > 0 && warpId % (warpNum / kNumWarpGroups) == 0 && laneId == 0) {
-        // Wait for completion signal from destPe for this expert
-        int globalExpertIdx = destPe * numLocalExperts + localExpert;
-        int64_t* flagSlot = args.rdmaRecvFlagMemObj->template GetAs<int64_t*>() + globalExpertIdx;
-
+      // Poll until signal arrives with acquire semantics
+      int waitIter = 0;
+      while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
+        waitIter++;
 #ifdef ENABLE_DEBUG_PRINTF
-        printf("[COMBINE-WAIT] myPe=%d smId=%d waiting for expert=%d (destPe=%d localExp=%d) count=%d\n",
-               myPe, smId, globalExpert, destPe, localExpert, (int)count);
-#endif
-
-        // Poll until signal arrives (acquire for visibility of data)
-        int waitIter = 0;
-        while (detail::AtomicLoadAcquireSystem(flagSlot) == 0) {
-          waitIter++;
-#ifdef ENABLE_DEBUG_PRINTF
-          if (waitIter % 100000000 == 0) {
-            printf("[COMBINE-WAIT-TIMEOUT] myPe=%d smId=%d expert=%d iter=%d\n",
-                   myPe, smId, globalExpert, waitIter);
-          }
-#endif
+        if (waitIter % 100000000 == 0) {
+          printf("[COMBINE-WAIT-TIMEOUT] myPe=%d srcPe=%d expert=%d iter=%d\n",
+                 myPe, srcPe, srcGlobalExpert, waitIter);
         }
-#ifdef ENABLE_DEBUG_PRINTF
-        printf("[COMBINE-WAIT-DONE] myPe=%d smId=%d expert=%d\n", myPe, smId, globalExpert);
 #endif
       }
+
+#ifdef ENABLE_DEBUG_PRINTF
+      printf("[COMBINE-WAIT-DONE] myPe=%d srcPe=%d expert=%d\n", myPe, srcPe, srcGlobalExpert);
+#endif
     }
   }
-  __syncthreads();
 
   // Grid barrier to ensure all blocks have received their signals
   detail::GridBarrier(args.combineGridBarrier, numSms);
@@ -734,122 +658,82 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     srcWeightScales = reinterpret_cast<float*>(sharedMem + warpNum * numTopK * sizeof(T*)) + warpId * numTopK;
   }
 
-  // Process each output token
-  index_t warpsPerToken = max(1, (globalWarpNum + numTokens - 1) / numTokens);
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  // Process each output token (SM-strided, like DeepEP)
+  for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
+    // Only first N threads participate (where N covers hidden dimension)
+    if (threadId < config.hiddenDim) {
+      // Gather source pointers for each top-k expert
+      for (int j = 0; j < numTopK; ++j) {
+        if (laneId == 0) {
+          index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
+          index_t destExpert = destTokId / expertCapacity;
+          index_t destLocalTokId = destTokId % expertCapacity;
+          index_t destPe = destExpert / numLocalExperts;
+          index_t localExpert = destExpert % numLocalExperts;
+          index_t destGlobalExpert = destPe * numLocalExperts + localExpert;
+          // srcIdx is the slot within the destination buffer
+          index_t srcIdx = destLocalTokId % config.maxNumInpTokenPerRank;
 
-  for (int i = globalWarpId; i < numTokens * warpsPerToken; i += globalWarpNum) {
-    index_t tokenIdx = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize = min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
-    if (hiddenDimSize <= 0) continue;
+          if (destPe < npes) {
+            // Buffer layout: [global_expert_idx * max_tokens + src_idx]
+            size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + srcIdx;
 
-    // Gather source pointers for each top-k expert
-    for (int j = laneId; j < numTopK; j += warpSize) {
-      index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
-      index_t destExpert = destTokId / expertCapacity;
-      index_t destLocalTokId = destTokId % expertCapacity;
-      index_t destPe = destExpert / numLocalExperts;
-      index_t localExpert = destExpert % numLocalExperts;
-      // Extract slot index from destLocalTokId (destLocalTokId = srcPe * maxTokens + slot)
-      index_t destSlotIdx = destLocalTokId % config.maxNumInpTokenPerRank;
-
-      if (destPe < npes) {
-        // For SELF tokens: use original expert-major layout
-        // For remote/P2P tokens: use new layout [destPe][localExpert][slot]
-        // selfBaseOffset matches dispatch: localExpert * expertCapacity + destLocalTokId
-        size_t selfBaseOffset = (localExpert * expertCapacity + destLocalTokId) * config.hiddenDim;
-        // remoteBaseOffset matches combine Phase 1: destPe * numLocalExperts * maxTokens + localExpert * maxTokens + slot
-        size_t remoteBaseOffset = (destPe * numLocalExperts * config.maxNumInpTokenPerRank +
-                                   localExpert * config.maxNumInpTokenPerRank + destSlotIdx) * config.hiddenDim;
-
-        if (destPe == myPe) {
-          // Self-token: expert output is in our own dispatch output buffer (inpTokenBuf)
-          // No inter-rank transfer needed
-          srcPtrs[j] = args.inpTokenBuf + selfBaseOffset + hiddenDimOffset;
-        } else {
-          bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-          if (isRemote) {
-            // Data was sent to our combine out buffer via RDMA
-            srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                         remoteBaseOffset + hiddenDimOffset;
-          } else {
-            // Data was written to our combine input buffer via P2P by destPe
-            srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
-                         remoteBaseOffset + hiddenDimOffset;
-          }
-        }
-      } else {
-        srcPtrs[j] = nullptr;
-      }
-
-      if constexpr (kUseWeights) {
-        float w = 1.0f;
-        if (j < numTopK && destPe < npes) {
-          // For SELF: weights are in local shmemDispatchOutWeightsMemObj
-          // For remote/P2P: weights were sent back to shmemCombineOutWeightsMemObj
-          index_t selfLinearTok = localExpert * expertCapacity + destLocalTokId;
-          index_t remoteLinearTok = destPe * numLocalExperts * config.maxNumInpTokenPerRank +
-                                    localExpert * config.maxNumInpTokenPerRank + destSlotIdx;
-
-          if (destPe == myPe) {
-            // SELF token: weight is in our local buffer
-            w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfLinearTok * numTopK + j];
-          } else {
-            bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-            if (isRemote) {
-              // RDMA token: weight was sent back to our shmemCombineOutWeightsMemObj in Phase 1
-              w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[remoteLinearTok * numTopK + j];
+            if (destPe == myPe) {
+              // Self-token: use original dispatch output layout
+              size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
+              srcPtrs[j] = args.inpTokenBuf + selfOffset * config.hiddenDim;
             } else {
-              // P2P token: read directly from destPe's buffer via xGMI (original layout)
-              w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfLinearTok * numTopK + j];
+              bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+              if (isRemote) {
+                srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                             bufferOffset * config.hiddenDim;
+              } else {
+                srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
+                             bufferOffset * config.hiddenDim;
+              }
             }
+          } else {
+            srcPtrs[j] = nullptr;
+          }
+
+          if constexpr (kUseWeights) {
+            float w = 1.0f;
+            if (destPe < npes) {
+              size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + srcIdx;
+              if (destPe == myPe) {
+                size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
+                w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfOffset * numTopK + j];
+              } else {
+                bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+                if (isRemote) {
+                  w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[bufferOffset * numTopK + j];
+                } else {
+                  size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
+                  w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfOffset * numTopK + j];
+                }
+              }
+            }
+            srcWeightScales[j] = w;
           }
         }
-        srcWeightScales[j] = w;
       }
-    }
+      __syncwarp();
 
-    __syncwarp();
-
-#ifdef ENABLE_DEBUG_PRINTF
-    // Debug: print srcPtrs and first value for all tokens on rank 0
-    if (myPe == 0 && tokenIdx < 4 && inTokenPartId == 0 && laneId == 0) {
-      for (int jj = 0; jj < numTopK; ++jj) {
-        index_t dTokId = args.dispDestTokIdMap[tokenIdx * numTopK + jj];
-        index_t dExpert = dTokId / expertCapacity;
-        index_t dLocalTokId = dTokId % expertCapacity;
-        index_t dPe = dExpert / numLocalExperts;
-        index_t lExpert = dExpert % numLocalExperts;
-        index_t dSlotIdx = dLocalTokId % config.maxNumInpTokenPerRank;
-        bool isRem = internode_ll::IsRemoteRank(myPe, dPe, gpuPerNode);
-        // Use appropriate offset based on token type
-        size_t bOffset = (dPe == myPe)
-            ? (lExpert * expertCapacity + dLocalTokId) * config.hiddenDim
-            : (dPe * numLocalExperts * config.maxNumInpTokenPerRank +
-               lExpert * config.maxNumInpTokenPerRank + dSlotIdx) * config.hiddenDim;
-        float val = srcPtrs[jj] ? static_cast<float>(srcPtrs[jj][0]) : -999.0f;
-        float w = kUseWeights ? srcWeightScales[jj] : 1.0f;
-        const char* srcType = (dPe == myPe) ? "SELF" : (isRem ? "RDMA" : "P2P");
-        printf("[COMBINE-DBG] token=%d j=%d: destTokId=%d destPe=%d localExp=%d offset=%lu %s srcVal=%.1f w=%.4f\n",
-               (int)tokenIdx, jj, (int)dTokId, (int)dPe, (int)lExpert,
-               (unsigned long)bOffset, srcType, val, w);
+      // Accumulate with weights
+      float combinedValue = 0.0f;
+      for (int j = 0; j < numTopK; ++j) {
+        if (srcPtrs[j] != nullptr) {
+          float val = static_cast<float>(srcPtrs[j][threadId]);
+          float weight = kUseWeights ? srcWeightScales[j] : 1.0f;
+          combinedValue += val * weight;
+        }
       }
+
+      // Write result
+      T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() + tokenIdx * config.hiddenDim;
+      outPtr[threadId] = static_cast<T>(combinedValue);
     }
-#endif
-
-    // Accumulate into the staging buffer (shmemStagingTokMemObj)
-    // We can't use:
-    // - shmemCombineOutTokMemObj: contains RDMA-received expert outputs
-    // - shmemCombineInpTokMemObj: contains P2P-received expert outputs
-    // - shmemDispatchOutTokMemObj: contains self-token expert outputs (inpTokenBuf points here)
-    // shmemStagingTokMemObj is safe because it's only used transiently in combine Phase 1
-    T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
-                tokenIdx * config.hiddenDim + hiddenDimOffset;
-
-    core::WarpAccum<T, 4>(outPtr, srcPtrs, kUseWeights ? srcWeightScales : nullptr,
-                          numTopK, hiddenDimSize);
+    __syncthreads();
   }
 
   // Reset total recv token for next iteration

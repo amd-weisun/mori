@@ -500,8 +500,22 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
 
 void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int warpPerBlock,
                                                               hipStream_t stream) {
+  // DeepEP-style warp group configuration
+  // kNumWarpGroups = 2, kNumWarpsPerGroup = 8 -> total 16 warps per block
+  constexpr int kNumWarpsPerGroup = 8;
+  constexpr int kNumWarpGroups = 2;
+  constexpr int kRequiredWarpsPerBlock = kNumWarpGroups * kNumWarpsPerGroup;
+
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
-  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+
+  // Ensure warp configuration matches DeepEP's expectations
+  assert(actualWarpNumPerBlock == kRequiredWarpsPerBlock &&
+         "InterNode LL combine requires exactly kNumWarpGroups * kNumWarpsPerGroup warps per block");
+
+  // Grid size: ceil(numExperts / kNumWarpGroups) to cover all experts
+  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
+  int requiredBlocks = (numExpertsTotal + kNumWarpGroups - 1) / kNumWarpGroups;
+  dim3 grid((blockNum <= 0) ? requiredBlocks : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
   assert(config.useDeepepLayout &&
@@ -524,7 +538,6 @@ void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int w
   }
 
   // Reset internode LL combine buffers
-  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvFlagMemObj->Get(), 0, numExpertsTotal * sizeof(int64_t), stream));
   // Reset grid barrier counters for combine
   // We use both barriers in the combine kernel: dispatchGridBarrier after Phase 2 signals,
@@ -544,15 +557,19 @@ void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int w
            (config.useWeightedCombine ? sizeof(float) : 0));
         if (config.useFP8) {
           if (config.useWeightedCombine) {
-            EpCombineInterNodeDeepepLLKernel<DataT, true, true><<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineInterNodeDeepepLLKernel<DataT, true, true, kNumWarpGroups, kNumWarpsPerGroup>
+                <<<grid, block, sharedMemSize, stream>>>(args);
           } else {
-            EpCombineInterNodeDeepepLLKernel<DataT, true, false><<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineInterNodeDeepepLLKernel<DataT, true, false, kNumWarpGroups, kNumWarpsPerGroup>
+                <<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else {
           if (config.useWeightedCombine) {
-            EpCombineInterNodeDeepepLLKernel<DataT, false, true><<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineInterNodeDeepepLLKernel<DataT, false, true, kNumWarpGroups, kNumWarpsPerGroup>
+                <<<grid, block, sharedMemSize, stream>>>(args);
           } else {
-            EpCombineInterNodeDeepepLLKernel<DataT, false, false><<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineInterNodeDeepepLLKernel<DataT, false, false, kNumWarpGroups, kNumWarpsPerGroup>
+                <<<grid, block, sharedMemSize, stream>>>(args);
           }
         }
       },
