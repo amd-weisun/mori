@@ -607,6 +607,38 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream, bool syncBarrier) {
   int numExpertsTotal = config.worldSize * config.numExpertPerRank;
 
+  // STEP 1: Cross-device barrier BEFORE buffer resets (if enabled)
+  // This ensures all ranks have completed their dispatch (including all RDMA writes)
+  // before ANY rank clears its buffers. Without this, one rank's reset could clear
+  // buffers while another rank's in-flight RDMA writes are still landing.
+  //
+  // The barrier uses dispatchGridBarrier which is at numBlocks after dispatch Phase 2.
+  // CrossDeviceBarrierKernel uses barrierIdx=0, so GridBarrier expects 2*numBlocks.
+  // Counter goes: numBlocks -> 2*numBlocks, then we reset it to 0 below.
+  if (syncBarrier && config.worldSize > 1) {
+    bool isInterNode = config.worldSize > config.gpuPerNode;
+
+    if (isInterNode) {
+      int blockSize = 256;  // Enough threads for barrier polling (needs >= worldSize threads)
+      dim3 grid(config.blockNum);  // Use same block count as dispatch for grid barrier compatibility
+      dim3 block(blockSize);
+
+      auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+      std::visit(
+          [&](auto& args) {
+            using ArgsT = std::decay_t<decltype(args)>;
+            using DataT = typename ArgsT::data_type;
+            CrossDeviceBarrierKernel<DataT><<<grid, block, 0, stream>>>(args);
+          },
+          argsVariant);
+
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+    }
+    // For intranode-only, hipStreamSynchronize is sufficient since all GPUs
+    // share the same xGMI coherency domain.
+  }
+
+  // STEP 2: Reset buffers now that all ranks have synchronized
   // Grid barrier counters must be reset between iterations - otherwise barriers
   // pass immediately due to accumulated counts from previous iterations.
   // Note: GridBarrier uses a single counter, so we only need sizeof(uint32_t).
@@ -635,39 +667,10 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream, bool syncBarrier) 
   // NOTE: rdmaRecvCountMemObj is NOT reset here - it's already reset in
   // LaunchInterNodeDispatchDeepepLL right before the kernel launch.
 
-  // Synchronize to ensure all reset operations complete before proceeding.
+  // STEP 3: Synchronize to ensure all reset operations complete before proceeding.
   // This prevents races between async memset and subsequent RDMA operations on
   // symmetric memory that may not obey stream ordering.
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-
-  // Optionally launch cross-device barrier to synchronize all ranks.
-  // This ensures all ranks have completed their buffer resets before any rank
-  // starts RDMA writes for the next dispatch iteration.
-  if (syncBarrier && config.worldSize > 1) {
-    // Determine if we need internode barrier (world_size > gpu_per_node means multi-node)
-    bool isInterNode = config.worldSize > config.gpuPerNode;
-
-    if (isInterNode) {
-      // Launch barrier kernel with minimal resources (just need 1 SM worth of threads)
-      // Using 1 block with enough threads for the barrier logic
-      int blockSize = 256;  // Enough threads for barrier polling (needs >= worldSize threads)
-      dim3 grid(config.blockNum);  // Use same block count as dispatch for grid barrier compatibility
-      dim3 block(blockSize);
-
-      auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
-      std::visit(
-          [&](auto& args) {
-            using ArgsT = std::decay_t<decltype(args)>;
-            using DataT = typename ArgsT::data_type;
-            CrossDeviceBarrierKernel<DataT><<<grid, block, 0, stream>>>(args);
-          },
-          argsVariant);
-
-      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-    }
-    // For intranode-only, hipStreamSynchronize above is sufficient since all GPUs
-    // share the same xGMI coherency domain and memset visibility is guaranteed.
-  }
 }
 
 }  // namespace deepep

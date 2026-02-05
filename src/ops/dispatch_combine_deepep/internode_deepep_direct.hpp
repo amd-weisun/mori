@@ -205,17 +205,25 @@ __device__ inline void CrossDeviceBarrierInterNode(
 /* ---------------------------------------------------------------------------------------------- */
 
 // Lightweight kernel that performs cross-device barrier only.
-// Used by LaunchReset() to synchronize all ranks before next iteration.
-// This ensures all ranks have completed their buffer resets before any rank
-// starts RDMA writes for the next dispatch.
+// Used by LaunchReset() to synchronize all ranks BEFORE buffer resets.
+// This ensures all ranks have completed their dispatch (including RDMA writes)
+// before any rank clears its buffers, preventing race conditions.
+//
+// IMPORTANT: This barrier runs BEFORE buffer resets, so counters have values
+// from the previous dispatch:
+// - dispatchGridBarrier: at numBlocks after dispatch Phase 2 (bypass mode)
+// - CrossDeviceBarrierInterNode with barrierIdx=0 uses GridBarrier index 1,
+//   which expects 2*numBlocks. Counter goes numBlocks -> 2*numBlocks.
+// - After barrier completes, dispatchGridBarrier is reset to 0 for next dispatch.
 template <typename T>
 __global__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
   const int numSms = gridDim.x;
-  // Use combineGridBarrier for the reset barrier since it's reset at the start of LaunchReset.
-  // Use barrierIdx=-1 so that GridBarrier uses index 0 (target = numBlocks).
-  // CrossDeviceBarrierInterNode uses (1 + barrierIdx) for the grid barrier index,
-  // so -1 gives us index 0, which is what we need for a freshly reset counter.
-  internode_ll::CrossDeviceBarrierInterNode(args, numSms, -1, args.combineGridBarrier);
+  // Use dispatchGridBarrier with barrierIdx=0:
+  // - After dispatch Phase 2 (bypass mode), counter is at numBlocks
+  // - CrossDeviceBarrierInterNode uses (1 + barrierIdx) = 1 for GridBarrier
+  // - GridBarrier expects numBlocks * 2, counter goes numBlocks -> 2*numBlocks
+  // - Then LaunchReset will reset dispatchGridBarrier to 0 for next iteration
+  internode_ll::CrossDeviceBarrierInterNode(args, numSms, 0, args.dispatchGridBarrier);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
