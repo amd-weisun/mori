@@ -211,9 +211,11 @@ __device__ inline void CrossDeviceBarrierInterNode(
 template <typename T>
 __global__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
   const int numSms = gridDim.x;
-  // Use combineGridBarrier for the reset barrier since it's reset at the start of LaunchReset
-  // The barrier uses barrierIdx=0 which maps to grid index 1 in CrossDeviceBarrierInterNode
-  internode_ll::CrossDeviceBarrierInterNode(args, numSms, 0, args.combineGridBarrier);
+  // Use combineGridBarrier for the reset barrier since it's reset at the start of LaunchReset.
+  // Use barrierIdx=-1 so that GridBarrier uses index 0 (target = numBlocks).
+  // CrossDeviceBarrierInterNode uses (1 + barrierIdx) for the grid barrier index,
+  // so -1 gives us index 0, which is what we need for a freshly reset counter.
+  internode_ll::CrossDeviceBarrierInterNode(args, numSms, -1, args.combineGridBarrier);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
