@@ -208,6 +208,11 @@ struct EpDispatchCombineDeepepConfig {
   // Opt-in: allocate expert-major capacity for DeepEP low-latency path without touching legacy
   // kernels
   bool useDeepepLayout{true};
+  // If true, bypass the cross-device barrier at the start of dispatch kernel.
+  // When bypassed, external synchronization (e.g., dist.barrier()) is required between
+  // reset() and dispatch() to avoid race conditions between buffer resets and RDMA writes.
+  // Default: true (bypass) for performance - production typically has natural CPU sync.
+  bool bypassStartBarrier{true};
   int gpuPerNode{8};
   int rdmaBlockNum{1};
 
@@ -586,7 +591,8 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::deepep::EpDispatchCo
      << "  blockNum: " << config.blockNum << std::endl
      << "  useFP8: " << config.useFP8 << std::endl
     << "  useWeightedCombine: " << config.useWeightedCombine << std::endl
-    << "  useDeepepLayout: " << config.useDeepepLayout;
+    << "  useDeepepLayout: " << config.useDeepepLayout << std::endl
+    << "  bypassStartBarrier: " << config.bypassStartBarrier;
   s << ss.str();
   return s;
 }

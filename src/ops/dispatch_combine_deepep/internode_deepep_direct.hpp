@@ -225,18 +225,22 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const int maxTokensPerRank = config.maxNumInpTokenPerRank;
   const index_t expertCapacity = npes * maxTokensPerRank;
 
-  // ========== PHASE 0: CROSS-DEVICE BARRIER (START) ==========
-  // CRITICAL: Synchronize all ranks BEFORE starting dispatch to ensure:
+  // ========== PHASE 0: CROSS-DEVICE BARRIER (START) [OPTIONAL] ==========
+  // Synchronize all ranks BEFORE starting dispatch to ensure:
   // 1. All ranks have completed their buffer resets (hipMemsetAsync on symmetric memory)
   // 2. No race between one rank's reset and another rank's RDMA writes from previous iteration
-  // Without this barrier, rank A might still be resetting its buffer while rank B starts
-  // sending RDMA writes to rank A, causing stale data in the output buffer.
   //
-  // We use dispatchGridBarrier for this barrier since combineGridBarrier is used later.
+  // This barrier is BYPASSED by default (config.bypassStartBarrier=true) for performance.
+  // When bypassed, external synchronization (e.g., dist.barrier() in Python) is required
+  // between reset() and dispatch() to avoid race conditions.
+  //
   // The dispatchGridBarrier is reset between iterations. Barrier index progression:
-  // - Phase 0 (START): barrierIdx=-1 → grid index 0 → target numBlocks
-  // - Phase 2:         barrierIdx=1  → grid index 1 → target 2*numBlocks
-  internode_ll::CrossDeviceBarrierInterNode(args, numSms, -1, args.dispatchGridBarrier);
+  // - Phase 0 (START): barrierIdx=-1 → grid index 0 → target numBlocks (if enabled)
+  // - Phase 2:         barrierIdx=0  → grid index 0 → target numBlocks (if bypassed)
+  //                    barrierIdx=1  → grid index 1 → target 2*numBlocks (if not bypassed)
+  if (!config.bypassStartBarrier) {
+    internode_ll::CrossDeviceBarrierInterNode(args, numSms, -1, args.dispatchGridBarrier);
+  }
 
   // ========== PHASE 1: TOKEN DISPATCH ==========
   // SM-strided token processing: each SM handles tokens[smId, smId+numSms, smId+2*numSms, ...]
@@ -493,8 +497,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   __syncthreads();
 
   // Grid barrier to ensure all blocks have finished Phase 1 dispatch (all RDMA posted)
-  // Use barrierIdx=1 since Phase 0 uses barrierIdx=0 (via CrossDeviceBarrier with -1 offset)
-  detail::GridBarrier(args.dispatchGridBarrier, numSms, 1);
+  // Barrier index depends on whether Phase 0 was executed:
+  // - If Phase 0 bypassed: use index 0 (first use of this counter in this kernel)
+  // - If Phase 0 executed: use index 1 (Phase 0 used index 0)
+  const uint32_t phase2BarrierIdx = config.bypassStartBarrier ? 0u : 1u;
+  detail::GridBarrier(args.dispatchGridBarrier, numSms, phase2BarrierIdx);
 
   // Now drain all RDMA puts - safe because all blocks have finished posting
   if (threadId == 0) {

@@ -642,6 +642,10 @@ def run_test_impl(
         # Barrier to ensure all ranks complete validation before reset
         dist.barrier()
         op.reset()
+        # CRITICAL: Barrier after reset to sync all ranks before next iteration's dispatch.
+        # This prevents race between one rank's reset and another rank's RDMA writes.
+        # Required when kernel's bypassStartBarrier=True (default for performance).
+        dist.barrier()
         # Only cleanup if we created the op (not passed in from caller)
         if owns_op:
             del op
@@ -692,6 +696,10 @@ def run_test_impl(
     torch.cuda.synchronize()
     dist.barrier()
     op.reset()
+    # CRITICAL: Barrier after reset to sync all ranks before next iteration's dispatch.
+    # This prevents race between one rank's reset and another rank's RDMA writes.
+    # Required when kernel's bypassStartBarrier=True (default for performance).
+    dist.barrier()
 
     # Only cleanup if we created the op (not passed in from caller)
     if owns_op:
@@ -1149,6 +1157,10 @@ def run_once_benchmark(
         dist.barrier()
 
     op.reset()
+    # CRITICAL: Barrier after reset to sync all ranks before next iteration's dispatch.
+    # This prevents race between one rank's reset and another rank's RDMA writes.
+    # Required when kernel's bypassStartBarrier=True (default for performance).
+    dist.barrier()
 
     return {
         'disp_duration_ms': disp_duration_ms,
