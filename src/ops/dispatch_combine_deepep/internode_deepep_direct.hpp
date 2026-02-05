@@ -213,6 +213,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
 
         __syncwarp();
+        // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
+        // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
+        __threadfence_system();
 
         // RDMA put for remote ranks
         if (isRemote && laneId == 0) {
@@ -248,6 +251,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
             localStaging[j] = args.inpTokenBuf[srcOffset + j];
           }
           __syncwarp();
+          // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
+          // __syncwarp() only synchronizes threads, not memory visibility to external agents.
+          // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
+          __threadfence_system();
 
           // RDMA put
           if (laneId == 0) {
@@ -542,6 +549,9 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
             localStaging[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
           }
           __syncwarp();
+          // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
+          // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
+          __threadfence_system();
 
           if (laneId == 0) {
             shmem::ShmemPutMemNbiThread(
