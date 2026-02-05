@@ -603,8 +603,29 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
   assert(false && "DeepEP combine (non-LL) not implemented yet");
 }
 
-// no need for a separate reset kernel now
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
+// Reset buffers between iterations for correctness
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
+  int numExpertsTotal = config.worldSize * config.numExpertPerRank;
+
+  // Grid barrier counters must be reset between iterations - otherwise barriers
+  // pass immediately due to accumulated counts from previous iterations
+  HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, config.worldSize * sizeof(uint32_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(combineGridBarrier, 0, config.worldSize * sizeof(uint32_t), stream));
+
+  // Reset per-expert atomic counters for slot assignment
+  HIP_RUNTIME_CHECK(hipMemsetAsync(atomicCounterPerExpert, 0, numExpertsTotal * sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(finishCounterPerExpert, 0, numExpertsTotal * sizeof(uint32_t), stream));
+
+  // Reset packed receive counters and layout range
+  HIP_RUNTIME_CHECK(hipMemsetAsync(packedRecvCount, 0, config.numExpertPerRank * sizeof(index_t), stream));
+  HIP_RUNTIME_CHECK(hipMemsetAsync(layoutRange, 0, config.numExpertPerRank * config.worldSize * sizeof(int64_t), stream));
+
+  // Reset per-expert receive token count
+  HIP_RUNTIME_CHECK(hipMemsetAsync(recvTokenCountPerExpert, 0, config.numExpertPerRank * sizeof(index_t), stream));
+
+  // Reset total received token count
+  HIP_RUNTIME_CHECK(hipMemsetAsync(totalRecvTokenNum, 0, sizeof(index_t), stream));
+}
 
 }  // namespace deepep
 }  // namespace moe

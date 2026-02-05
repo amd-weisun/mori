@@ -102,6 +102,78 @@ __device__ __forceinline__ void syncwarp_system() {
   __threadfence_system();
 }
 
+// Cross-device barrier for internode using RDMA signaling.
+// Similar to DeepEP's shmem_device_barrier_all() but using MORI primitives.
+// All ranks must call this. Uses crossDeviceBarrierFlag to track barrier count.
+// The barrier waits for all ranks to signal with the same flag value.
+template <typename T>
+__device__ inline void CrossDeviceBarrierInterNode(
+    mori::moe::deepep::EpDispatchCombineArgs<T>& args,
+    int numSms,
+    int barrierIdx = 0) {
+  const int myPe = args.config.rank;
+  const int npes = args.config.worldSize;
+  const int gpuPerNode = args.config.gpuPerNode;
+  const int threadId = threadIdx.x;
+  const int smId = blockIdx.x;
+
+  // Grid barrier first to ensure all blocks on this rank are done
+  // Use barrier index 1 since combineGridBarrier index 0 is used in dispatch Phase 4
+  // CrossDeviceBarrier is called with barrierIdx=0 by default, so we use 1+barrierIdx
+  detail::GridBarrier(args.combineGridBarrier, numSms, 1 + barrierIdx);
+
+  // System-wide fence to ensure all writes are visible
+  __threadfence_system();
+
+  // Drain all pending RDMA operations
+  if (threadId == 0 && smId == 0) {
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
+
+  // Read current barrier flag and increment
+  uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
+  if (threadId == 0 && smId == 0) {
+    detail::AtomicAddRelaxed(args.crossDeviceBarrierFlag, 1u);
+  }
+
+  // Signal all other ranks that we're at the barrier
+  if (threadId == 0 && smId == 0) {
+    for (int destPe = 0; destPe < npes; ++destPe) {
+      if (destPe == myPe) continue;
+      bool isRemote = IsRemoteRank(myPe, destPe, gpuPerNode);
+      if (isRemote) {
+        // RDMA PUT the barrier flag value
+        shmem::ShmemPutTypeImmNbiThread<uint32_t>(
+            args.crossDeviceBarrierMemObj,
+            myPe * sizeof(uint32_t),
+            barrierFlag,
+            destPe, 0);
+      } else {
+        // P2P direct write
+        uint32_t* remotePtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + myPe;
+        detail::AtomicStoreReleaseSystem(remotePtr, barrierFlag);
+      }
+    }
+    // Also set our own flag
+    uint32_t* localPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + myPe;
+    detail::AtomicStoreReleaseSystem(localPtr, barrierFlag);
+
+    // Drain the RDMA signals
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
+
+  // Wait for all ranks to arrive (check that all ranks reached this barrier value)
+  if (threadId < npes) {
+    uint32_t* localPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + threadId;
+    while (detail::AtomicLoadAcquireSystem(localPtr) < barrierFlag) {
+      // spin
+    }
+  }
+  __syncthreads();
+}
+
 }  // namespace internode_ll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -512,6 +584,11 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   __syncthreads();
+
+  // ========== PHASE 6: CROSS-DEVICE BARRIER ==========
+  // Ensure all ranks have completed their writes before any rank proceeds to next iteration.
+  // This prevents races where one rank's buffer reset overlaps with another rank's writes.
+  internode_ll::CrossDeviceBarrierInterNode(args, numSms);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -739,6 +816,9 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
         }
 #endif
       }
+
+      // Reset flag for next iteration (critical for multi-iteration correctness)
+      detail::AtomicStoreReleaseSystem(flagSlot, int64_t{0});
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
       printf("[COMBINE-WAIT-DONE] myPe=%d srcPe=%d expert=%d\n", myPe, srcPe, srcGlobalExpert);
