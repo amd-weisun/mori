@@ -870,81 +870,80 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Process each output token (SM-strided, like DeepEP)
+  const int blockSize = blockDim.x;
   for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
-    // Only first N threads participate (where N covers hidden dimension)
-    if (threadId < config.hiddenDim) {
-      // Gather source pointers for each top-k expert
-      for (int j = 0; j < numTopK; ++j) {
-        if (laneId == 0) {
-          index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
-          index_t destExpert = destTokId / expertCapacity;
-          index_t destLocalTokId = destTokId % expertCapacity;
-          index_t destPe = destExpert / numLocalExperts;
-          index_t localExpert = destExpert % numLocalExperts;
-          index_t destGlobalExpert = destPe * numLocalExperts + localExpert;
+    // Gather source pointers for each top-k expert (only lane 0 of each warp does this)
+    for (int j = 0; j < numTopK; ++j) {
+      if (laneId == 0) {
+        index_t destTokId = args.dispDestTokIdMap[tokenIdx * numTopK + j];
+        index_t destExpert = destTokId / expertCapacity;
+        index_t destLocalTokId = destTokId % expertCapacity;
+        index_t destPe = destExpert / numLocalExperts;
+        index_t localExpert = destExpert % numLocalExperts;
+        index_t destGlobalExpert = destPe * numLocalExperts + localExpert;
 
+        if (destPe < npes) {
+          // Buffer layout: [global_expert_idx * max_tokens + token_idx]
+          // The combine sender writes to offset tokenIdx (the receiver's local token index),
+          // NOT slotIdx (which was the dispatch slot assignment).
+          size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
+
+          if (destPe == myPe) {
+            // Self-token: use original dispatch output layout
+            size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
+            srcPtrs[j] = args.inpTokenBuf + selfOffset * config.hiddenDim;
+          } else {
+            bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+            if (isRemote) {
+              srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                           bufferOffset * config.hiddenDim;
+            } else {
+              srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
+                           bufferOffset * config.hiddenDim;
+            }
+          }
+        } else {
+          srcPtrs[j] = nullptr;
+        }
+
+        if constexpr (kUseWeights) {
+          float w = 1.0f;
           if (destPe < npes) {
-            // Buffer layout: [global_expert_idx * max_tokens + token_idx]
-            // The combine sender writes to offset tokenIdx (the receiver's local token index),
-            // NOT slotIdx (which was the dispatch slot assignment).
-            size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
-
+            // Use same bufferOffset as token data (tokenIdx-based, not slotIdx)
+            size_t weightsBufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
             if (destPe == myPe) {
-              // Self-token: use original dispatch output layout
               size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
-              srcPtrs[j] = args.inpTokenBuf + selfOffset * config.hiddenDim;
+              w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfOffset * numTopK + j];
             } else {
               bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
               if (isRemote) {
-                srcPtrs[j] = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                             bufferOffset * config.hiddenDim;
+                w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[weightsBufferOffset * numTopK + j];
               } else {
-                srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>() +
-                             bufferOffset * config.hiddenDim;
-              }
-            }
-          } else {
-            srcPtrs[j] = nullptr;
-          }
-
-          if constexpr (kUseWeights) {
-            float w = 1.0f;
-            if (destPe < npes) {
-              // Use same bufferOffset as token data (tokenIdx-based, not slotIdx)
-              size_t weightsBufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
-              if (destPe == myPe) {
                 size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
-                w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfOffset * numTopK + j];
-              } else {
-                bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-                if (isRemote) {
-                  w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[weightsBufferOffset * numTopK + j];
-                } else {
-                  size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
-                  w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfOffset * numTopK + j];
-                }
+                w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfOffset * numTopK + j];
               }
             }
-            srcWeightScales[j] = w;
           }
+          srcWeightScales[j] = w;
         }
       }
-      // Local memory access follows, wavefront sync is sufficient
-      internode_ll::syncwarp();
+    }
+    // Sync to ensure all source pointers are visible to all threads
+    __syncthreads();
 
-      // Accumulate with weights
+    // Accumulate with weights - loop over hidden dimension with striding
+    // Each thread processes multiple elements: threadId, threadId + blockSize, threadId + 2*blockSize, ...
+    T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() + tokenIdx * config.hiddenDim;
+    for (int hiddenIdx = threadId; hiddenIdx < config.hiddenDim; hiddenIdx += blockSize) {
       float combinedValue = 0.0f;
       for (int j = 0; j < numTopK; ++j) {
         if (srcPtrs[j] != nullptr) {
-          float val = static_cast<float>(srcPtrs[j][threadId]);
+          float val = static_cast<float>(srcPtrs[j][hiddenIdx]);
           float weight = kUseWeights ? srcWeightScales[j] : 1.0f;
           combinedValue += val * weight;
         }
       }
-
-      // Write result
-      T* outPtr = args.shmemStagingTokMemObj->template GetAs<T*>() + tokenIdx * config.hiddenDim;
-      outPtr[threadId] = static_cast<T>(combinedValue);
+      outPtr[hiddenIdx] = static_cast<T>(combinedValue);
     }
     __syncthreads();
   }
