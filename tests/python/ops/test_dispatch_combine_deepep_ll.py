@@ -688,7 +688,7 @@ def run_test_impl(
     if not SKIP_COMBINE_CHECKS:
         print(f"[Rank {rank}] Validating combine results...", flush=True)
         validate_combine(
-            config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type
+            config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type, rank
         )
 
     op.reset()
@@ -902,10 +902,22 @@ def validate_dispatch_data(
     print(f"[Rank {rank}] Dispatch data validation passed: matched {tokens_matched}/{tokens_checked} tokens", flush=True)
 
 
-def validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type):
-    """Validate combine results (rank 0 only, samples first few tokens)."""
+def validate_combine(config, combine_output, all_rank_input, all_rank_weights, use_fp8, data_type, rank=0):
+    """Validate combine results for a specific rank.
+
+    Args:
+        config: Configuration object with max_num_inp_token_per_rank, num_experts_per_token
+        combine_output: The combine output tensor for this rank [num_tokens, hidden_dim]
+        all_rank_input: List of input tensors for all ranks
+        all_rank_weights: List of weight tensors for all ranks
+        use_fp8: Whether FP8 quantization is used
+        data_type: The data type (e.g., torch.bfloat16)
+        rank: The rank to validate (default 0 for backward compatibility)
+    """
     num_tokens_to_check = min(100, config.max_num_inp_token_per_rank)
-    base_input = all_rank_input[0]
+
+    # Get this rank's input and weights
+    base_input = all_rank_input[rank]
     if use_fp8:
         base_input = dequant_input_like_fp8(base_input, data_type)
 
@@ -913,7 +925,7 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
 
     for i in range(num_tokens_to_check):
         got = combine_output[i]
-        weights = all_rank_weights[0][i].to(torch.float32)
+        weights = all_rank_weights[rank][i].to(torch.float32)
         expected = torch.zeros_like(got)
         for k in range(weights.numel()):
             expected = (expected + (base_input[i].to(torch.float32) * weights[k])).to(data_type)
@@ -923,26 +935,30 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
         if not torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol):
             # Enhanced debug output for DEBUG_SIMPLE_DATA mode
             if DEBUG_SIMPLE_DATA:
-                # In simple data mode, expected value = topk * token_id (since all weights are 1)
-                expected_simple = float(i * topk)
+                # In simple data mode, expected value = sum of (global_token_id * weight_k) for all top-k
+                global_token_id = rank * config.max_num_inp_token_per_rank + i
+                weight_sum = weights.sum().item()
+                expected_simple = float(global_token_id) * weight_sum
                 got_val = got[0].item()
-                print(f"[DEBUG] Combine mismatch at token {i}:", flush=True)
-                print(f"  Expected (simple): {expected_simple} (= token_id {i} * topk {topk})", flush=True)
+                print(f"[DEBUG] Rank {rank} Combine mismatch at token {i}:", flush=True)
+                print(f"  Global token id: {global_token_id}", flush=True)
+                print(f"  Expected (simple): {expected_simple} (= global_token_id {global_token_id} * weight_sum {weight_sum})", flush=True)
                 print(f"  Got value[0]: {got_val}", flush=True)
                 # Try to infer which token's data this might be
-                if got_val > 0:
-                    inferred_token_id = got_val / topk
+                if got_val > 0 and weight_sum > 0:
+                    inferred_token_id = got_val / weight_sum
                     inferred_rank = int(inferred_token_id // config.max_num_inp_token_per_rank)
                     inferred_local_token = int(inferred_token_id % config.max_num_inp_token_per_rank)
                     print(f"  Inferred source: rank={inferred_rank}, local_token={inferred_local_token}", flush=True)
+                print(f"  weights={weights.tolist()}", flush=True)
                 print(f"  got[:8]={got[:8].tolist()}", flush=True)
                 print(f"  expected[:8]={expected[:8].tolist()}", flush=True)
             raise AssertionError(
-                f"Combine mismatch at token {i}: "
+                f"Rank {rank} Combine mismatch at token {i}: "
                 f"got={got[:8].tolist()}, expected={expected[:8].tolist()}"
             )
 
-    _log("[Rank 0] Combine validation passed", force=True)
+    _log(f"[Rank {rank}] Combine validation passed", force=True)
 
 
 def run_once_benchmark(
@@ -1063,7 +1079,7 @@ def run_once_benchmark(
                 gpu_per_node=gpu_per_node,
             )
             validate_combine(
-                config, combine_output, all_rank_input, all_rank_weights, use_fp8, torch.bfloat16
+                config, combine_output, all_rank_input, all_rank_weights, use_fp8, torch.bfloat16, rank
             )
 
     op.reset()
