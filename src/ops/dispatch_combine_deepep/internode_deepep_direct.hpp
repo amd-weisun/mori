@@ -120,7 +120,8 @@ __device__ inline void CrossDeviceBarrierInterNode(
   // Read current barrier flag BEFORE grid barrier to ensure all blocks see the same value.
   // CRITICAL: If we read after the grid barrier, there's a race where block 0 increments
   // before block 1 reads, causing block 1 to wait for a signal value that will never arrive.
-  uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
+  // Use atomic load to ensure we see the latest value after previous kernel completed.
+  uint32_t barrierFlag = detail::AtomicLoadAcquire(args.crossDeviceBarrierFlag);
 
   // Grid barrier to ensure all blocks on this rank are done with their RDMA operations
   // Use barrier index 1 since combineGridBarrier index 0 is used in dispatch Phase 4
@@ -137,9 +138,12 @@ __device__ inline void CrossDeviceBarrierInterNode(
   __syncthreads();
 
   // Increment the flag for next barrier call (only block 0 thread 0)
+  // Use release semantics to ensure the increment is visible to subsequent kernel launches.
   if (threadId == 0 && smId == 0) {
-    detail::AtomicAddRelaxed(args.crossDeviceBarrierFlag, 1u);
+    detail::AtomicAddRelease(args.crossDeviceBarrierFlag, 1u);
   }
+  // Ensure the increment is visible before proceeding
+  __threadfence();
 
   // Signal all other ranks that we're at the barrier
   if (threadId == 0 && smId == 0) {

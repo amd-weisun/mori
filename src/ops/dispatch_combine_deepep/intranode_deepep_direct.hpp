@@ -72,10 +72,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
         crossDeviceBarrierFlag);
   }
 
-  // Step 3: Increment flag counter (device-scope relaxed)
+  // Step 3: Increment flag counter (device-scope release for next iteration visibility)
   if (globalThdId == 0) {
-    detail::AtomicAddRelaxed(args.crossDeviceBarrierFlag, 1u);
+    detail::AtomicAddRelease(args.crossDeviceBarrierFlag, 1u);
   }
+  // Ensure the increment is visible before proceeding
+  __threadfence();
 
   // Step 4: Wait for signals from all remote ranks (device-scope acquire)
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
@@ -161,7 +163,8 @@ __global__ void EpDispatchIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   const int myPe = config.rank;
   const int npes = config.worldSize;
   const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
-  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  // Use atomic load to ensure we see the latest value after previous kernel completed.
+  const uint32_t crossDeviceBarrierFlag = detail::AtomicLoadAcquire(args.crossDeviceBarrierFlag);
 
   // Synchronize all ranks before accessing remote symmetric memory.
   // Note: Counter buffers are already reset by hipMemsetAsync before kernel launch.
@@ -411,7 +414,8 @@ __global__ void EpCombineIntraNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   int globalWarpNum = gridDim.x * warpNum;
 
 
-  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  // Use atomic load to ensure we see the latest value after previous kernel completed.
+  const uint32_t crossDeviceBarrierFlag = detail::AtomicLoadAcquire(args.crossDeviceBarrierFlag);
   const index_t expertCapacity = config.worldSize * config.maxNumInpTokenPerRank;
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   // Step 1: copy only valid expert slots into symmetric combine buffer (visible to all ranks).
