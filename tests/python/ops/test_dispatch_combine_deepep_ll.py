@@ -617,24 +617,23 @@ def run_test_impl(
         validate_dispatch(
             rank, num_experts_per_rank, world_size, recv_count, all_rank_indices
         )
-        # Also validate data placement (only for internode on rank 0)
-        # Internode uses different buffer layout than intranode
-        if is_internode:
-            validate_dispatch_data(
-                rank=rank,
-                world_size=world_size,
-                num_experts_per_rank=num_experts_per_rank,
-                hidden_dim=hidden_dim,
-                gpu_per_node=gpu_per_node,
-                dispatch_output=dispatch_output,
-                dispatch_scales=dispatch_scales,
-                recv_count=recv_count,
-                all_rank_input=all_rank_input,
-                all_rank_indices=all_rank_indices,
-                use_fp8=use_fp8,
-                data_type=data_type,
-                max_tokens_to_check=10,
-            )
+        # Validate data placement for both internode and intranode
+        # The function handles different buffer layouts internally
+        validate_dispatch_data(
+            rank=rank,
+            world_size=world_size,
+            num_experts_per_rank=num_experts_per_rank,
+            hidden_dim=hidden_dim,
+            gpu_per_node=gpu_per_node,
+            dispatch_output=dispatch_output,
+            dispatch_scales=dispatch_scales,
+            recv_count=recv_count,
+            all_rank_input=all_rank_input,
+            all_rank_indices=all_rank_indices,
+            use_fp8=use_fp8,
+            data_type=data_type,
+            max_tokens_to_check=10,
+        )
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -747,15 +746,17 @@ def validate_dispatch_data(
     This function verifies that tokens dispatched from each source rank are
     placed at the correct locations in the output buffer with correct values.
 
-    Buffer layout (internode):
-    - dispatch_output: [num_local_experts, expert_capacity, hidden_dim]
-    - expert_capacity = max_num_inp_token_per_rank * world_size (for internode)
-    - Each source rank has reserved slots: [srcPe * max_tokens, (srcPe+1) * max_tokens)
+    Buffer layout:
+    - Internode: [num_local_experts, expert_capacity, hidden_dim]
+      - expert_capacity = max_num_inp_token_per_rank * world_size
+      - Each source rank has reserved slots: [srcPe * max_tokens, (srcPe+1) * max_tokens)
+    - Intranode: [num_local_experts, expert_capacity, hidden_dim]
+      - Tokens placed via global atomic counter (no per-source partitioning)
+      - Slot order is non-deterministic
 
-    NOTE: Slot assignment within a source rank's partition is non-deterministic
-    due to SM-strided token processing with atomicAdd. We cannot predict the exact
-    slot, but we can verify that each expected token appears SOMEWHERE in the
-    source rank's partition.
+    NOTE: Slot assignment is non-deterministic due to SM-strided token processing
+    with atomicAdd. We cannot predict the exact slot, but we can verify that each
+    expected token appears SOMEWHERE in the buffer.
 
     Args:
         rank: Current rank
@@ -780,19 +781,15 @@ def validate_dispatch_data(
     else:
         dispatch_out_bf16 = dispatch_output
 
-    # For internode: each source rank gets slots [srcPe * max_tokens, (srcPe+1) * max_tokens)
-    max_tokens_per_rank = all_rank_input[0].shape[0]
+    max_tokens_per_rank = all_rank_input[rank].shape[0]
 
     # Build expected token placement for this rank's local experts
     rank_begin = rank * num_experts_per_rank
     rank_end = rank_begin + num_experts_per_rank
 
-    # print(f"[Rank {rank}] Validating dispatch data placement...", flush=True)
-    # print(f"  Local experts: {rank_begin} to {rank_end - 1}", flush=True)
-    # print(f"  dispatch_output shape: {dispatch_out_bf16.shape}", flush=True)
-    # print(f"  is_internode: {is_internode}", flush=True)
-
-    # Build expected tokens per (local_expert, src_rank)
+    # Build expected tokens per local_expert
+    # For internode: also track per src_rank for partition-based validation
+    # For intranode: we'll flatten and search the entire expert buffer
     # expected_tokens[local_expert][src_rank] = list of (src_token_idx, expected_tensor)
     expected_tokens = {e: {r: [] for r in range(world_size)} for e in range(num_experts_per_rank)}
 
@@ -814,6 +811,9 @@ def validate_dispatch_data(
     tokens_matched = 0
     tokens_checked = 0
 
+    atol = 0.5 if use_fp8 else 0.1
+    rtol = 0.25 if use_fp8 else 0.1
+
     for local_expert in range(num_experts_per_rank):
         expert_recv_count = int(recv_count[local_expert].item())
         total_expected = sum(len(expected_tokens[local_expert][r]) for r in range(world_size))
@@ -824,38 +824,94 @@ def validate_dispatch_data(
             errors_found += 1
             continue
 
-        # For each source rank, get actual tokens in its partition and match against expected
-        for src_rank in range(world_size):
-            expected_list = expected_tokens[local_expert][src_rank]
-            if not expected_list:
+        if is_internode:
+            # Internode: each source rank has its own partition
+            for src_rank in range(world_size):
+                expected_list = expected_tokens[local_expert][src_rank]
+                if not expected_list:
+                    continue
+
+                num_expected = len(expected_list)
+                partition_start = src_rank * max_tokens_per_rank
+                partition_end = partition_start + num_expected  # Only check slots that should have data
+
+                # Get actual tokens from this partition
+                actual_tokens = []
+                for slot_idx in range(partition_start, partition_end):
+                    actual = dispatch_out_bf16[local_expert, slot_idx, :]
+                    actual_tokens.append(actual)
+
+                # Match expected tokens against actual (order may differ)
+                matched = [False] * num_expected
+
+                for i, (src_token_idx, expected_input) in enumerate(expected_list):
+                    if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
+                        break  # Limit total checks for performance
+
+                    found_match = False
+                    for j, actual in enumerate(actual_tokens):
+                        if matched[j]:
+                            continue
+                        if torch.allclose(actual.float(), expected_input.float(), atol=atol, rtol=rtol):
+                            matched[j] = True
+                            found_match = True
+                            tokens_matched += 1
+                            break
+
+                    tokens_checked += 1
+
+                    if not found_match:
+                        # Find the closest match to help diagnose the issue
+                        min_diff = float('inf')
+                        closest_slot = -1
+                        for j, actual in enumerate(actual_tokens):
+                            diff = (actual.float() - expected_input.float()).abs().max().item()
+                            if diff < min_diff:
+                                min_diff = diff
+                                closest_slot = j
+
+                        if min_diff < atol:
+                            tokens_matched += 1
+                            continue  # Skip as non-error (matching order issue)
+
+                        print(f"  [Expert {local_expert}] Token not found in partition:", flush=True)
+                        print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
+                        print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
+                        print(f"    closest_slot={closest_slot}, max_diff={min_diff:.6f}, atol={atol}", flush=True)
+                        if closest_slot >= 0 and closest_slot < len(actual_tokens):
+                            closest = actual_tokens[closest_slot]
+                            print(f"    closest[:8]={closest[:8].tolist()}", flush=True)
+                        errors_found += 1
+        else:
+            # Intranode: tokens are placed via global atomic counter (no partitioning)
+            # Search the entire expert buffer for matching tokens
+            all_expected = []
+            for src_rank in range(world_size):
+                for src_token_idx, expected_input in expected_tokens[local_expert][src_rank]:
+                    all_expected.append((src_rank, src_token_idx, expected_input))
+
+            if not all_expected:
                 continue
 
-            num_expected = len(expected_list)
-            partition_start = src_rank * max_tokens_per_rank
-            partition_end = partition_start + num_expected  # Only check slots that should have data
-
-            # Get actual tokens from this partition
+            # Get actual tokens from the expert buffer (up to recv_count)
             actual_tokens = []
-            for slot_idx in range(partition_start, partition_end):
+            for slot_idx in range(expert_recv_count):
                 actual = dispatch_out_bf16[local_expert, slot_idx, :]
                 actual_tokens.append(actual)
 
-            # Match expected tokens against actual (order may differ)
-            # Use greedy matching: for each expected, find best match in actual
-            matched = [False] * num_expected
-            atol = 0.5 if use_fp8 else 0.1
-            rtol = 0.25 if use_fp8 else 0.1
+            # Match expected tokens against actual (order is non-deterministic)
+            matched_actual = [False] * len(actual_tokens)
 
-            for i, (src_token_idx, expected_input) in enumerate(expected_list):
+            for i, (src_rank, src_token_idx, expected_input) in enumerate(all_expected):
                 if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
                     break  # Limit total checks for performance
 
                 found_match = False
                 for j, actual in enumerate(actual_tokens):
-                    if matched[j]:
+                    if matched_actual[j]:
                         continue
                     if torch.allclose(actual.float(), expected_input.float(), atol=atol, rtol=rtol):
-                        matched[j] = True
+                        matched_actual[j] = True
                         found_match = True
                         tokens_matched += 1
                         break
@@ -867,32 +923,24 @@ def validate_dispatch_data(
                     min_diff = float('inf')
                     closest_slot = -1
                     for j, actual in enumerate(actual_tokens):
+                        if matched_actual[j]:
+                            continue
                         diff = (actual.float() - expected_input.float()).abs().max().item()
                         if diff < min_diff:
                             min_diff = diff
                             closest_slot = j
 
-                    # If min_diff is 0, the value exists but was matched to a different expected token
-                    # This can happen when multiple tokens have similar/identical values
-                    # In this case, it's not really an error - just a matching order issue
                     if min_diff < atol:
                         tokens_matched += 1
-                        continue  # Skip this as a non-error
+                        continue  # Skip as non-error (matching order issue)
 
-                    print(f"  [Expert {local_expert}] Token not found in partition:", flush=True)
+                    print(f"  [Expert {local_expert}] Token not found in buffer:", flush=True)
                     print(f"    src_rank={src_rank}, src_token={src_token_idx}", flush=True)
                     print(f"    expected[:8]={expected_input[:8].tolist()}", flush=True)
                     print(f"    closest_slot={closest_slot}, max_diff={min_diff:.6f}, atol={atol}", flush=True)
                     if closest_slot >= 0 and closest_slot < len(actual_tokens):
                         closest = actual_tokens[closest_slot]
                         print(f"    closest[:8]={closest[:8].tolist()}", flush=True)
-                        # Show element-wise diff for first 8
-                        diff8 = (closest[:8].float() - expected_input[:8].float()).abs()
-                        print(f"    diff[:8]={diff8.tolist()}", flush=True)
-                    print(f"    Partition [{partition_start}:{partition_end}] contents:", flush=True)
-                    for s_idx, actual in enumerate(actual_tokens[:4]):  # Show first 4 slots
-                        is_zero = actual.abs().max().item() < 1e-6
-                        print(f"      slot[{partition_start + s_idx}]: {actual[:8].tolist()} {'(zero)' if is_zero else ''}", flush=True)
                     errors_found += 1
 
     if errors_found > 0:
