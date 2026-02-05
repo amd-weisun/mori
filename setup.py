@@ -89,6 +89,7 @@ class CMakeBuild(build_ext):
         use_ionic = os.environ.get("USE_IONIC", "OFF")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
+        enable_combine_debug_printf = os.environ.get("ENABLE_COMBINE_DEBUG_PRINTF", "OFF")
         gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
@@ -99,6 +100,7 @@ class CMakeBuild(build_ext):
                 f"-DUSE_BNXT={use_bnxt}",
                 f"-DUSE_IONIC={use_ionic}",
                 f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
+                f"-DENABLE_COMBINE_DEBUG_PRINTF={enable_combine_debug_printf}",
                 f"-DGPU_TARGETS={gpu_archs}",
                 f"-DENABLE_PROFILER={enable_profiler}",
                 "-B",

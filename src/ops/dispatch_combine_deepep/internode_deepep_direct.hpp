@@ -566,10 +566,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Synchronize warp group after sending
-#ifdef USE_ROCM
+  __threadfence_system();
   __syncthreads();
-#else
-  asm volatile("bar.sync %0, %1;" :: "r"(warpGroupId + 1), "r"(kNumWarpsPerGroup * 32));
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (subWarpId == 0 && laneId == 0) {
+    printf("[COMBINE-PHASE1-DONE] myPe=%d smId=%d warpGroupId=%d responsibleExpert=%d dstRank=%d\n",
+           myPe, smId, warpGroupId, responsibleExpertIdx, dstRank);
+  }
+  __syncthreads();
 #endif
 
   // ========== PHASE 2: SIGNAL COMPLETION ==========
@@ -605,8 +610,28 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
+  // Sync after Phase 2 signaling
+  __threadfence_system();
+  __syncthreads();
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (subWarpId == 0 && laneId == 0) {
+    printf("[COMBINE-PHASE2-DONE] myPe=%d smId=%d warpGroupId=%d responsibleExpert=%d signaled to dstRank=%d\n",
+           myPe, smId, warpGroupId, responsibleExpertIdx, dstRank);
+  }
+  __syncthreads();
+#endif
+
   // ========== PHASE 3: RECEIVE + ACCUMULATE ==========
   // Wait for signals from ranks that sent us data
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (subWarpId == 0 && laneId == 0) {
+    printf("[COMBINE-PHASE3-START] myPe=%d smId=%d warpGroupId=%d responsibleExpert=%d about to wait\n",
+           myPe, smId, warpGroupId, responsibleExpertIdx);
+  }
+  __syncthreads();
+#endif
 
   // Each warp group waits for its responsible expert (like DeepEP)
   if (responsibleExpertIdx < numExpertsTotal && dstRank != myPe) {
@@ -647,8 +672,35 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
+  // Sync after Phase 3 wait
+  __threadfence_system();
+  __syncthreads();
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (subWarpId == 0 && laneId == 0) {
+    printf("[COMBINE-PHASE3-WAIT-DONE] myPe=%d smId=%d warpGroupId=%d responsibleExpert=%d\n",
+           myPe, smId, warpGroupId, responsibleExpertIdx);
+  }
+  __syncthreads();
+#endif
+
   // Grid barrier to ensure all blocks have received their signals
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (threadId == 0) {
+    printf("[COMBINE-GRID-BARRIER-START] myPe=%d smId=%d entering grid barrier\n", myPe, smId);
+  }
+#endif
+
   detail::GridBarrier(args.combineGridBarrier, numSms);
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  __threadfence_system();
+  __syncthreads();
+  if (threadId == 0) {
+    printf("[COMBINE-GRID-BARRIER-DONE] myPe=%d smId=%d passed grid barrier\n", myPe, smId);
+  }
+  __syncthreads();
+#endif
 
   // Shared memory for source pointers
   extern __shared__ char sharedMem[];
@@ -736,10 +788,27 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     __syncthreads();
   }
 
+  // Sync after accumulation
+  __threadfence_system();
+  __syncthreads();
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (threadId == 0) {
+    printf("[COMBINE-ACCUMULATE-DONE] myPe=%d smId=%d numTokens=%d\n", myPe, smId, numTokens);
+  }
+  __syncthreads();
+#endif
+
   // Reset total recv token for next iteration
   if (threadId == 0) {
     *args.totalRecvTokenNum = 0;
   }
+
+#ifdef ENABLE_COMBINE_DEBUG_PRINTF
+  if (threadId == 0) {
+    printf("[COMBINE-KERNEL-DONE] myPe=%d smId=%d\n", myPe, smId);
+  }
+#endif
 }
 
 }  // namespace deepep
