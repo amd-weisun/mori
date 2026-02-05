@@ -122,15 +122,20 @@ __device__ inline T WarpReduceSum(T val) {
 // Grid-level barrier using device-scope atomics (for internode LL kernels)
 // All blocks must call this function. Thread 0 of each block participates in the barrier.
 // The counter must be reset to 0 before each kernel invocation.
-__device__ inline void GridBarrier(uint32_t* counter, uint32_t numBlocks) {
+// The barrierIdx parameter allows multiple barriers to reuse the same counter:
+//   - barrierIdx=0: waits for counter == numBlocks
+//   - barrierIdx=1: waits for counter == numBlocks * 2
+//   - etc.
+__device__ inline void GridBarrier(uint32_t* counter, uint32_t numBlocks, uint32_t barrierIdx = 0) {
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();  // Ensure prior writes are visible
     AtomicAddRelaxed(counter, 1u);
   }
   __syncthreads();
+  uint32_t targetCount = numBlocks * (barrierIdx + 1);
   if (threadIdx.x == 0) {
-    while (AtomicLoadRelaxed(counter) != numBlocks) {
+    while (AtomicLoadRelaxed(counter) < targetCount) {
       // spin
     }
   }

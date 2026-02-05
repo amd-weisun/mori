@@ -324,21 +324,25 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
   }
 
   // ========== PHASE 2: RDMA QUIET + GRID BARRIER ==========
-  // Ensure all RDMA puts are drained BEFORE grid barrier (following DeepEP pattern)
+  // Ensure all RDMA puts are drained BEFORE signaling (following DeepEP pattern)
   // Grid barrier alone doesn't guarantee RDMA completion
   //
-  // For same-node P2P writes: __threadfence_system() ensures visibility
-  // For remote RDMA puts: ShmemQuietThread() drains pending operations
+  // CRITICAL: Must grid-barrier FIRST to ensure all blocks have finished posting RDMA,
+  // THEN quiet to drain all posted operations. Otherwise, faster blocks might quiet
+  // before slower blocks have posted their RDMA operations.
 
-  // System-wide fence for P2P write visibility + RDMA quiet for remote puts
+  // System-wide fence for P2P write visibility
+  __threadfence_system();
+  __syncthreads();
+
+  // Grid barrier to ensure all blocks have finished Phase 1 dispatch (all RDMA posted)
+  detail::GridBarrier(args.dispatchGridBarrier, numSms);
+
+  // Now drain all RDMA puts - safe because all blocks have finished posting
   if (threadId == 0) {
     shmem::ShmemQuietThread();
   }
-  __threadfence_system();  // System-wide visibility for all P2P writes
   __syncthreads();
-
-  // Then grid barrier to ensure all blocks have finished Phase 1 dispatch
-  detail::GridBarrier(args.dispatchGridBarrier, numSms);
 
   // ========== PHASE 3: COUNT SIGNAL SENDING ==========
   // Send negative-encoded count to each destination rank for each expert
@@ -378,19 +382,22 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
     }
   }
 
-  // Drain all RDMA puts (count signals)
-  if (threadId == 0) {
-    shmem::ShmemQuietThread();
-    __threadfence_system();  // System-wide visibility
-  }
-  __syncthreads();
-
   // ========== PHASE 4: GRID BARRIER ==========
-  // Synchronize all blocks before receiving
+  // Synchronize all blocks before draining RDMA
+  // CRITICAL: Grid barrier FIRST to ensure all blocks have finished posting signals,
+  // THEN quiet to drain all posted operations.
+  __threadfence_system();
+  __syncthreads();
 
   // Need a second barrier counter since dispatchGridBarrier was used in Phase 2
   // We reuse combineGridBarrier here (will be reset before combine kernel)
-  detail::GridBarrier(args.combineGridBarrier, numSms);
+  detail::GridBarrier(args.combineGridBarrier, numSms, 0);  // Barrier 0 for dispatch kernel
+
+  // Now drain all RDMA puts (count signals) - safe because all blocks have finished posting
+  if (threadId == 0) {
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
 
   // ========== PHASE 5: RECEIVE + UNPACK ==========
   // Poll for negative-encoded counts, allocate packed buffer space
@@ -565,11 +572,18 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Synchronize warp group after sending
-  shmem::ShmemQuietThread();
+  // Synchronize after Phase 1 sends
+  // CRITICAL: Grid barrier FIRST to ensure all blocks have finished posting RDMA,
+  // THEN quiet to drain all posted operations.
   __threadfence_system();
   __syncthreads();
-  detail::GridBarrier(args.combineGridBarrier, numSms);
+  detail::GridBarrier(args.combineGridBarrier, numSms, 0);  // Barrier 0
+
+  // Now drain all RDMA puts - safe because all blocks have finished posting
+  if (threadId == 0) {
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {
@@ -613,10 +627,17 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
 
   // Sync after Phase 2 signaling
-  shmem::ShmemQuietThread();
+  // CRITICAL: Grid barrier FIRST to ensure all blocks have finished posting signals,
+  // THEN quiet to drain all posted operations.
   __threadfence_system();
   __syncthreads();
-  detail::GridBarrier(args.combineGridBarrier, numSms);
+  detail::GridBarrier(args.combineGridBarrier, numSms, 1);  // Barrier 1
+
+  // Now drain all RDMA signals - safe because all blocks have finished posting
+  if (threadId == 0) {
+    shmem::ShmemQuietThread();
+  }
+  __syncthreads();
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {
@@ -676,11 +697,10 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  // Sync after Phase 3 wait
-  shmem::ShmemQuietThread();
+  // Sync after Phase 3 wait - barrier to ensure all blocks have received their signals
   __threadfence_system();
   __syncthreads();
-  detail::GridBarrier(args.combineGridBarrier, numSms);
+  detail::GridBarrier(args.combineGridBarrier, numSms, 2);  // Barrier 2
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {
@@ -689,15 +709,6 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   }
   __syncthreads();
 #endif
-
-  // Grid barrier to ensure all blocks have received their signals
-#ifdef ENABLE_COMBINE_DEBUG_PRINTF
-  if (threadId == 0) {
-    printf("[COMBINE-GRID-BARRIER-START] myPe=%d smId=%d entering grid barrier\n", myPe, smId);
-  }
-#endif
-
-  detail::GridBarrier(args.combineGridBarrier, numSms);
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   __threadfence_system();
