@@ -651,15 +651,20 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
       bool isRemote = internode_ll::IsRemoteRank(myPe, dstRank, gpuPerNode);
 
       // Sub-warps handle different tokens (strided by kNumWarpsPerGroup)
-      for (int tokenIdx = subWarpId; tokenIdx < numTokensToSend; tokenIdx += kNumWarpsPerGroup) {
-        // Source token index from src_info (slot in source PE's token stream)
-        // srcIdx is the token's position in dstRank's token stream that was dispatched to this expert
-        // For combine, we need to map back: srcLinear is where we stored the output
-        index_t srcLinear = localExpertIdx * expertCapacity + dstRank * config.maxNumInpTokenPerRank + tokenIdx;
+      for (int slotIdx = subWarpId; slotIdx < numTokensToSend; slotIdx += kNumWarpsPerGroup) {
+        // srcLinear: where expert output data is stored (from dispatch)
+        // Layout: [localExpert * expertCapacity + srcPe * maxTokensPerRank + slotIdx]
+        index_t srcLinear = localExpertIdx * expertCapacity + dstRank * config.maxNumInpTokenPerRank + slotIdx;
 
-        // Destination layout: [global_expert_idx * max_tokens + src_idx]
+        // Read the original source token index from the dispatch mapping
+        // dispTokIdToSrcTokIdMemObj[srcLinear] = srcPe * maxTokensPerRank + originalTokenIdx
+        index_t srcTokMapping = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[srcLinear];
+        index_t originalTokenIdx = srcTokMapping % config.maxNumInpTokenPerRank;
+
+        // Destination layout: [global_expert_idx * max_tokens + original_token_idx]
         // This matches DeepEP's buffer layout for rdma_recv_x
-        index_t destLinear = globalExpertIdx * config.maxNumInpTokenPerRank + tokenIdx;
+        // Receiver will read from [topk_idx * max_tokens + token_idx] where token_idx is their local token
+        index_t destLinear = globalExpertIdx * config.maxNumInpTokenPerRank + originalTokenIdx;
 
         if (isRemote) {
           // Stage to local buffer, then RDMA PUT
@@ -877,12 +882,12 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           index_t destPe = destExpert / numLocalExperts;
           index_t localExpert = destExpert % numLocalExperts;
           index_t destGlobalExpert = destPe * numLocalExperts + localExpert;
-          // srcIdx is the slot within the destination buffer
-          index_t srcIdx = destLocalTokId % config.maxNumInpTokenPerRank;
 
           if (destPe < npes) {
-            // Buffer layout: [global_expert_idx * max_tokens + src_idx]
-            size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + srcIdx;
+            // Buffer layout: [global_expert_idx * max_tokens + token_idx]
+            // The combine sender writes to offset tokenIdx (the receiver's local token index),
+            // NOT slotIdx (which was the dispatch slot assignment).
+            size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
 
             if (destPe == myPe) {
               // Self-token: use original dispatch output layout
@@ -905,14 +910,15 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           if constexpr (kUseWeights) {
             float w = 1.0f;
             if (destPe < npes) {
-              size_t bufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + srcIdx;
+              // Use same bufferOffset as token data (tokenIdx-based, not slotIdx)
+              size_t weightsBufferOffset = destGlobalExpert * config.maxNumInpTokenPerRank + tokenIdx;
               if (destPe == myPe) {
                 size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
                 w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>()[selfOffset * numTopK + j];
               } else {
                 bool isRemote = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
                 if (isRemote) {
-                  w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[bufferOffset * numTopK + j];
+                  w = args.shmemCombineOutWeightsMemObj->template GetAs<float*>()[weightsBufferOffset * numTopK + j];
                 } else {
                   size_t selfOffset = localExpert * expertCapacity + destLocalTokId;
                   w = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe)[selfOffset * numTopK + j];
