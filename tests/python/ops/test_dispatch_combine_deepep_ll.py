@@ -659,15 +659,15 @@ def run_test_impl(
         combine_input = dequant_dispatch_output(dispatch_output, dispatch_scales, hidden_dim)
 
     # Debug: show dispatch output (combine input) values for rank 0
-    if DEBUG_SIMPLE_DATA and rank == 0:
-        print(f"[DEBUG] Dispatch output shape: {dispatch_output.shape}", flush=True)
-        # Show first value at each expert's slot 0 (from rank 0's partition)
-        expert_capacity = world_size * max_num_inp_token_per_rank
-        for e in range(num_experts_per_rank):
-            for s in range(min(4, max_num_inp_token_per_rank)):
-                val = combine_input[e, s, 0].item()
-                if abs(val) > 1e-6:  # Only show non-zero
-                    print(f"    dispatch_out[expert={e}][slot={s}][0] = {val:.1f}", flush=True)
+    # if DEBUG_SIMPLE_DATA and rank == 0:
+    #     print(f"[DEBUG] Dispatch output shape: {dispatch_output.shape}", flush=True)
+    #     # Show first value at each expert's slot 0 (from rank 0's partition)
+    #     expert_capacity = world_size * max_num_inp_token_per_rank
+    #     for e in range(num_experts_per_rank):
+    #         for s in range(min(4, max_num_inp_token_per_rank)):
+    #             val = combine_input[e, s, 0].item()
+    #             if abs(val) > 1e-6:  # Only show non-zero
+    #                 print(f"    dispatch_out[expert={e}][slot={s}][0] = {val:.1f}", flush=True)
 
     combine_output, _, _ = combine_func(
         combine_input, dispatch_indices, dispatch_weights, handle=handle
