@@ -632,7 +632,7 @@ def run_test_impl(
             all_rank_indices=all_rank_indices,
             use_fp8=use_fp8,
             data_type=data_type,
-            max_tokens_to_check=200,
+            # max_tokens_to_check=200,
         )
         torch.cuda.synchronize()
         dist.barrier()
@@ -739,7 +739,7 @@ def validate_dispatch_data(
     all_rank_indices: list,
     use_fp8: bool,
     data_type: torch.dtype,
-    max_tokens_to_check: int = 200,
+    # max_tokens_to_check: int = 200,
 ):
     """Validate dispatch data placement by checking actual token values.
 
@@ -845,8 +845,8 @@ def validate_dispatch_data(
                 matched = [False] * num_expected
 
                 for i, (src_token_idx, expected_input) in enumerate(expected_list):
-                    if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
-                        break  # Limit total checks for performance
+                    # if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
+                    #     break  # Limit total checks for performance
 
                     found_match = False
                     for j, actual in enumerate(actual_tokens):
@@ -903,8 +903,8 @@ def validate_dispatch_data(
             matched_actual = [False] * len(actual_tokens)
 
             for i, (src_rank, src_token_idx, expected_input) in enumerate(all_expected):
-                if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
-                    break  # Limit total checks for performance
+                # if tokens_checked >= max_tokens_to_check * num_experts_per_rank:
+                #     break  # Limit total checks for performance
 
                 found_match = False
                 for j, actual in enumerate(actual_tokens):
