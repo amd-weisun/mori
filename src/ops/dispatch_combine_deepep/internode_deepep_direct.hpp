@@ -569,6 +569,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
+  detail::GridBarrier(args.combineGridBarrier, numSms);
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {
@@ -615,6 +616,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
+  detail::GridBarrier(args.combineGridBarrier, numSms);
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {
@@ -678,6 +680,7 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
   shmem::ShmemQuietThread();
   __threadfence_system();
   __syncthreads();
+  detail::GridBarrier(args.combineGridBarrier, numSms);
 
 #ifdef ENABLE_COMBINE_DEBUG_PRINTF
   if (subWarpId == 0 && laneId == 0) {

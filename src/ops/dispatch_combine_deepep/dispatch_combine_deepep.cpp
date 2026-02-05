@@ -479,6 +479,13 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatchDeepepLL(int blockNum, int 
   HIP_RUNTIME_CHECK(hipMemsetAsync(dispatchGridBarrier, 0, sizeof(uint32_t), stream));
   HIP_RUNTIME_CHECK(hipMemsetAsync(combineGridBarrier, 0, sizeof(uint32_t), stream));
 
+  // Reset symmetric dispatch output buffers to ensure no stale data from previous iterations
+  // Only reset local portion - remote ranks will write via RDMA
+  size_t maxTokenSlots = static_cast<size_t>(config.worldSize) * config.numExpertPerRank *
+                         config.maxNumInpTokenPerRank;
+  size_t dispatchOutTokSize = maxTokenSlots * config.hiddenDim * config.maxTokenTypeSize;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(shmemDispatchOutTokMemObj->localPtr, 0, dispatchOutTokSize, stream));
+
   size_t sharedMemSize =
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
@@ -526,15 +533,17 @@ void EpDispatchCombineHandle::LaunchInterNodeCombineDeepepLL(int blockNum, int w
            "DeepEP fp8 dispatch expects scaleDim == hiddenDim / 128");
   }
 
-  // Same initialization as intranode combine
-  size_t combineOutSize =
-      static_cast<size_t>(config.maxNumInpTokenPerRank) * config.hiddenDim * config.maxTokenTypeSize;
-  HIP_RUNTIME_CHECK(hipMemsetAsync(shmemCombineOutTokMemObj->Get(), 0, combineOutSize, stream));
+  // Reset symmetric combine output buffer - must cover all slots that RDMA writes can land in
+  // Buffer layout: [globalExpertIdx * maxNumInpTokenPerRank + tokenIdx] where
+  // globalExpertIdx ranges over [0, worldSize * numExpertPerRank)
+  size_t maxTokenSlots = static_cast<size_t>(config.worldSize) * config.numExpertPerRank *
+                         config.maxNumInpTokenPerRank;
+  size_t combineOutTokSize = maxTokenSlots * config.hiddenDim * config.maxTokenTypeSize;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(shmemCombineOutTokMemObj->localPtr, 0, combineOutTokSize, stream));
   if (weightsBuf) {
-    size_t combineOutWeightsSize =
-        static_cast<size_t>(config.maxNumInpTokenPerRank) * config.numExpertPerToken * sizeof(float);
+    size_t combineOutWeightsSize = maxTokenSlots * config.numExpertPerToken * sizeof(float);
     HIP_RUNTIME_CHECK(
-        hipMemsetAsync(shmemCombineOutWeightsMemObj->Get(), 0, combineOutWeightsSize, stream));
+        hipMemsetAsync(shmemCombineOutWeightsMemObj->localPtr, 0, combineOutWeightsSize, stream));
   }
 
   // Reset internode LL combine buffers
