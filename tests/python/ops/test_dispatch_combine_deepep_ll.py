@@ -982,6 +982,20 @@ def validate_combine(config, combine_output, all_rank_input, all_rank_weights, u
         atol = 0.25 if use_fp8 else 0.1
         rtol = 0.25 if use_fp8 else 0.1
         if not torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol):
+            # Check for NaN/Inf which cause allclose to fail
+            got_nan = torch.isnan(got).any().item()
+            got_inf = torch.isinf(got).any().item()
+            exp_nan = torch.isnan(expected).any().item()
+            exp_inf = torch.isinf(expected).any().item()
+            if got_nan or got_inf or exp_nan or exp_inf:
+                print(f"[DEBUG] Rank {rank} token {i}: NaN/Inf detected! got_nan={got_nan} got_inf={got_inf} exp_nan={exp_nan} exp_inf={exp_inf}", flush=True)
+
+            # Find the actual difference
+            diff = (got.float() - expected.float()).abs()
+            max_diff_idx = diff.argmax().item()
+            max_diff = diff[max_diff_idx].item()
+            print(f"[DEBUG] Rank {rank} token {i}: max_diff={max_diff:.6f} at idx={max_diff_idx}, got[idx]={got[max_diff_idx].item():.6f}, expected[idx]={expected[max_diff_idx].item():.6f}", flush=True)
+
             # Enhanced debug output for DEBUG_SIMPLE_DATA mode
             if DEBUG_SIMPLE_DATA:
                 # In simple data mode, expected value = sum of (global_token_id * weight_k) for all top-k
