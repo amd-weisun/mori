@@ -191,8 +191,19 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
       if constexpr (kUseFP8) {
         // FP8 quantization and copy
-        auto* destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
-            args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(isRemote ? myPe : destPe)) + baseOffset;
+        // Use (tokenIdx * numTopK + warpId) as staging index to avoid race condition:
+        // Multiple warps in the same block may process the same tokenIdx for different top-K experts.
+        // For remote, we stage to shmemStagingTokMemObj; for local, we write directly to destination.
+        index_t stagingIdx = tokenIdx * numTopK + warpId;
+        __hip_fp8_storage_t* destFp8;
+        if (isRemote) {
+          // Stage to local staging buffer with unique stagingIdx
+          destFp8 = args.shmemStagingTokMemObj->template GetAs<__hip_fp8_storage_t*>() + stagingIdx * config.hiddenDim;
+        } else {
+          // Write directly to destination at baseOffset
+          destFp8 = reinterpret_cast<__hip_fp8_storage_t*>(
+              args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe)) + baseOffset;
+        }
         int numScales = config.hiddenDim / detail::kNumPerChannels;
 
         for (int scaleIdx = 0; scaleIdx < numScales; ++scaleIdx) {
@@ -210,12 +221,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           float scaleInv = detail::DeepepFp8ScaleInv(amax);
 
           // Store inverse scale (one per channel group)
-          // Use (tokenIdx * numTopK + warpId) as staging index to avoid race condition:
-          // Multiple warps in the same block may process the same tokenIdx for different top-K experts
-          index_t stagingIdx = tokenIdx * numTopK + warpId;
           if (laneId == 0) {
             if (isRemote) {
               // Stage locally first, will RDMA put later
+              // Scales are stored after token data: [token data][scales]
               reinterpret_cast<float*>(
                   args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
                   maxTokensPerRank * numTopK * config.hiddenDim)[stagingIdx * numScales + scaleIdx] = scaleInv;
@@ -236,17 +245,17 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
 
         // RDMA put for remote ranks
         if (isRemote && laneId == 0) {
-          // Put FP8 data
+          // Put FP8 data from staging buffer to destination
+          size_t stagingOffset = stagingIdx * config.hiddenDim * sizeof(__hip_fp8_storage_t);
           shmem::ShmemPutMemNbiThread(
               args.shmemDispatchOutTokMemObj,
               baseOffset * sizeof(__hip_fp8_storage_t),
-              args.shmemDispatchOutTokMemObj,
-              baseOffset * sizeof(__hip_fp8_storage_t),
+              args.shmemStagingTokMemObj,
+              stagingOffset,
               config.hiddenDim * sizeof(__hip_fp8_storage_t),
               destPe, 0);
 
-          // Put scales - use stagingIdx to match the staging location used above
-          index_t stagingIdx = tokenIdx * numTopK + warpId;
+          // Put scales from staging buffer to destination
           size_t stagingScalesOffset = maxTokensPerRank * numTopK * config.hiddenDim + stagingIdx * numScales * sizeof(float);
           shmem::ShmemPutMemNbiThread(
               args.shmemOutScalesMemObj,
