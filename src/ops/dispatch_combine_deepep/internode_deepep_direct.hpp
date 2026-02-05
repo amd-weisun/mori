@@ -83,6 +83,25 @@ __device__ __forceinline__ int GetNodeId(int rank, int gpuPerNode) {
   return rank / gpuPerNode;
 }
 
+// Warp synchronization with memory fence for AMD GPUs.
+// On AMD GPUs, HIP's __syncwarp() only synchronizes thread execution, NOT memory.
+// For RDMA operations where the NIC reads from GPU memory, we need system-scope
+// memory visibility before posting WQEs.
+//
+// This matches DeepEP's syncwarp() pattern which uses AMD GCN fence intrinsics,
+// but we use the stronger __threadfence_system() for NIC visibility.
+__device__ __forceinline__ void syncwarp() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+// Stronger sync for RDMA: ensures writes are visible to NIC (external PCIe device)
+__device__ __forceinline__ void syncwarp_system() {
+  __builtin_amdgcn_wave_barrier();
+  __threadfence_system();
+}
+
 }  // namespace internode_ll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -212,10 +231,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           }
         }
 
-        __syncwarp();
-        // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
-        // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
-        __threadfence_system();
+        // Warp sync with system-scope memory fence for NIC visibility before RDMA PUT
+        internode_ll::syncwarp_system();
 
         // RDMA put for remote ranks
         if (isRemote && laneId == 0) {
@@ -250,11 +267,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             localStaging[j] = args.inpTokenBuf[srcOffset + j];
           }
-          __syncwarp();
-          // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
-          // __syncwarp() only synchronizes threads, not memory visibility to external agents.
-          // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
-          __threadfence_system();
+          // Warp sync with system-scope memory fence for NIC visibility before RDMA PUT
+          internode_ll::syncwarp_system();
 
           // RDMA put
           if (laneId == 0) {
@@ -295,7 +309,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           args.shmemInpIndicesMemObj->template GetAs<index_t*>()[tokenIdx * numTopK + laneId] =
               args.tokenIndices[tokenIdx * numTopK + laneId];
         }
-        __syncwarp();
+        // Warp sync with system-scope memory fence for NIC visibility before RDMA PUT
+        internode_ll::syncwarp_system();
 
         if (laneId == 0) {
           if (args.weightsBuf) {
@@ -327,8 +342,8 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         }
       }
 
-      // Signal dispatch completion for this token
-      __syncwarp();
+      // Signal dispatch completion for this token (local atomic, wavefront sync is sufficient)
+      internode_ll::syncwarp();
       if (laneId == 0) {
         detail::AtomicAddRelease(args.finishCounterPerExpert + destExpert, 1u);
       }
@@ -548,10 +563,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             localStaging[j] = args.inpTokenBuf[srcLinear * config.hiddenDim + j];
           }
-          __syncwarp();
-          // System-scope memory fence to ensure all staged writes are visible to NIC before RDMA PUT.
-          // __threadfence() is device-scope only; NIC is an external PCIe device requiring system scope.
-          __threadfence_system();
+          // Warp sync with system-scope memory fence for NIC visibility before RDMA PUT
+          internode_ll::syncwarp_system();
 
           if (laneId == 0) {
             shmem::ShmemPutMemNbiThread(
@@ -803,7 +816,8 @@ __global__ void EpCombineInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args) 
           }
         }
       }
-      __syncwarp();
+      // Local memory access follows, wavefront sync is sufficient
+      internode_ll::syncwarp();
 
       // Accumulate with weights
       float combinedValue = 0.0f;
