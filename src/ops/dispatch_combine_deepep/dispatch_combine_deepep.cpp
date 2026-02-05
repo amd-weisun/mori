@@ -625,6 +625,11 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
 
   // Reset total received token count
   HIP_RUNTIME_CHECK(hipMemsetAsync(totalRecvTokenNum, 0, sizeof(index_t), stream));
+
+  // Synchronize to ensure all reset operations complete before proceeding.
+  // This prevents races between async memset and subsequent RDMA operations on
+  // symmetric memory that may not obey stream ordering.
+  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 }
 
 }  // namespace deepep
