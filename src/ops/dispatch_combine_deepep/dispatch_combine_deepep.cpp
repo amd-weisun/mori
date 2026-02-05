@@ -626,6 +626,18 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
   // Reset total received token count
   HIP_RUNTIME_CHECK(hipMemsetAsync(totalRecvTokenNum, 0, sizeof(index_t), stream));
 
+  // Reset cross-device barrier memory object. Although the barrier uses >= comparison
+  // with monotonically increasing flag values, resetting to 0 ensures clean state
+  // and prevents any potential issues with stale values from previous iterations.
+  size_t crossDeviceBarrierSize = config.worldSize * sizeof(uint32_t);
+  HIP_RUNTIME_CHECK(hipMemsetAsync(crossDeviceBarrierMemObj->localPtr, 0, crossDeviceBarrierSize, stream));
+
+  // Reset rdmaRecvCountMemObj to ensure signal polling starts fresh each iteration.
+  // Signals use negative-encoded counts (-count-1), and receivers poll until != 0.
+  // Without reset, stale signals from previous iteration could cause incorrect counts.
+  size_t rdmaRecvCountSize = static_cast<size_t>(config.numExpertPerRank) * config.worldSize * sizeof(int64_t);
+  HIP_RUNTIME_CHECK(hipMemsetAsync(rdmaRecvCountMemObj->localPtr, 0, rdmaRecvCountSize, stream));
+
   // Synchronize to ensure all reset operations complete before proceeding.
   // This prevents races between async memset and subsequent RDMA operations on
   // symmetric memory that may not obey stream ordering.
