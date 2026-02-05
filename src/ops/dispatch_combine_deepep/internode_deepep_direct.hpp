@@ -141,13 +141,13 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
       if (laneId == 0) {
         args.dispDestTokIdMap[tokenIdx * numTopK + warpId] = destExpert * expertCapacity + destTokId;
 #ifdef ENABLE_DEBUG_PRINTF
-        if (myPe == 0 && tokenIdx < 4) {
-          bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
-          const char* destType = (destPe == myPe) ? "SELF" : (isRemoteDbg ? "RDMA" : "P2P");
-          printf("[DISPATCH-DBG] token=%d k=%d: destExpert=%d destPe=%d %s stored=%d offset=%lu\n",
-                 (int)tokenIdx, warpId, destExpert, destPe, destType,
-                 (int)(destExpert * expertCapacity + destTokId),
-                 (unsigned long)(destLinearTok * config.hiddenDim));
+        // Debug: trace RDMA dispatch to node 1 (ranks 8-15) for tokens that might be problematic
+        bool isRemoteDbg = internode_ll::IsRemoteRank(myPe, destPe, gpuPerNode);
+        if (myPe == 0 && isRemoteDbg && destPe >= 8 && localExpert == 0) {
+          printf("[DISPATCH-RDMA] myPe=%d tok=%d slotIdx=%d destPe=%d localExp=%d destLinear=%lu srcVal=%.1f\n",
+                 myPe, (int)tokenIdx, (int)slotIdx, destPe, localExpert,
+                 (unsigned long)destLinearTok,
+                 static_cast<float>(args.inpTokenBuf[tokenIdx * config.hiddenDim]));
         }
 #endif
       }
@@ -191,12 +191,15 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
           float scaleInv = detail::DeepepFp8ScaleInv(amax);
 
           // Store inverse scale (one per channel group)
+          // Use (tokenIdx * numTopK + warpId) as staging index to avoid race condition:
+          // Multiple warps in the same block may process the same tokenIdx for different top-K experts
+          index_t stagingIdx = tokenIdx * numTopK + warpId;
           if (laneId == 0) {
             if (isRemote) {
               // Stage locally first, will RDMA put later
               reinterpret_cast<float*>(
                   args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
-                  maxTokensPerRank * config.hiddenDim)[tokenIdx * numScales + scaleIdx] = scaleInv;
+                  maxTokensPerRank * numTopK * config.hiddenDim)[stagingIdx * numScales + scaleIdx] = scaleInv;
             } else {
               args.shmemOutScalesMemObj->template GetAs<float*>(destPe)[destLinearTok * numScales + scaleIdx] = scaleInv;
             }
@@ -222,8 +225,9 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
               config.hiddenDim * sizeof(__hip_fp8_storage_t),
               destPe, 0);
 
-          // Put scales
-          size_t stagingScalesOffset = maxTokensPerRank * config.hiddenDim + tokenIdx * numScales * sizeof(float);
+          // Put scales - use stagingIdx to match the staging location used above
+          index_t stagingIdx = tokenIdx * numTopK + warpId;
+          size_t stagingScalesOffset = maxTokensPerRank * numTopK * config.hiddenDim + stagingIdx * numScales * sizeof(float);
           shmem::ShmemPutMemNbiThread(
               args.shmemOutScalesMemObj,
               destLinearTok * numScales * sizeof(float),
@@ -236,7 +240,10 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
         // BF16/FP32: direct copy
         if (isRemote) {
           // Stage locally first
-          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + tokenIdx * config.hiddenDim;
+          // Use (tokenIdx * numTopK + warpId) as staging index to avoid race condition:
+          // Multiple warps in the same block may process the same tokenIdx for different top-K experts
+          index_t stagingIdx = tokenIdx * numTopK + warpId;
+          T* localStaging = args.shmemStagingTokMemObj->template GetAs<T*>() + stagingIdx * config.hiddenDim;
           for (int j = laneId; j < config.hiddenDim; j += warpSize) {
             localStaging[j] = args.inpTokenBuf[srcOffset + j];
           }
@@ -248,7 +255,7 @@ __global__ void EpDispatchInterNodeDeepepLLKernel(EpDispatchCombineArgs<T> args)
                 args.shmemDispatchOutTokMemObj,
                 baseOffset * sizeof(T),
                 args.shmemStagingTokMemObj,
-                tokenIdx * config.hiddenDim * sizeof(T),
+                stagingIdx * config.hiddenDim * sizeof(T),
                 config.hiddenDim * sizeof(T),
                 destPe, 0);
           }
