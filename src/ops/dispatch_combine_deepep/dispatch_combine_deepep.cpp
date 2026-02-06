@@ -605,40 +605,15 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
 // Reset buffers between iterations for correctness
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream, bool syncBarrier) {
+  (void)syncBarrier;  // No longer used - synchronization via dispatch START barrier instead
   int numExpertsTotal = config.worldSize * config.numExpertPerRank;
 
-  // STEP 1: Cross-device barrier BEFORE buffer resets (if enabled)
-  // This ensures all ranks have completed their dispatch (including all RDMA writes)
-  // before ANY rank clears its buffers. Without this, one rank's reset could clear
-  // buffers while another rank's in-flight RDMA writes are still landing.
-  //
-  // The barrier uses dispatchGridBarrier which is at numBlocks after dispatch Phase 2.
-  // CrossDeviceBarrierKernel uses barrierIdx=0, so GridBarrier expects 2*numBlocks.
-  // Counter goes: numBlocks -> 2*numBlocks, then we reset it to 0 below.
-  if (syncBarrier && config.worldSize > 1) {
-    bool isInterNode = config.worldSize > config.gpuPerNode;
+  // NOTE: Cross-device synchronization is handled by the START barrier in dispatch
+  // (when bypassStartBarrier=false). This ensures all ranks have completed their
+  // previous dispatch before any rank starts the next one. The START barrier
+  // approach is simpler and more reliable than a barrier in reset().
 
-    if (isInterNode) {
-      int blockSize = 256;  // Enough threads for barrier polling (needs >= worldSize threads)
-      dim3 grid(config.blockNum);  // Use same block count as dispatch for grid barrier compatibility
-      dim3 block(blockSize);
-
-      auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
-      std::visit(
-          [&](auto& args) {
-            using ArgsT = std::decay_t<decltype(args)>;
-            using DataT = typename ArgsT::data_type;
-            CrossDeviceBarrierKernel<DataT><<<grid, block, 0, stream>>>(args);
-          },
-          argsVariant);
-
-      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-    }
-    // For intranode-only, hipStreamSynchronize is sufficient since all GPUs
-    // share the same xGMI coherency domain.
-  }
-
-  // STEP 2: Reset buffers now that all ranks have synchronized
+  // Reset buffers
   // Grid barrier counters must be reset between iterations - otherwise barriers
   // pass immediately due to accumulated counts from previous iterations.
   // Note: GridBarrier uses a single counter, so we only need sizeof(uint32_t).

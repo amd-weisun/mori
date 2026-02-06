@@ -200,31 +200,10 @@ __device__ inline void CrossDeviceBarrierInterNode(
 
 }  // namespace internode_ll
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                           Cross-Device Barrier Kernel (for reset sync)                         */
-/* ---------------------------------------------------------------------------------------------- */
-
-// Lightweight kernel that performs cross-device barrier only.
-// Used by LaunchReset() to synchronize all ranks BEFORE buffer resets.
-// This ensures all ranks have completed their dispatch (including RDMA writes)
-// before any rank clears its buffers, preventing race conditions.
-//
-// IMPORTANT: This barrier runs BEFORE buffer resets, so counters have values
-// from the previous dispatch:
-// - dispatchGridBarrier: at numBlocks after dispatch Phase 2 (bypass mode)
-// - CrossDeviceBarrierInterNode with barrierIdx=0 uses GridBarrier index 1,
-//   which expects 2*numBlocks. Counter goes numBlocks -> 2*numBlocks.
-// - After barrier completes, dispatchGridBarrier is reset to 0 for next dispatch.
-template <typename T>
-__global__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
-  const int numSms = gridDim.x;
-  // Use dispatchGridBarrier with barrierIdx=0:
-  // - After dispatch Phase 2 (bypass mode), counter is at numBlocks
-  // - CrossDeviceBarrierInterNode uses (1 + barrierIdx) = 1 for GridBarrier
-  // - GridBarrier expects numBlocks * 2, counter goes numBlocks -> 2*numBlocks
-  // - Then LaunchReset will reset dispatchGridBarrier to 0 for next iteration
-  internode_ll::CrossDeviceBarrierInterNode(args, numSms, 0, args.dispatchGridBarrier);
-}
+// NOTE: CrossDeviceBarrierKernel was previously used for reset synchronization,
+// but this approach had issues with grid barrier counter states. The simpler
+// solution is to use the START barrier in dispatch (bypassStartBarrier=false)
+// which synchronizes all ranks at the beginning of each dispatch.
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                              Multi-Node Dispatch Kernel                                         */

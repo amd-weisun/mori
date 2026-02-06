@@ -933,7 +933,7 @@ void RegisterMoriOps(py::module_& m) {
     pybind11::class_<mori::moe::deepep::EpDispatchCombineDeepepConfig>(
       m, "EpDispatchCombineDeepepConfig")
                   .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool, bool, bool,
-                  bool, int, int>(),
+                  bool, bool, int, int>(),
          py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
          py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
          py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
@@ -941,7 +941,8 @@ void RegisterMoriOps(py::module_& m) {
          py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
          py::arg("use_external_inp_buf") = true, py::arg("use_fp8") = true,
          py::arg("use_weighted_combine") = true, py::arg("use_deepep_layout") = true,
-          py::arg("gpu_per_node") = 8,
+         py::arg("bypass_start_barrier") = true,
+         py::arg("gpu_per_node") = 8,
          py::arg("rdma_block_num") = 1)
       .def_readwrite("rank", &mori::moe::deepep::EpDispatchCombineDeepepConfig::rank)
       .def_readwrite("world_size", &mori::moe::deepep::EpDispatchCombineDeepepConfig::worldSize)
@@ -965,8 +966,10 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("use_fp8", &mori::moe::deepep::EpDispatchCombineDeepepConfig::useFP8)
       .def_readwrite("use_deepep_layout",
              &mori::moe::deepep::EpDispatchCombineDeepepConfig::useDeepepLayout)
-            .def_readwrite("use_weighted_combine",
-              &mori::moe::deepep::EpDispatchCombineDeepepConfig::useWeightedCombine)
+      .def_readwrite("use_weighted_combine",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::useWeightedCombine)
+      .def_readwrite("bypass_start_barrier",
+             &mori::moe::deepep::EpDispatchCombineDeepepConfig::bypassStartBarrier)
       .def_readwrite("gpu_per_node", &mori::moe::deepep::EpDispatchCombineDeepepConfig::gpuPerNode)
       .def_readwrite("rdma_block_num",
              &mori::moe::deepep::EpDispatchCombineDeepepConfig::rdmaBlockNum);

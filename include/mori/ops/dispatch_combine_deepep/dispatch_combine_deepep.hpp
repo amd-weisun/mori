@@ -212,6 +212,7 @@ struct EpDispatchCombineDeepepConfig {
   // When bypassed, external synchronization (e.g., dist.barrier()) is required between
   // reset() and dispatch() to avoid race conditions between buffer resets and RDMA writes.
   // Default: true (bypass) for performance - production typically has natural CPU sync.
+  // For multi-iteration tests, set this to false to enable the START barrier.
   bool bypassStartBarrier{true};
   int gpuPerNode{8};
   int rdmaBlockNum{1};

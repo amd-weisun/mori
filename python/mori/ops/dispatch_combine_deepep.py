@@ -49,6 +49,7 @@ class EpDispatchCombineDeepepConfig:
     use_fp8: bool = True
     use_deepep_layout: bool = True
     use_weighted_combine: bool = True
+    bypass_start_barrier: bool = True  # Set to False for multi-iteration tests
     kernel_type: EpDispatchCombineDeepepKernelType = EpDispatchCombineDeepepKernelType.IntraNode
     gpu_per_node: int = 8
     rdma_block_num: int = 1
@@ -80,6 +81,7 @@ class EpDispatchCombineDeepepOp:
                 use_fp8=config.use_fp8,
                 use_deepep_layout=config.use_deepep_layout,
                 use_weighted_combine=config.use_weighted_combine,
+                bypass_start_barrier=config.bypass_start_barrier,
                 gpu_per_node=config.gpu_per_node,
                 rdma_block_num=config.rdma_block_num,
             )

@@ -302,6 +302,7 @@ def create_op_for_setting(
         use_fp8=use_fp8,
         use_deepep_layout=True,
         use_weighted_combine=True,
+        bypass_start_barrier=False,  # Enable START barrier for multi-iteration correctness
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
     )
@@ -519,6 +520,7 @@ def run_test_impl(
         use_fp8=use_fp8,
         use_deepep_layout=True,
         use_weighted_combine=True,
+        bypass_start_barrier=False,  # Enable START barrier for multi-iteration correctness
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
     )
@@ -1138,6 +1140,7 @@ def run_once_benchmark(
                 use_fp8=use_fp8,
                 use_deepep_layout=True,
                 use_weighted_combine=True,
+                bypass_start_barrier=False,  # Enable START barrier for multi-iteration correctness
                 kernel_type=(
                     mori.ops.EpDispatchCombineDeepepKernelType.InterNodeLL
                     if is_internode
