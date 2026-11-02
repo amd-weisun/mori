@@ -65,7 +65,52 @@ Dispatch and combine kernels for MoE expert parallelism.
    * - ``get_registered_combine_input_buffer(dtype)``
      - Get pre-registered zero-copy combine buffer.
 
-See `MORI-EP Guide <../MORI-EP-GUIDE.md>`_ for full API reference.
+See :doc:`MORI-EP Guide <../MORI-EP-GUIDE>` for full API reference.
+
+AsyncLL v2 SDMA overlap
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The HIP backend of ``mori.ops.dispatch_combine_v2`` supports
+``async_ll=True, async_ll_transport="sdma"``. Run independent computation
+between ``dispatch_send()`` and ``dispatch_recv()``, and between
+``combine_send()`` and ``combine_recv()``. Receive data and counts are ready
+after the corresponding receive phase completes on the stream.
+
+On a single gfx1250 node, the send phase now posts each payload followed by
+its ready notification on the same SDMA queue. The receive phase still waits
+for outgoing copies before the source buffers can be reused. Zero-token peers
+also exchange notifications. The redundant dispatch receive-count reset is
+omitted because the receive copy writes the total, including zero.
+
+These options are read once when an op is constructed:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Environment variable
+     - Default and effect
+   * - ``MORI_ASYNCLL_EARLY_NOTIFY``
+     - ``1`` on single-node gfx1250 SDMA; ``0`` elsewhere. Posts notifications
+       in the send phase. Other architectures can opt in with ``1``.
+   * - ``MORI_ASYNCLL_SKIP_RESET``
+     - No longer has an effect. It skipped the host-side ``total_recv`` reset
+       before each dispatch; that reset has been removed for every kernel
+       family (the dispatch kernels now produce the count themselves), and
+       AsyncLL's receive copy always assigned it. Still accepted, so existing
+       settings do not fail.
+   * - ``MORI_ASYNCLL_FUSED_RECV``
+     - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
+       per CTA waits, then an acquire and CTA barrier release the copy waves.
+
+All three variables accept ``0`` or ``1``. Skipping the reset or fusing receive
+requires early notification. Set all three to ``0`` for the legacy sequence.
+LSA and multi-node ops retain their existing protocol and ignore these SDMA
+options. The resolved notification mode is part of every native Plan's
+configuration and generated source, so different ops can coexist without
+changing the protocol of an already constructed Plan.
+
+The default targets single-node gfx1250 overlap. Receive fusion remains opt-in
+because its additional benefit depends on the token count and compute window.
 
 MORI Shmem (Symmetric Memory)
 -------------------------------
@@ -140,7 +185,7 @@ OpenSHMEM-style APIs for GPU memory management and RDMA.
    * - ``shmem_barrier_all()``
      - Global barrier across all PEs
 
-See `Shmem Guide <../MORI-SHMEM-GUIDE.md>`_ for full API reference.
+See :doc:`Shmem Guide <../MORI-SHMEM-GUIDE>` for full API reference.
 
 MORI-IO (Point-to-Point I/O)
 ------------------------------
@@ -187,7 +232,7 @@ RDMA-based P2P communication for KVCache transfer.
 - ``BackendType``: ``Unknown``, ``XGMI``, ``RDMA``, ``TCP``
 - ``StatusCode``: ``SUCCESS``, ``INIT``, ``IN_PROGRESS``, ``ERR_INVALID_ARGS``, ``ERR_NOT_FOUND``, ``ERR_RDMA_OP``, ``ERR_BAD_STATE``, ``ERR_GPU_OP``
 
-See `MORI-IO Guide <../MORI-IO-GUIDE.md>`_ for full API reference.
+See :doc:`MORI-IO Guide <../MORI-IO-GUIDE>` for full API reference.
 
 MORI-IR (Device Bitcode Integration)
 --------------------------------------
@@ -269,4 +314,4 @@ into GPU kernel frameworks (Triton, FlyDSL, MLIR, custom HIP, etc.).
      - ``quiet_thread()``, ``fence_thread()``, ``barrier_all_block()``
      - Ordering and synchronization
 
-See `MORI-IR Guide <../MORI-IR-GUIDE.md>`_ for full device function table and integration examples.
+See :doc:`MORI-IR Guide <../MORI-IR-GUIDE>` for full device function table and integration examples.
