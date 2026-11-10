@@ -6,20 +6,20 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>UMBP storage and transfer simulation &mdash; MORI development (38dbdd8f) documentation</title>
+  <title>UMBP storage and transfer simulation &mdash; MORI development (dd5856ca) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=652335f8"></script>
+      <script src="_static/documentation_options.js?v=ce01910b"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="MORI-VIZ (Visualizer)" href="PROFILER.html" />
+    <link rel="next" title="UMBP transfer calibration" href="umbp-calibration.html" />
     <link rel="prev" title="MORI UMBP Single-Node Smoke Test" href="MORI-UMBP-SINGLE-NODE-GUIDE.html" /> 
 </head>
 
@@ -190,6 +190,18 @@
 <li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html">MORI Fused GEMM + Collective Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#performance-at-a-glance">Performance at a glance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#what-every-operator-has-in-common">What every operator has in common</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-reduce-and-reduce-scatter">GEMM + all-reduce and reduce-scatter</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-to-all">GEMM + all-to-all</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#gemm-all-gather">GEMM + all-gather</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-gather-gemm">All-gather + GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#all-to-all-gemm">All-to-all + GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-FUSED-OPS-GUIDE.html#running-the-tests-and-benchmarks">Running the tests and benchmarks</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
@@ -257,6 +269,12 @@
 <li class="toctree-l2"><a class="reference internal" href="#timing-and-limits">Timing and limits</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="umbp-calibration.html">UMBP transfer calibration</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#sampling">Sampling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#ssd-configuration-and-preparation">SSD configuration and preparation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="umbp-calibration.html#profiles-and-accuracy">Profiles and accuracy</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
@@ -303,19 +321,6 @@
 <li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
 </ul>
 </li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html">MORI GEMM + All-Reduce Benchmark</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#summary">Summary</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#running-the-benchmark">Running the benchmark</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#modes-and-quantisation">Modes and quantisation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-fp8-wire-s-knobs">The fp8 wire’s knobs</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-gemm-on-its-own">The GEMM on its own</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#measurement-discipline">Measurement discipline</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#reproducing-the-end-to-end-numbers">Reproducing the end-to-end numbers</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
@@ -558,7 +563,7 @@ tier policies and control RPCs. Payload storage/transfers are virtual; sim is of
 <span class="n">client</span><span class="o">.</span><span class="n">get_into_ptr</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>With <code class="docutils literal notranslate"><span class="pre">UMBPConfig.from_environment()</span></code>, the equivalent settings are <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_ENABLE=1</span></code>,
+<p><code class="docutils literal notranslate"><span class="pre">UMBPConfig()</span></code> reads the equivalent settings from <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_ENABLE=1</span></code>,
 <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_PROFILE=/path/to/profile.json</span></code> and <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_TRACE=/tmp/umbp-worker-0.jsonl</span></code>.
 Existing APIs and return types remain available. Use a separate trace file per client/run.
 DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;
@@ -599,10 +604,11 @@ Copy it and adjust the coefficients for your platform.
 Each path names its source/destination memory type, except the remote paths, which use
 the initiator’s read/write direction. Configure every path your workload uses; a missing
 path rejects the transfer. Unused paths may be omitted.</p>
-<p>This first version uses manually supplied parameters. Automatic calibration belongs in
-a follow-up PR covering the actual engines (<code class="docutils literal notranslate"><span class="pre">LocalCopyEngine</span></code>, <code class="docutils literal notranslate"><span class="pre">HbmCopyEngine</span></code> and
-<code class="docutils literal notranslate"><span class="pre">MoriIoEngine</span></code>), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
-also need measurements of the actual configured storage path.</p>
+<p>Profiles may use manual estimates or the optional <a class="reference internal" href="umbp-calibration.html"><span class="std std-doc">engine calibration tools</span></a>.
+Those tools measure <code class="docutils literal notranslate"><span class="pre">LocalCopyEngine</span></code>, <code class="docutils literal notranslate"><span class="pre">HbmCopyEngine</span></code>, <code class="docutils literal notranslate"><span class="pre">MoriIoEngine</span></code>, <code class="docutils literal notranslate"><span class="pre">PosixEngine</span></code>,
+<code class="docutils literal notranslate"><span class="pre">GdsEngine</span></code> and <code class="docutils literal notranslate"><span class="pre">SSDTier</span></code>, and merge
+measured coefficients with explicitly reported estimates for unmeasured paths.
+Select the paths and SSD settings used by your deployment when calibrating.</p>
 <p>For staged SSD load/offload, optional <code class="docutils literal notranslate"><span class="pre">file_cpu_staged</span></code> / <code class="docutils literal notranslate"><span class="pre">cpu_file_staged</span></code> describe storage-path cost;
 normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
 to <code class="docutils literal notranslate"><span class="pre">SSDTier</span></code> device I/O plus its skipped payload work (record building, CRC, bounce
@@ -633,20 +639,26 @@ The example SSD values are estimates, not calibration results.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">copy_latency_ns</span></code></p></td>
 <td><p>Nonnegative cost per coalesced copy; default 0.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">registration_latency_ns</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">interleave_copies</span></code></p></td>
+<td><p>Optional <code class="docutils literal notranslate"><span class="pre">cpu_gpu</span></code> / <code class="docutils literal notranslate"><span class="pre">gpu_cpu</span></code> flag to wait per copy in pure same-device fallback batches, letting concurrent callers interleave; default false. Gather and mixed batches keep batch scheduling.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">registration_latency_ns</span></code></p></td>
 <td><p>Optional nonnegative first-FD cost for <code class="docutils literal notranslate"><span class="pre">file_gpu</span></code>; default 0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">log_size_latency_ns</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">log_size_latency_ns</span></code></p></td>
 <td><p>Optional nonnegative SSD read cost per copy × <code class="docutils literal notranslate"><span class="pre">log2(max(1,</span> <span class="pre">mean</span> <span class="pre">copy</span> <span class="pre">bytes</span> <span class="pre">/</span> <span class="pre">4096))</span></code>; default 0.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">batch_log_size_latency_ns</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">batch_log_size_latency_ns</span></code></p></td>
 <td><p>Optional nonnegative SSD read cost per batch × the same size term; default 0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">serialize_latency</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">serialize_latency</span></code></p></td>
 <td><p>Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bandwidth_bytes_per_second</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">bandwidth_bytes_per_second</span></code></p></td>
 <td><p>Positive effective bandwidth.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">size_knee_bytes</span></code>, <code class="docutils literal notranslate"><span class="pre">large_size_ns_per_byte</span></code></p></td>
+<td><p>Optional paired scalar fields for <code class="docutils literal notranslate"><span class="pre">cpu_staging</span></code> / <code class="docutils literal notranslate"><span class="pre">cpu_staging_read</span></code>: a positive byte threshold and nonnegative additional ns/byte above it. Omitted fields add no cost.</p></td>
 </tr>
 </tbody>
 </table>
@@ -725,14 +737,14 @@ Workers/timers use wall time; background work counts when it delays an API/chann
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="MORI-UMBP-SINGLE-NODE-GUIDE.html" class="btn btn-neutral float-left" title="MORI UMBP Single-Node Smoke Test" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="PROFILER.html" class="btn btn-neutral float-right" title="MORI-VIZ (Visualizer)" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="umbp-calibration.html" class="btn btn-neutral float-right" title="UMBP transfer calibration" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-11-02.
+      <span class="lastupdated">Last updated on 2026-11-10.
       </span></p>
   </div>
 
